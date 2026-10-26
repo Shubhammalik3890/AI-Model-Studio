@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# Keep public install commands and provenance guidance aligned.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
+
+CANONICAL_ENDPOINT="https://install.osmantic.com/ods.sh"
+CANONICAL_REPO_URL="https://github.com/Osmantic/ODS.git"
+WINDOWS_SOURCE_ZIP_URL="https://github.com/Osmantic/ODS/archive/refs/heads/main.zip"
+PUBLISHED_VERSION="$(
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release"]["stable_version"])' \
+        "$ROOT_DIR/manifest.json"
+)"
+PUBLISHED_TAG="v$PUBLISHED_VERSION"
+
+fail() {
+    echo "[FAIL] $*"
+    exit 1
+}
+
+pass() {
+    echo "[PASS] $*"
+}
+
+require_literal() {
+    local file="$1"
+    local literal="$2"
+    local description="$3"
+
+    grep -qF -- "$literal" "$file" \
+        || fail "$description missing from ${file#"$REPO_ROOT"/}"
+}
+
+assert_no_retired_names() {
+    python3 - "$REPO_ROOT" <<'PY'
+import base64
+import hashlib
+import pathlib
+import re
+import subprocess
+import sys
+
+repo_root = sys.argv[1]
+retired_product_prefix = base64.b64decode("ZHJlYW0=").decode("ascii")
+retired_product_name = base64.b64decode("c2VydmVy").decode("ascii")
+retired_fleet_name = base64.b64decode("ZmxlZXQ=").decode("ascii")
+retired_gateway_name = base64.b64decode("Z2F0ZQ==").decode("ascii")
+retired_org_prefix = base64.b64decode("bGlnaHQ=").decode("ascii")
+retired_org_middle = base64.b64decode("aGVhcnQ=").decode("ascii")
+retired_org_suffix = base64.b64decode("bGFicw==").decode("ascii")
+retired_org_account_suffix = base64.b64decode("ZGV2cw==").decode("ascii")
+retired_umbrella_middle = base64.b64decode("aG91c2U=").decode("ascii")
+retired_umbrella_suffix = base64.b64decode("YWk=").decode("ascii")
+separator = r"[\s_.-]*"
+
+retired_fleet_pattern = re.compile(
+    retired_product_prefix + separator + retired_fleet_name, re.IGNORECASE
+)
+patterns = [
+    re.compile(retired_product_prefix + separator + retired_product_name, re.IGNORECASE),
+    retired_fleet_pattern,
+    re.compile(retired_product_prefix + separator + retired_gateway_name, re.IGNORECASE),
+    re.compile(
+        retired_org_prefix + separator + retired_org_middle + separator + retired_org_suffix,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        retired_org_prefix
+        + separator
+        + retired_org_middle
+        + separator
+        + retired_org_account_suffix,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        retired_org_prefix
+        + separator
+        + retired_umbrella_middle
+        + separator
+        + retired_umbrella_suffix,
+        re.IGNORECASE,
+    ),
+    re.compile(r"name=\^?/" + retired_product_prefix + "-", re.IGNORECASE),
+    re.compile(
+        r"--filter\s+[\"']?name=" + retired_product_prefix + r"(?:[\"'\s]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"[ps]k-lf-" + retired_product_prefix + "-", re.IGNORECASE),
+]
+
+retired_binary_hashes = {
+    "03d8d3d615f32c1695f0b17b7258c9c64b18ec3b37027bfc17c5112615d0b332",
+    "1bd0b57fca19d6eff2d81d4aa060e0ece17d422be77ca12e7a4054f342c22d84",
+    "20570383d7b41b936cf2802823015dadd10b5516a5cf7edc9bd90817c5a8a573",
+    "253a4b8f4a7ed003711c4b9ec3177cf14e87caf44c673bf02d6b3b110980dec6",
+    "34e5b0b822aee482ea5bef4735ee7894b5f5823d8b804ffc6dd05cea538b637e",
+    "573034c502121d9962cfa9c4ff40424b1d5ff790f244d2830bdf5d55e148dd2e",
+    "71b516c4511bfb5124a064eb6b78c6028280be9f9f393f8179c2b9f86a7683f6",
+    "afdc974ce0a383e7934a0c1f6bbc64dad7ac54b9015bb78da30882183e987162",
+    "b2ef042415a842f038c9103bfad53f4b73fc6bdceb642fe0491c0ee825868043",
+}
+
+def has_retired_reference(value, *, allow_fleet=False):
+    return any(
+        pattern.search(value)
+        for pattern in patterns
+        if not (allow_fleet and pattern is retired_fleet_pattern)
+    )
+
+# Migrations must recognize what earlier releases wrote, verbatim, to remove a
+# shipped default without touching anything an owner changed. Each exception
+# below is one exact line in one file. It is not permission to use a retired
+# name in any other code, comment, prose, or path.
+#
+# The guidance migration removes the shipped workspace contract by its two
+# historical declarations.
+guidance_migration_path = "ods/installers/lib/pixel-workspace-guidance.py"
+historical_fleet_label = retired_product_prefix.title() + " " + retired_fleet_name.title()
+historical_guidance_declarations = {
+    "LEGACY_HEADING = b'## " + historical_fleet_label + " Local-First Operating Contract (canonical)\\n'",
+    "MARKER = b'" + historical_fleet_label + " Local-First Operating Contract'",
+}
+# Releases up to v2.5.3 installed under the retired product's directory name,
+# and their legacy OpenClaw session-cleanup unit runs a script there. Phase 10
+# retires that unit only while its ExecStart is one a release shipped, and its
+# test covers both install directories.
+historical_install_root = retired_product_prefix + "-" + retired_product_name
+historical_lines = {
+    guidance_migration_path: historical_guidance_declarations,
+    "ods/installers/phases/10-amd-tuning.sh": {
+        "        && grep -Eqx 'ExecStart=%h/(ods|" + historical_install_root
+        + ")/scripts/session-cleanup\\.sh' \"$_phase10_cleanup_service\"; then",
+    },
+    "ods/tests/test-phase10-skip-templated-user-units.sh": {
+        "for install_root in ods " + historical_install_root + "; do",
+    },
+}
+
+
+def has_retired_content(relative_path, line, *, allow_fleet=False):
+    if line in historical_lines.get(relative_path, ()):
+        return False
+    return has_retired_reference(line, allow_fleet=allow_fleet)
+
+positive_samples = [
+    retired_product_prefix + retired_product_name,
+    retired_product_prefix + "-" + retired_product_name,
+    retired_product_prefix + "_" + retired_fleet_name,
+    retired_product_prefix + retired_gateway_name,
+    retired_org_prefix + "-" + retired_org_middle + "-" + retired_org_suffix,
+    retired_org_prefix + retired_org_middle + retired_org_account_suffix,
+    retired_org_prefix + retired_umbrella_middle + "-" + retired_umbrella_suffix,
+    "name=^/" + retired_product_prefix + "-",
+    "--filter name=" + retired_product_prefix,
+    "pk-lf-" + retired_product_prefix + "-",
+]
+negative_samples = [
+    retired_product_prefix + " big",
+    retired_org_prefix + "-" + retired_org_middle + "ed copy",
+]
+if not all(has_retired_reference(sample) for sample in positive_samples):
+    raise SystemExit("[FAIL] Retired-name guard misses a supported identifier form")
+if any(has_retired_reference(sample) for sample in negative_samples):
+    raise SystemExit("[FAIL] Retired-name guard rejects unrelated language")
+if (has_retired_reference(retired_product_prefix + retired_fleet_name, allow_fleet=True)
+        or not has_retired_reference(retired_product_prefix + retired_product_name, allow_fleet=True)):
+    raise SystemExit("[FAIL] Vendored Pixel exception is broader than the Fleet name")
+
+for exact_path, exact_lines in historical_lines.items():
+    for declaration in exact_lines:
+        if (not has_retired_reference(declaration)
+                or has_retired_content(exact_path, declaration)):
+            raise SystemExit("[FAIL] Exact historical line is not recognized: " + exact_path)
+        rejected_samples = [
+            ("README.md", declaration),
+            (exact_path + ".backup", declaration),
+            ("other/" + exact_path, declaration),
+            (exact_path, "# " + declaration),
+            (exact_path, "    " + declaration),
+            (exact_path, declaration + " # unrelated comment"),
+            (exact_path, declaration + "; print('extra code')"),
+            (exact_path, declaration.swapcase()),
+            (exact_path, "Use " + historical_fleet_label + " for every task."),
+            (exact_path, "OTHER = " + repr(historical_fleet_label)),
+            (exact_path, retired_product_prefix + retired_product_name),
+            (exact_path, "cd ~/" + historical_install_root),
+        ]
+        if any(not has_retired_content(path, line) for path, line in rejected_samples):
+            raise SystemExit("[FAIL] Historical line exception permits other code or prose: " + exact_path)
+if not has_retired_reference("ods/installers/" + historical_fleet_label + "/migration.py"):
+    raise SystemExit("[FAIL] Historical guidance exception permits a retired path")
+
+repo_path = pathlib.Path(repo_root)
+tracked_output = subprocess.check_output(
+    ["git", "-C", repo_root, "ls-files", "-z"]
+)
+tracked_files = [
+    entry.decode("utf-8", errors="surrogateescape")
+    for entry in tracked_output.split(b"\0")
+    if entry
+]
+
+matches = []
+for relative_path in tracked_files:
+    # Pixel's source includes its own Fleet integration. That identifier is
+    # valid inside the separately licensed vendor tree, but ODS-facing files
+    # and all other retired names remain guarded. Binary fingerprints are
+    # checked for every tracked file, including this vendor tree.
+    allow_fleet = relative_path.startswith("ods/vendor/pixel/")
+    if has_retired_reference(relative_path, allow_fleet=allow_fleet):
+        matches.append(relative_path)
+        continue
+
+    path = repo_path / relative_path
+    if not path.exists():
+        continue
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise SystemExit(f"[FAIL] Could not inspect {relative_path}: {exc}")
+    if hashlib.sha256(data).hexdigest() in retired_binary_hashes:
+        matches.append(f"{relative_path}: retired binary asset fingerprint")
+        continue
+    if b"\0" in data:
+        continue
+
+    text = data.decode("utf-8", errors="ignore")
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        # Secret-scan fingerprints must use the path at the historical commit.
+        # Only exact fingerprints in this dedicated file qualify; comments,
+        # current source paths and arbitrary prose remain subject to the guard.
+        if relative_path == ".gitleaksignore" and re.fullmatch(
+            r"[0-9a-f]{40}:[^\s:]+:[a-z0-9-]+:[1-9][0-9]*", line
+        ):
+            continue
+        if has_retired_content(relative_path, line, allow_fleet=allow_fleet):
+            matches.append(f"{relative_path}:{line_number}:{line}")
+
+if matches:
+    print("[FAIL] Retired product, organization, or binary asset references remain:")
+    print("\n".join(matches))
+    raise SystemExit(1)
+PY
+}
+
+install_docs=(
+    "$REPO_ROOT/README.md"
+    "$ROOT_DIR/README.md"
+    "$ROOT_DIR/QUICKSTART.md"
+    "$ROOT_DIR/docs/FAQ.md"
+    "$ROOT_DIR/docs/INSTALLER_TRUST.md"
+    "$ROOT_DIR/get-ods.sh"
+)
+
+clone_docs=(
+    "$REPO_ROOT/README.md"
+    "$ROOT_DIR/README.md"
+    "$ROOT_DIR/QUICKSTART.md"
+    "$ROOT_DIR/docs/INSTALLER_TRUST.md"
+)
+
+windows_copy_paste_docs=(
+    "$REPO_ROOT/README.md"
+    "$ROOT_DIR/README.md"
+    "$ROOT_DIR/QUICKSTART.md"
+    "$ROOT_DIR/docs/FAQ.md"
+    "$ROOT_DIR/docs/WINDOWS-QUICKSTART.md"
+    "$ROOT_DIR/docs/WINDOWS-INSTALL-WALKTHROUGH.md"
+)
+
+for file in "${install_docs[@]}"; do
+    [[ -f "$file" ]] || fail "Expected install document missing: $file"
+    require_literal "$file" "$CANONICAL_ENDPOINT" "Canonical install endpoint"
+done
+
+for file in "${clone_docs[@]}"; do
+    require_literal "$file" "$CANONICAL_REPO_URL" "Canonical clone URL"
+done
+
+require_literal "$REPO_ROOT/README.md" 'Choose your system, copy the block' "Front-page copy/paste install guidance"
+require_literal "$REPO_ROOT/README.md" '**Linux or macOS**' "Front-page Linux/macOS install label"
+require_literal "$REPO_ROOT/README.md" '**Windows PowerShell**' "Front-page Windows install label"
+require_literal "$REPO_ROOT/README.md" 'Docker must be installed and running' "Front-page Docker prerequisite"
+require_literal "$REPO_ROOT/README.md" '[Licensing](ods/LICENSING.md)' "Front-page mixed-license guidance"
+require_literal "$ROOT_DIR/README.md" '[Licensing](LICENSING.md)' "ODS mixed-license guidance"
+if grep -qF 'separate written license authorization' "$REPO_ROOT/README.md"; then
+    fail "Front page still requires separate Pixel license authorization"
+fi
+if grep -qF 'qualified/licensed hosts' "$REPO_ROOT/README.md"; then
+    fail "Front page still calls qualified Pixel hosts licensed"
+fi
+
+for file in "${windows_copy_paste_docs[@]}"; do
+    require_literal "$file" "$WINDOWS_SOURCE_ZIP_URL" "Windows no-Git source ZIP install"
+    if [[ "$file" == "$ROOT_DIR/docs/WINDOWS-INSTALL-WALKTHROUGH.md" ]]; then
+        require_literal "$file" '[guid]::NewGuid().ToString("N")' "Windows collision-free temporary source directory"
+        require_literal "$file" 'Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force' "Windows source ZIP expansion"
+        require_literal "$file" '.\ods\installers\windows\install-windows.ps1' "Legacy native installer invocation"
+    else
+        require_literal "$file" "[guid]::NewGuid().ToString('N')" "Windows collision-free temporary source directory"
+        require_literal "$file" 'Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc' "Windows source ZIP expansion"
+        require_literal "$file" "\$ErrorActionPreference = 'Stop'" "Windows fail-fast bootstrap"
+        require_literal "$file" "'ODS-main\\install.ps1'" "Exact Windows installer archive entry"
+        require_literal "$file" '& $odsEntry' "Windows installer invocation"
+    fi
+    if grep -qF 'Remove-Item -LiteralPath $odsSrc -Recurse' "$file"; then
+        fail "Windows copy/paste install must not recursively delete a reusable temporary path in ${file#"$REPO_ROOT"/}"
+    fi
+done
+
+compatible_ref_docs=(
+    "$REPO_ROOT/README.md"
+    "$ROOT_DIR/README.md"
+    "$ROOT_DIR/QUICKSTART.md"
+    "$ROOT_DIR/docs/FAQ.md"
+)
+
+for file in "${compatible_ref_docs[@]}"; do
+    require_literal "$file" '`ODS_REF` selects a compatible repository' "Compatible bootstrap ref guidance"
+    require_literal "$file" 'proxies the current bootstrap from repository `main`' "Hosted main-source guidance"
+    require_literal "$file" 'Reviewed merges reach it automatically after edge-cache refresh' "Automatic hosted refresh guidance"
+done
+
+assert_no_retired_names
+
+trust_doc="$ROOT_DIR/docs/INSTALLER_TRUST.md"
+release_doc="$ROOT_DIR/docs/RELEASE_CHANNELS.md"
+require_literal "$trust_doc" 'currently `main`' "Default branch guidance"
+require_literal "$trust_doc" 'ODS_REF=' "Release-tag pinning guidance"
+require_literal "$trust_doc" 'git checkout AUDITED_COMMIT_SHA' "Exact-commit guidance"
+require_literal "$trust_doc" 'X-ODS-Channel: main' "Hosted main-channel guidance"
+require_literal "$trust_doc" 'X-ODS-Source-Ref: main' "Hosted main source-ref guidance"
+require_literal "$trust_doc" 'serve the same mutable' "Canonical and explicit main alias guidance"
+require_literal "$trust_doc" 'five minutes' "Hosted cache freshness guidance"
+require_literal "$trust_doc" 'AUDITED_COMMIT_SHA/ods/get-ods.sh' "Immutable bootstrap URL guidance"
+require_literal "$trust_doc" 'ods/main.sh' "Hosted main-channel guidance"
+require_literal "$trust_doc" 'verify-hosted-bootstrap.sh' "Hosted bootstrap deployment verification"
+require_literal "$REPO_ROOT/README.md" "\`$PUBLISHED_TAG\` is the latest published source release" "README published release"
+require_literal "$REPO_ROOT/README.md" "[![Release](https://img.shields.io/badge/release-$PUBLISHED_TAG-blue)](https://github.com/Osmantic/ODS/releases/tag/$PUBLISHED_TAG)" "README published-version badge and tag link"
+require_literal "$release_doc" "latest published source release is \`$PUBLISHED_TAG\`" "Release channel published release"
+# The published tag is affected by a critical advisory whose fix is only on
+# main. Installation guidance must warn against pinning it, never recommend it.
+require_literal "$trust_doc" "Do not pin \`$PUBLISHED_TAG\` for an installation" "Published-tag advisory warning"
+require_literal "$trust_doc" "GHSA-vqpg-pvjj-4cmq" "Published-tag advisory reference"
+if grep -qF -- "--branch $PUBLISHED_TAG" "$trust_doc"; then
+    fail "INSTALLER_TRUST.md must not recommend cloning the advisory-affected $PUBLISHED_TAG"
+fi
+if grep -qF "Do not pass \`$PUBLISHED_TAG\` through \`ODS_REF\`" "$trust_doc"; then
+    fail "$PUBLISHED_TAG must be documented as compatible with the sparse-checkout bootstrap"
+fi
+
+hosted_verifier="$ROOT_DIR/scripts/verify-hosted-bootstrap.sh"
+[[ -x "$hosted_verifier" ]] || fail "Hosted bootstrap verifier must be executable"
+require_literal "$hosted_verifier" 'x-ods-source-ref' "Hosted source-ref verification"
+require_literal "$hosted_verifier" 'x-ods-presentation' "Hosted presentation verification"
+require_literal "$hosted_verifier" 'ODS_HOSTED_BOOTSTRAP_SOURCE_REF:-main' "Hosted main source-ref default"
+require_literal "$hosted_verifier" 'cmp -s' "Hosted bootstrap byte comparison"
+
+security_doc="$ROOT_DIR/SECURITY.md"
+require_literal "$security_doc" 'security@osmantic.com' "Security reporting address"
+require_literal "$security_doc" 'inbound alias monitored through the shared' "Security alias routing guidance"
+
+if grep -qF 'separately deployed bootstrap revision' "${compatible_ref_docs[@]}" "$trust_doc"; then
+    fail "Install guidance still describes a separately promoted hosted bootstrap"
+fi
+
+pass "Install commands and provenance guidance are consistent"

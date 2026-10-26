@@ -1,0 +1,1955 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+usage() {
+    echo "Usage: $0 [REPORT_PATH]"
+    echo "       $0 --help"
+    echo ""
+    echo "Generates a machine-readable diagnostics report for installer and runtime readiness."
+    echo "Report includes capability profile, preflight-style analysis, and autofix_hints."
+    echo ""
+    echo "Arguments:"
+    echo "  REPORT_PATH  Output JSON path (default: /tmp/ods-doctor-report.json)"
+    echo ""
+    echo "Exit codes: 0 = report generated, 1 = error (e.g. missing dependency)"
+    echo ""
+    echo "See docs/ODS-DOCTOR.md for details."
+}
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+# ods-doctor sources lib/service-registry.sh, which uses Bash 4 associative
+# arrays. macOS ships Bash 3.2, and every caller launches this script by its
+# shebang (ods-cli's `ods doctor`, installers/macos.sh, the dashboard host
+# agent, and the documented `scripts/ods-doctor.sh` invocation), so it runs
+# under whatever `bash` is first on PATH — often /bin/bash 3.2. Without a
+# guard the report failed to generate with "service-registry.sh requires
+# Bash 4.0+". Re-exec under a modern Bash, mirroring install-macos.sh.
+_ods_doctor_bash_is_modern() {
+    [ -x "$1" ] || return 1
+    # The test string must evaluate in the candidate shell, not this one.
+    # shellcheck disable=SC2016
+    "$1" -c '[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]' >/dev/null 2>&1
+}
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    _ods_doctor_bash_candidates=("${BASH:-}" /opt/homebrew/bin/bash /usr/local/bin/bash)
+    if command -v brew >/dev/null 2>&1; then
+        _ods_doctor_brew_prefix="$(brew --prefix 2>/dev/null)"
+        [ -n "$_ods_doctor_brew_prefix" ]             && _ods_doctor_bash_candidates=("$_ods_doctor_brew_prefix/bin/bash" "${_ods_doctor_bash_candidates[@]}")
+    fi
+    for _ods_doctor_candidate in "${_ods_doctor_bash_candidates[@]}"; do
+        if _ods_doctor_bash_is_modern "$_ods_doctor_candidate"; then
+            exec "$_ods_doctor_candidate" "$0" "$@"
+        fi
+    done
+    echo "ods-doctor.sh requires Bash 4+ (you have ${BASH_VERSION})." >&2
+    echo "macOS ships only Bash 3.2; install a modern one with: brew install bash" >&2
+    exit 1
+fi
+
+REPORT_FILE="${1:-/tmp/ods-doctor-report.json}"
+
+# Scratch files live in a private directory for this run only. Fixed names in
+# the shared /tmp let an earlier run by another user (sudo ods doctor) make
+# every later run fail before it wrote its report.
+DOCTOR_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ods-doctor.XXXXXX")"
+trap 'rm -rf -- "$DOCTOR_WORK_DIR"' EXIT
+CAP_FILE="$DOCTOR_WORK_DIR/capabilities.json"
+PREFLIGHT_FILE="$DOCTOR_WORK_DIR/preflight.json"
+DOCTOR_BASH_CMD="${BASH:-}"
+if [[ -z "$DOCTOR_BASH_CMD" || ! -x "$DOCTOR_BASH_CMD" ]]; then
+    DOCTOR_BASH_CMD="$(command -v bash 2>/dev/null || printf '%s\n' bash)"
+fi
+
+# Source service registry and safe env helpers
+if [[ -f "$ROOT_DIR/lib/service-registry.sh" ]]; then
+    export SCRIPT_DIR="$ROOT_DIR"
+    . "$ROOT_DIR/lib/service-registry.sh"
+    sr_load
+fi
+if [[ -f "$ROOT_DIR/lib/safe-env.sh" ]]; then
+    . "$ROOT_DIR/lib/safe-env.sh"
+fi
+
+# Safe .env loading (no direct source to avoid injection). Prefer the shared
+# reader from lib/safe-env.sh, sourced above: it applies Compose's grammar
+# (quotes, inline comments after a quoted or unquoted value) and skips the
+# readonly UID that older .env files still carry. The loop below is only the
+# fallback for a tree without lib/.
+load_env_safe() {
+    local env_file="${1:-$ROOT_DIR/.env}"
+    [[ -f "$env_file" ]] || return 0
+    if declare -F load_env_file >/dev/null 2>&1; then
+        load_env_file "$env_file"
+        return 0
+    fi
+    while IFS='=' read -r key value; do
+        value="${value%$'\r'}"
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+        export "$key=$value"
+    done < "$env_file"
+}
+load_env_safe "$ROOT_DIR/.env"
+sr_resolve_ports
+_DASHBOARD_PORT="${SERVICE_PORTS[dashboard]:-3001}"
+_WEBUI_PORT="${SERVICE_PORTS[open-webui]:-3000}"
+
+# RAM: platform-branch. /proc/meminfo does not exist on macOS; use sysctl.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    RAM_BYTES="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    RAM_GB=$(( RAM_BYTES / 1024 / 1024 / 1024 ))
+else
+    RAM_GB="$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print int($2/1024/1024)}' || echo 0)"
+fi
+# Installer-recorded fallback: if detection returned 0 and .env has HOST_RAM_GB, trust that.
+if (( RAM_GB == 0 )) && [[ -f "$ROOT_DIR/.env" ]]; then
+    _env_ram=$(grep '^HOST_RAM_GB=' "$ROOT_DIR/.env" | cut -d= -f2 | tr -d '"' || true)
+    [[ -n "${_env_ram:-}" ]] && RAM_GB="$_env_ram"
+fi
+
+_doctor_disk_free_gb() {
+    local path="$1" value
+    value="$(df -k "$path" 2>/dev/null | tail -1 | awk '{print int($4/1024/1024)}' || true)"
+    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+    printf '%s\n' "$value"
+}
+
+_doctor_external_inference_enabled() {
+    # A host-native llama-server (Windows Portal) keeps its model on Windows.
+    [[ -n "${EXTERNAL_LLM_URL:-}" \
+        || -n "${NATIVE_LLM_BASE_URL:-}" \
+        || "${ODS_MODE:-local}" == "cloud" ]]
+}
+
+_doctor_select_disk() {
+    local home_path="${HOME:-$ROOT_DIR}" docker_root="" docker_disk_gb=0
+    DOCTOR_HOME_DISK_GB="$(_doctor_disk_free_gb "$home_path")"
+    DOCTOR_DISK_SOURCE="$home_path"
+    DISK_GB="$DOCTOR_HOME_DISK_GB"
+
+    # External inference stores neither the served model nor Docker images
+    # under HOME. When Docker has a separate data-root, apply the existing
+    # tier floor to the filesystem that actually grows during installation.
+    # Fall back to HOME if the daemon or data-root cannot be observed.
+    if _doctor_external_inference_enabled && command -v docker >/dev/null 2>&1; then
+        docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+        if [[ "$docker_root" == /* ]]; then
+            docker_disk_gb="$(_doctor_disk_free_gb "$docker_root")"
+            if [[ "$docker_disk_gb" =~ ^[0-9]+$ && "$docker_disk_gb" -gt 0 ]]; then
+                DISK_GB="$docker_disk_gb"
+                DOCTOR_DISK_SOURCE="$docker_root"
+            fi
+        fi
+    fi
+    export DISK_GB DOCTOR_HOME_DISK_GB DOCTOR_DISK_SOURCE
+}
+
+# POSIX df -k works on BSD and GNU identically (df -BG is GNU-only).
+_doctor_select_disk
+
+if [[ -x "$SCRIPT_DIR/scripts/build-capability-profile.sh" ]]; then
+    CAP_ENV="$("$DOCTOR_BASH_CMD" "$SCRIPT_DIR/scripts/build-capability-profile.sh" --output "$CAP_FILE" --env)"
+    load_env_from_output <<< "$CAP_ENV"
+else
+    echo "scripts/build-capability-profile.sh not found/executable" >&2
+    exit 1
+fi
+
+if [[ -x "$SCRIPT_DIR/scripts/preflight-engine.sh" ]]; then
+    PREFLIGHT_ENV="$("$DOCTOR_BASH_CMD" "$SCRIPT_DIR/scripts/preflight-engine.sh" \
+        --report "$PREFLIGHT_FILE" \
+        --tier "${CAP_RECOMMENDED_TIER:-T1}" \
+        --ram-gb "$RAM_GB" \
+        --disk-gb "$DISK_GB" \
+        --disk-policy runtime \
+        --gpu-backend "${CAP_LLM_BACKEND:-cpu}" \
+        --gpu-vram-mb "${CAP_GPU_VRAM_MB:-0}" \
+        --gpu-name "${CAP_GPU_NAME:-Unknown}" \
+        --platform-id "${CAP_PLATFORM_ID:-unknown}" \
+        --compose-overlays "${CAP_COMPOSE_OVERLAYS:-}" \
+        --script-dir "$ROOT_DIR" \
+        --env)"
+    load_env_from_output <<< "$PREFLIGHT_ENV"
+else
+    echo "scripts/preflight-engine.sh not found/executable" >&2
+    exit 1
+fi
+
+DOCKER_CLI="false"
+DOCKER_DAEMON="false"
+# Exported for the report writer below, keeping its argument list unchanged.
+export DOCKER_ACCESS_DENIED="false"
+COMPOSE_CLI="false"
+DASHBOARD_HTTP="false"
+WEBUI_HTTP="false"
+
+# Open WebUI is optional. ENABLE_OPEN_WEBUI is disabled only by the exact
+# case-sensitive literal "false"; unset or any other value keeps it enabled.
+# Keep this consistent with ods-cli's optional-service status check.
+WEBUI_ENABLED="true"
+if [[ "${ENABLE_OPEN_WEBUI:-}" == "false" ]]; then
+    WEBUI_ENABLED="false"
+fi
+
+# Extension diagnostics (JSON array of objects)
+EXT_DIAGNOSTICS="[]"
+
+if command -v docker >/dev/null 2>&1; then
+    DOCKER_CLI="true"
+    if docker_info_error="$(docker info 2>&1 >/dev/null)"; then
+        DOCKER_DAEMON="true"
+    elif [[ "$docker_info_error" == *"permission denied"* ]]; then
+        # A running daemon this account cannot use yet, as right after the
+        # installer adds it to the docker group, is not a stopped daemon.
+        DOCKER_ACCESS_DENIED="true"
+    fi
+    if docker compose version >/dev/null 2>&1 || command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE_CLI="true"
+    fi
+fi
+
+if command -v curl >/dev/null 2>&1; then
+    if curl -sf --max-time 10 "http://127.0.0.1:${_DASHBOARD_PORT}" >/dev/null 2>&1; then
+        DASHBOARD_HTTP="true"
+    fi
+    if [[ "$WEBUI_ENABLED" == "true" ]] \
+        && curl -sf --max-time 10 "http://127.0.0.1:${_WEBUI_PORT}" >/dev/null 2>&1; then
+        WEBUI_HTTP="true"
+    fi
+fi
+
+# Colors for doctor logging
+if [[ -t 1 ]] && [[ -z "${NO_COLOR+x}" ]]; then
+    _GREEN=$'\033[0;32m'
+    _RED=$'\033[0;31m'
+    _BLUE=$'\033[0;34m'
+    _YELLOW=$'\033[1;33m'
+    _NC=$'\033[0m'
+else
+    _GREEN=''
+    _RED=''
+    _BLUE=''
+    _YELLOW=''
+    _NC=''
+fi
+
+log_ok()   { echo -e "  ${_GREEN}✓${_NC} $*"; }
+log_fail() { echo -e "  ${_RED}✗${_NC} $*"; }
+log_info() { echo -e "  ${_BLUE}ℹ${_NC} $*"; }
+log_warn() { echo -e "  ${_YELLOW}⚠${_NC} $*"; }
+
+LLM_STATUS="unknown"
+LLM_PROVIDER=""
+LLM_MODEL=""
+LLM_URL=""
+LLM_LOCAL_WARNING="false"
+LLM_RECOVERY=""
+
+_doctor_check_external_llm() {
+    local url="$1" provider="$2" model="$3"
+    local health_path
+    local probe_ok=false
+
+    LLM_URL="$url"
+    LLM_PROVIDER="${provider:-external}"
+    LLM_MODEL="$model"
+    LLM_RECOVERY=""
+    LLM_LOCAL_WARNING="false"
+
+    case "$provider" in
+        ollama)     health_path="/api/tags" ;;
+        lmstudio)   health_path="/v1/models" ;;
+        *)          health_path="/v1/models" ;;  # OpenAI-compat fallback
+    esac
+
+    # API mode passes the key file the installer stored: a keyed API answers
+    # 401 without it, which is not "down". The key reaches curl as a header
+    # file, never as an argument. Other callers keep the plain probe.
+    local key_file="${4:-}" key="" status="000"
+    LLM_FAILURE=""
+    if [[ -n "$key_file" && -s "$key_file" && ! -r "$key_file" ]]; then
+        LLM_FAILURE="key-unreadable"
+    elif [[ -n "$key_file" ]] && command -v curl >/dev/null 2>&1; then
+        if [[ -s "$key_file" ]]; then
+            IFS= read -r key < "$key_file" || true  # a key without a final newline still reads
+        fi
+        if [[ -n "$key" ]]; then
+            status="$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
+                -H @<(printf 'Authorization: Bearer %s\n' "$key") "${url%/}${health_path}" 2>/dev/null)" || true
+        else
+            status="$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' "${url%/}${health_path}" 2>/dev/null)" || true
+        fi
+        case "$status" in
+            2[0-9][0-9]) probe_ok=true ;;
+            401|403) if [[ -n "$key" ]]; then LLM_FAILURE="key-refused"; else LLM_FAILURE="key-required"; fi ;;
+            *) LLM_FAILURE="unreachable" ;;
+        esac
+        key=""
+    elif command -v curl >/dev/null 2>&1 \
+        && curl -sf --max-time 5 "${url%/}${health_path}" > /dev/null 2>&1; then
+        probe_ok=true
+    fi
+    if [[ "$LLM_FAILURE" == key-unreadable ]]; then
+        LLM_STATUS="unknown"
+        log_warn "LLM backend: ${provider:-external} (external) — not checked: this user cannot read its stored API key"
+        log_info "  Endpoint : $url"
+        log_info "  Recovery : run ods doctor as the user that installed ODS"
+    elif [[ "$LLM_FAILURE" == key-refused || "$LLM_FAILURE" == key-required ]]; then
+        LLM_STATUS="fail"
+        if [[ "$LLM_FAILURE" == key-refused ]]; then
+            log_fail "LLM backend: ${provider:-external} (external) — the API refused the stored key (HTTP $status)"
+            LLM_RECOVERY="replace the API key: rerun the installer with --external-llm-key-file FILE (Windows: -ExternalLlmKeyFile FILE)"
+        else
+            log_fail "LLM backend: ${provider:-external} (external) — the API needs a key, and none is stored (HTTP $status)"
+            LLM_RECOVERY="add the API key: rerun the installer with --external-llm-key-file FILE (Windows: -ExternalLlmKeyFile FILE)"
+        fi
+        log_info "  Endpoint : $url"
+        log_info "  Recovery : $LLM_RECOVERY"
+    elif [[ "$probe_ok" == true ]]; then
+        LLM_STATUS="ok"
+        log_ok "LLM backend: ${provider:-external} (external) — responding"
+        log_ok "  Endpoint : $url"
+        [ -n "$model" ] && log_ok "  Model    : $model"
+    else
+        LLM_STATUS="fail"
+        log_fail "LLM backend: ${provider:-external} (external) — not responding"
+        log_info "  Endpoint : $url"
+        case "$provider" in
+            ollama)
+                LLM_RECOVERY="ollama serve"
+                log_info "  Recovery : ollama serve"
+                ;;
+            lmstudio)
+                LLM_RECOVERY="start LM Studio and enable local server"
+                log_info "  Recovery : start LM Studio and enable local server"
+                ;;
+            *)
+                LLM_RECOVERY="check external LLM service connectivity"
+                ;;
+        esac
+    fi
+
+    if [[ "$DOCKER_DAEMON" == "true" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'ods-llama-server'; then
+        LLM_LOCAL_WARNING="true"
+        log_warn "  Note     : Unused local llama-server container is running"
+    fi
+}
+
+# The Windows Portal's llama-server runs outside the stack. Its /health needs
+# no API key, so the probe sends none.
+_doctor_check_host_native_llm() {
+    local url="${NATIVE_LLM_BASE_URL%/}" reached=false
+    LLM_URL="$url"
+    LLM_PROVIDER="llama-server (Windows)"
+    LLM_MODEL="${GGUF_FILE:-}"
+    LLM_RECOVERY=""
+    LLM_LOCAL_WARNING="false"
+    if [[ "${ODS_HOST_LLM_TRANSPORT:-}" == model-router && -n "${NATIVE_LLM_CONTAINER_BASE_URL:-}" ]]; then
+        # Under WSL's default NAT networking this shell cannot reach Windows
+        # loopback; the Portal's route goes through model-router
+        # (host.docker.internal). Probe from that container, as LiteLLM and
+        # the router reach the server.
+        url="${NATIVE_LLM_CONTAINER_BASE_URL%/}"
+        LLM_URL="$url"
+        if [[ "${DOCKER_DAEMON:-false}" == "true" ]] && docker exec ods-model-router python -c \
+            'import sys, urllib.request; urllib.request.urlopen(sys.argv[1] + "/health", timeout=5)' \
+            "$url" >/dev/null 2>&1; then
+            reached=true
+        fi
+    elif command -v curl >/dev/null 2>&1 && curl -sf --max-time 5 "${url}/health" >/dev/null 2>&1; then
+        reached=true
+    fi
+    if $reached; then
+        LLM_STATUS="ok"
+        log_ok "LLM backend: llama-server on Windows (host-native) — responding"
+        log_ok "  Endpoint : $url"
+        [[ -z "$LLM_MODEL" ]] || log_ok "  Model    : $LLM_MODEL"
+    else
+        LLM_STATUS="fail"
+        LLM_RECOVERY="restart the llama-server task from the ODS Portal on Windows, then rerun setup there"
+        if [[ "${ODS_HOST_LLM_TRANSPORT:-}" == model-router ]]; then
+            LLM_RECOVERY="if ods-model-router is not running, run ods start; otherwise $LLM_RECOVERY"
+        fi
+        log_fail "LLM backend: llama-server on Windows (host-native) — not responding"
+        log_info "  Endpoint : $url"
+        log_info "  Recovery : $LLM_RECOVERY"
+    fi
+    # Informational only: a failed listing just omits the note.
+    if [[ "$DOCKER_DAEMON" == "true" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'ods-llama-server'; then
+        LLM_LOCAL_WARNING="true"
+        log_warn "  Note     : Unused local llama-server container is running"
+    fi
+}
+
+_doctor_check_llama_server() {
+    local port="${OLLAMA_PORT:-${LLAMA_SERVER_PORT:-${SERVICE_PORTS[llama-server]:-11434}}}"
+    local health_path="${SERVICE_HEALTH[llama-server]:-/health}"
+    LLM_PROVIDER="llama-server"
+    LLM_RECOVERY=""
+
+    if [[ "$(uname -s)" == Darwin ]]; then
+        port="${ODS_NATIVE_LLAMA_PORT:-8080}"
+        # Native inference stays private even when the dashboard uses a LAN bind.
+        local probe_host="127.0.0.1"
+        LLM_URL=""
+        if [[ "$port" =~ ^[0-9]+$ && ${#port} -le 5 ]] \
+            && (( 10#$port > 0 && 10#$port <= 65535 )) && [[ -n "$probe_host" ]]; then
+            LLM_URL="http://${probe_host}:${port}"
+        fi
+        if [[ -n "$LLM_URL" ]] && command -v curl >/dev/null 2>&1 \
+            && curl -sf --max-time 5 "${LLM_URL}/health" >/dev/null 2>&1; then
+            LLM_STATUS="ok"
+            log_ok "LLM backend: llama-server (native Metal) - responding"
+            log_ok "  Endpoint : $LLM_URL"
+        else
+            LLM_STATUS="fail"
+            LLM_RECOVERY="check the native llama-server process and ODS_NATIVE_LLAMA_PORT; run ods restart"
+            log_fail "LLM backend: llama-server (native Metal) - not responding"
+            log_info "  Recovery : $LLM_RECOVERY"
+        fi
+        return
+    fi
+    local container_name
+    container_name=$(sr_container "llama-server" 2>/dev/null || echo "ods-llama-server")
+
+    LLM_URL="http://127.0.0.1:${port}"
+    LLM_PROVIDER="llama-server"
+
+    if [[ "$DOCKER_DAEMON" == "true" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$container_name"; then
+        if command -v curl >/dev/null 2>&1 && curl -sf --max-time 5 "http://127.0.0.1:${port}${health_path}" >/dev/null 2>&1; then
+            LLM_STATUS="ok"
+            log_ok "LLM backend: llama-server (local) — responding"
+            log_ok "  Endpoint : http://127.0.0.1:${port}"
+        else
+            LLM_STATUS="fail"
+            LLM_RECOVERY="ods restart llama-server"
+            log_fail "LLM backend: llama-server (local) — container running but not responding"
+            log_info "  Endpoint : http://127.0.0.1:${port}"
+            log_info "  Recovery : ods restart llama-server"
+        fi
+    else
+        LLM_STATUS="fail"
+        LLM_RECOVERY="ods start llama-server"
+        log_fail "LLM backend: llama-server (local) — container not running"
+        log_info "  Recovery : ods start llama-server"
+    fi
+}
+
+_doctor_check_llm_backend() {
+    local ext_url="${EXTERNAL_LLM_URL:-}"
+    local ext_provider="${EXTERNAL_LLM_PROVIDER:-}"
+    local ext_model="${EXTERNAL_LLM_MODEL:-}"
+    local mode="${ODS_MODE:-local}"
+
+    if [ -n "$ext_url" ]; then
+        # External LLM mode — skip llama-server check
+        _doctor_check_external_llm "$ext_url" "$ext_provider" "$ext_model" \
+            "$ROOT_DIR/config/litellm/external-upstream.key"
+    elif [[ -n "${NATIVE_LLM_BASE_URL:-}" ]]; then
+        _doctor_check_host_native_llm
+    elif [[ "$mode" == "cloud" ]]; then
+        local cloud_url="${LLM_API_URL:-}"
+        if [ -n "$cloud_url" ]; then
+            # Translate known LiteLLM/container routes to the host-mapped port
+            # E.g. http://litellm:4000 -> http://127.0.0.1:${LITELLM_PORT:-4000}
+            local probe_url="$cloud_url"
+            if [[ "$probe_url" =~ ^https?://litellm(:[0-9]+)?(.*)$ ]]; then
+                local port_part="${BASH_REMATCH[1]:-}"
+                local path_part="${BASH_REMATCH[2]:-}"
+                local port="4000"
+                if [ -n "$port_part" ]; then
+                    port="${port_part#:}"
+                elif [ -n "${LITELLM_PORT:-}" ]; then
+                    port="$LITELLM_PORT"
+                fi
+                probe_url="http://127.0.0.1:${port}${path_part}"
+            fi
+
+            # Extract host to check if it's host-probeable (e.g. contains '.' or is 'localhost')
+            local host
+            host=$(echo "$probe_url" | grep -oE '://[^/]+' | cut -d/ -f3 | cut -d: -f1)
+
+            local is_probeable=false
+            if [[ "$host" == "localhost" ]] || [[ "$host" == *"."* ]]; then
+                is_probeable=true
+            fi
+
+            if [ "$is_probeable" = true ]; then
+                _doctor_check_external_llm "$probe_url" "${ext_provider:-openai}" "$ext_model"
+            else
+                LLM_URL="$cloud_url"
+                LLM_PROVIDER="cloud"
+                LLM_STATUS="ok"
+                LLM_MODEL=""
+                LLM_RECOVERY=""
+                log_ok "LLM backend: cloud (external) — container-internal endpoint bypassed host probe"
+                log_ok "  Endpoint : $cloud_url"
+            fi
+        else
+            # Leave backend check provider-neutral when no probe target exists
+            LLM_URL=""
+            LLM_PROVIDER="cloud"
+            LLM_STATUS="ok"
+            LLM_MODEL=""
+            LLM_RECOVERY=""
+        fi
+    else
+        # Managed local/hybrid runtimes still use the local container check.
+        _doctor_check_llama_server
+    fi
+}
+
+_doctor_check_llm_backend
+
+export LLM_STATUS
+export LLM_PROVIDER
+export LLM_MODEL
+export LLM_URL
+export LLM_LOCAL_WARNING
+export LLM_RECOVERY
+export LLM_FAILURE
+
+# STT model cache check: a common silent-failure mode is the installer's
+# pre-download failing, so Whisper's /health passes (service up) but the
+# model isn't cached. Transcription then returns 404. This check catches
+# that case and surfaces the exact recovery command.
+STT_MODEL_CACHED="unknown"
+STT_MODEL_NAME=""
+STT_RECOVERY_HINT=""
+TTS_HTTP="unknown"
+TTS_PORT=""
+if [[ "${ENABLE_VOICE:-false}" == "true" ]] && command -v curl >/dev/null 2>&1; then
+    STT_MODEL_NAME="${AUDIO_STT_MODEL:-Systran/faster-whisper-base}"
+    _stt_whisper_port="${SERVICE_PORTS[whisper]:-9000}"
+    _stt_model_encoded="${STT_MODEL_NAME//\//%2F}"
+    _stt_whisper_url="http://127.0.0.1:${_stt_whisper_port}"
+    if curl -sf --max-time 5 "${_stt_whisper_url}/v1/models/${_stt_model_encoded}" >/dev/null 2>&1; then
+        STT_MODEL_CACHED="true"
+    else
+        # Distinguish "service down" from "model missing" for the hint.
+        if curl -sf --max-time 5 "${_stt_whisper_url}/health" >/dev/null 2>&1; then
+            STT_MODEL_CACHED="false"
+            STT_RECOVERY_HINT="curl --max-time 3600 -X POST ${_stt_whisper_url}/v1/models/${_stt_model_encoded}"
+        else
+            STT_MODEL_CACHED="service_down"
+        fi
+    fi
+
+    TTS_PORT="${SERVICE_PORTS[tts]:-8880}"
+    if curl -sf --max-time 5 "http://127.0.0.1:${TTS_PORT}/health" >/dev/null 2>&1; then
+        TTS_HTTP="true"
+    else
+        TTS_HTTP="false"
+    fi
+elif [[ "${ENABLE_VOICE:-false}" != "true" ]]; then
+    STT_MODEL_CACHED="disabled"
+    TTS_HTTP="disabled"
+fi
+
+# Compute capability 12.1 CUDA arch check: DGX Spark (GB10) and RTX Spark
+# (N1X). llama.cpp's CUDA 12 images (server-cuda-*) load on these GPUs without
+# sm_121 kernels and answer with unusable output ("????"); the installer picks
+# the CUDA 13 image config/backends/nvidia.json pins for them. Surface a
+# mismatch in doctor so operators do not have to infer it from llama-server
+# logs. The DGX_SPARK_* names and report keys are kept for older readers.
+DGX_SPARK_GPU="false"
+DGX_SPARK_GPU_NAME=""
+DGX_SPARK_COMPUTE_CAP=""
+LLAMA_CUDA_ARCHS=""
+DGX_SPARK_CUDA_ARCH_STATUS="unknown"
+DGX_SPARK_CUDA_ARCH_MESSAGE=""
+_doctor_gpu_backend="${GPU_BACKEND:-${CAP_LLM_BACKEND:-}}"
+if [[ "$_doctor_gpu_backend" == "nvidia" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    _dgx_gpu_raw="$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 || true)"
+    if [[ -n "$_dgx_gpu_raw" ]]; then
+        DGX_SPARK_GPU_NAME="$(echo "$_dgx_gpu_raw" | cut -d',' -f1 | xargs)"
+        DGX_SPARK_COMPUTE_CAP="$(echo "$_dgx_gpu_raw" | cut -d',' -f2 | xargs)"
+        if [[ "$DGX_SPARK_GPU_NAME" == *"GB10"* || "$DGX_SPARK_COMPUTE_CAP" == "12.1" ]]; then
+            DGX_SPARK_GPU="true"
+            if [[ "$DOCKER_DAEMON" == "true" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'ods-llama-server'; then
+                _llama_arch_line="$(docker logs ods-llama-server 2>&1 | grep 'CUDA : ARCHS =' | tail -1 || true)"
+                LLAMA_CUDA_ARCHS="$(echo "$_llama_arch_line" | sed -n 's/.*CUDA : ARCHS = \([^|]*\).*/\1/p' | xargs)"
+                if [[ -z "$LLAMA_CUDA_ARCHS" ]]; then
+                    DGX_SPARK_CUDA_ARCH_STATUS="unknown"
+                    DGX_SPARK_CUDA_ARCH_MESSAGE="DGX Spark / RTX Spark GPU (compute capability 12.1) detected, but llama-server CUDA archs were not found in logs."
+                elif [[ ",${LLAMA_CUDA_ARCHS}," == *",1210,"* || ",${LLAMA_CUDA_ARCHS}," == *",121,"* || ",${LLAMA_CUDA_ARCHS}," == *",121a,"* ]]; then
+                    DGX_SPARK_CUDA_ARCH_STATUS="pass"
+                    DGX_SPARK_CUDA_ARCH_MESSAGE="llama-server includes sm_121 kernels for this DGX Spark / RTX Spark GPU."
+                else
+                    DGX_SPARK_CUDA_ARCH_STATUS="warn"
+                    DGX_SPARK_CUDA_ARCH_MESSAGE="DGX Spark / RTX Spark GPU (compute capability 12.1) detected, but llama-server reports CUDA archs '${LLAMA_CUDA_ARCHS}' without sm_121."
+                fi
+            else
+                DGX_SPARK_CUDA_ARCH_STATUS="unknown"
+                DGX_SPARK_CUDA_ARCH_MESSAGE="DGX Spark / RTX Spark GPU (compute capability 12.1) detected, but ods-llama-server is not available for CUDA arch inspection."
+            fi
+        fi
+    fi
+fi
+
+# Collect extension diagnostics (wrapped in function to allow local variables)
+collect_extension_diagnostics() {
+    # Use outer GPU_BACKEND or default to nvidia (don't make local to avoid set -u issues)
+    local backend="${GPU_BACKEND-nvidia}"
+    local EXT_DIAG_ITEMS=()
+
+    for sid in "${SERVICE_IDS[@]}"; do
+        # Skip core services
+        [[ "${SERVICE_CATEGORIES[$sid]:-}" == "core" ]] && continue
+
+        # Check if extension is enabled
+        local compose_file="${SERVICE_COMPOSE[$sid]:-}"
+        [[ -z "$compose_file" || ! -f "$compose_file" ]] && continue
+
+        # Build diagnostic entry
+        local container="${SERVICE_CONTAINERS[$sid]:-}"
+        local container_state="unknown"
+        local health_status="unknown"
+        local issues=()
+
+        # Check container state
+        if [[ "$DOCKER_DAEMON" == "true" && -n "$container" ]]; then
+            local inspect_output
+            if inspect_output=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null); then
+                container_state="$inspect_output"
+            else
+                container_state="not_found"
+            fi
+
+            # Check health endpoint if container running
+            if [[ "$container_state" == "running" ]]; then
+                local port="${SERVICE_PORTS[$sid]:-0}"
+                local health="${SERVICE_HEALTH[$sid]:-}"
+                if [[ "$port" != "0" && -n "$health" ]]; then
+                    if curl -sf --max-time 5 "http://127.0.0.1:${port}${health}" >/dev/null 2>&1; then
+                        health_status="healthy"
+                    else
+                        health_status="unhealthy"
+                        issues+=("health_check_failed")
+                    fi
+                fi
+            elif [[ "$container_state" == exited \
+                    && "${SERVICE_PORTS[$sid]:-0}" == 0 \
+                    && "${SERVICE_STARTUP_CHECKS[$sid]:-true}" == false \
+                    && "${SERVICE_SOCKET_ONLY[$sid]:-0}" != 1 ]] \
+                && [[ "$(docker inspect --format '{{.State.ExitCode}} {{.State.OOMKilled}}' "$container" 2>/dev/null)" == '0 false' ]] \
+                && jq -e --arg sid "$sid" 'type == "object" and .service_id == $sid and .status == "started" and .exit_verified == true' \
+                    "$ROOT_DIR/data/extension-progress/$sid.json" >/dev/null 2>&1; then
+                # CLI tools finish normally; a stopped daemon is still a fault.
+                health_status="completed"
+            else
+                issues+=("container_not_running")
+            fi
+        fi
+
+        # Check GPU backend compatibility (only if SERVICE_GPU_BACKENDS array exists from PR #357).
+        # dashboard-api uses GPU_BACKEND=nvidia internally on macOS (see
+        # installers/macos/docker-compose.macos.yml) so service manifests are
+        # discovered. doctor/preflight path doesn't have that workaround, so the
+        # raw gpu_backends check produces false positives for CPU-only services
+        # declaring gpu_backends: [amd, nvidia]. Skip the check on apple — if a
+        # service genuinely needs GPU and isn't available on Apple, it's a
+        # manifest-level concern, not a runtime doctor warning.
+        if [[ "$backend" != "apple" ]] && declare -p SERVICE_GPU_BACKENDS &>/dev/null; then
+            local gpu_backends="${SERVICE_GPU_BACKENDS[$sid]:-}"
+            if [[ -n "$gpu_backends" \
+                && ! " $gpu_backends " =~ " all " \
+                && ! " $gpu_backends " =~ " $backend " ]]; then
+                issues+=("gpu_backend_incompatible")
+            fi
+        fi
+
+        # Check dependencies
+        local deps="${SERVICE_DEPENDS[$sid]:-}"
+        if [[ -n "$deps" ]]; then
+            local dep
+            for dep in $deps; do
+                local dep_compose="${SERVICE_COMPOSE[$dep]:-}"
+                local dep_cat="${SERVICE_CATEGORIES[$dep]:-}"
+                if [[ "$dep_cat" != "core" && ! -f "$dep_compose" ]]; then
+                    issues+=("missing_dependency:$dep")
+                fi
+            done
+        fi
+
+        # Build JSON object (escape quotes in values)
+        local issues_json="[]"
+        if [[ ${#issues[@]} -gt 0 ]]; then
+            # Use printf with newline separator, then convert to JSON array
+            issues_json="[\"$(printf '%s\n' "${issues[@]}" | sed 's/"/\\"/g' | tr '\n' ',' | sed 's/,$//' | sed 's/,/","/g')\"]"
+        fi
+
+        EXT_DIAG_ITEMS+=("{\"id\":\"$sid\",\"container_state\":\"$container_state\",\"health_status\":\"$health_status\",\"issues\":$issues_json}")
+    done
+
+    if [[ ${#EXT_DIAG_ITEMS[@]} -gt 0 ]]; then
+        echo "[$(IFS=,; echo "${EXT_DIAG_ITEMS[*]}")]"
+    else
+        echo "[]"
+    fi
+}
+
+# Hermes slash workers are spawned by upstream Hermes for /slash commands. A
+# leak in that worker lifecycle can create many long-lived child processes and
+# starve local models of RAM. Doctor only reports; cleanup remains explicit via
+# `ods repair hermes-workers`.
+HERMES_SLASH_WORKER_MAX_COUNT="${HERMES_SLASH_WORKER_MAX_COUNT:-8}"
+HERMES_SLASH_WORKER_COUNT="0"
+if [[ "$DOCKER_DAEMON" == "true" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'ods-hermes'; then
+    _hermes_worker_count="$(
+        docker exec ods-hermes sh -c \
+            "(ps -eo args= 2>/dev/null || ps -ef 2>/dev/null) | grep '[t]ui_gateway[.]slash_worker' | wc -l" \
+            2>/dev/null || echo 0
+    )"
+    HERMES_SLASH_WORKER_COUNT="$(echo "$_hermes_worker_count" | tr -dc '0-9')"
+    [[ -n "$HERMES_SLASH_WORKER_COUNT" ]] || HERMES_SLASH_WORKER_COUNT="0"
+fi
+
+ODS_MANAGED_CONTAINER_COUNT="0"
+ODS_RUNNING_CONTAINER_COUNT="0"
+if [[ "$DOCKER_DAEMON" == "true" ]]; then
+    ODS_MANAGED_CONTAINER_COUNT="$(
+        docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c '^ods-' || true
+    )"
+    ODS_RUNNING_CONTAINER_COUNT="$(
+        docker ps --format '{{.Names}}' 2>/dev/null | grep -c '^ods-' || true
+    )"
+fi
+
+# Rootless Docker subordinate ID ranges — runtime half of the install
+# preflight's ROOTLESS_SUBID check. A rootless daemon maps in-container
+# users through /etc/subuid + /etc/subgid; a missing entry or a range under
+# 65536 IDs breaks layer extraction for non-root images with cryptic
+# "uid/gid map out of range" errors, so doctor surfaces it with the fix.
+ROOTLESS_DOCKER="false"
+ROOTLESS_SUBID_STATUS="skipped"
+ROOTLESS_SUBUID_TOTAL="0"
+ROOTLESS_SUBGID_TOTAL="0"
+ROOTLESS_SUBID_USER="$(id -un 2>/dev/null || echo unknown)"
+if [[ "${ODS_ASSUME_ROOTLESS:-0}" == "1" ]] || { [[ "$DOCKER_DAEMON" == "true" ]] \
+    && docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q 'rootless'; }; then
+    ROOTLESS_DOCKER="true"
+    subid_range_total() {
+        # Sum every range allocated to the user; entries may be keyed by
+        # name or numeric UID (subgid is also keyed by user, not group).
+        local file="$1" user="$2" numeric_uid="$3" total=0 owner start count
+        [[ -r "$file" ]] || { echo 0; return; }
+        while IFS=: read -r owner start count; do
+            if [[ "$owner" == "$user" || "$owner" == "$numeric_uid" ]]; then
+                [[ "$count" =~ ^[0-9]+$ ]] && total=$((total + count))
+            fi
+        done <"$file"
+        echo "$total"
+    }
+    _subid_uid="$(id -u)"
+    ROOTLESS_SUBUID_TOTAL="$(subid_range_total "${ODS_SUBUID_FILE:-/etc/subuid}" "$ROOTLESS_SUBID_USER" "$_subid_uid")"
+    ROOTLESS_SUBGID_TOTAL="$(subid_range_total "${ODS_SUBGID_FILE:-/etc/subgid}" "$ROOTLESS_SUBID_USER" "$_subid_uid")"
+    if [[ "$ROOTLESS_SUBUID_TOTAL" -eq 0 || "$ROOTLESS_SUBGID_TOTAL" -eq 0 ]]; then
+        ROOTLESS_SUBID_STATUS="fail"
+    elif [[ "$ROOTLESS_SUBUID_TOTAL" -lt 65536 || "$ROOTLESS_SUBGID_TOTAL" -lt 65536 ]]; then
+        ROOTLESS_SUBID_STATUS="warn"
+    else
+        ROOTLESS_SUBID_STATUS="pass"
+    fi
+fi
+export ROOTLESS_DOCKER ROOTLESS_SUBID_STATUS ROOTLESS_SUBUID_TOTAL ROOTLESS_SUBGID_TOTAL ROOTLESS_SUBID_USER
+
+# Collect extension diagnostics if service registry loaded
+EXT_DIAGNOSTICS="[]"
+if [[ "${#SERVICE_IDS[@]}" -gt 0 ]]; then
+    EXT_DIAGNOSTICS=$(collect_extension_diagnostics)
+fi
+
+PYTHON_CMD="python3"
+if [[ -f "$ROOT_DIR/lib/python-cmd.sh" ]]; then
+    . "$ROOT_DIR/lib/python-cmd.sh"
+    PYTHON_CMD="$(ods_detect_python_cmd)"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_CMD="python"
+fi
+
+"$PYTHON_CMD" - "$CAP_FILE" "$PREFLIGHT_FILE" "$REPORT_FILE" "$DOCKER_CLI" "$DOCKER_DAEMON" "$COMPOSE_CLI" "$DASHBOARD_HTTP" "$WEBUI_HTTP" "$_DASHBOARD_PORT" "$_WEBUI_PORT" "$EXT_DIAGNOSTICS" "$STT_MODEL_CACHED" "$STT_MODEL_NAME" "$STT_RECOVERY_HINT" "$TTS_HTTP" "$TTS_PORT" "$DGX_SPARK_GPU" "$DGX_SPARK_GPU_NAME" "$DGX_SPARK_COMPUTE_CAP" "$LLAMA_CUDA_ARCHS" "$DGX_SPARK_CUDA_ARCH_STATUS" "$DGX_SPARK_CUDA_ARCH_MESSAGE" "$HERMES_SLASH_WORKER_COUNT" "$HERMES_SLASH_WORKER_MAX_COUNT" "$ODS_MANAGED_CONTAINER_COUNT" "$ODS_RUNNING_CONTAINER_COUNT" "$ROOT_DIR" "$WEBUI_ENABLED" <<'PY'
+import json
+import os
+import pathlib
+import re
+import shlex
+import sys
+from datetime import datetime, timezone
+from urllib import error, parse, request
+
+cap_file, preflight_file, report_file, docker_cli, docker_daemon, compose_cli, dashboard_http, webui_http, dashboard_port, webui_port, ext_diagnostics_json, stt_cached, stt_model_name, stt_recovery, tts_http, tts_port, dgx_spark_gpu, dgx_spark_gpu_name, dgx_spark_compute_cap, llama_cuda_archs, dgx_spark_arch_status, dgx_spark_arch_message, hermes_slash_worker_count, hermes_slash_worker_max_count, ods_managed_container_count, ods_running_container_count, root_dir_arg, webui_enabled = sys.argv[1:]
+# Passed in the environment so callers of this block keep its argument list.
+docker_access_denied = os.environ.get("DOCKER_ACCESS_DENIED", "false")
+
+cap = json.load(open(cap_file, "r", encoding="utf-8"))
+pre = json.load(open(preflight_file, "r", encoding="utf-8"))
+ext_diagnostics = json.loads(ext_diagnostics_json)
+root_dir = pathlib.Path(root_dir_arg).resolve()
+
+def _int_value(raw, default=0):
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+hermes_slash_worker_count_num = _int_value(hermes_slash_worker_count)
+hermes_slash_worker_max_count_num = max(1, _int_value(hermes_slash_worker_max_count, 8))
+
+def _clean_env(name, default=""):
+    return os.environ.get(name, default).strip()
+
+
+def _join_url(base_url, path):
+    base = base_url.rstrip("/")
+    suffix = path if path.startswith("/") else f"/{path}"
+    return f"{base}{suffix}"
+
+
+def _split_backends(raw):
+    backends = []
+    invalid = []
+    for item in (raw or "").split(","):
+        backend = item.strip().lower()
+        if not backend:
+            continue
+        if backend in {"auto", "cpu", "npu", "rocm", "vulkan"}:
+            if backend not in backends:
+                backends.append(backend)
+        else:
+            invalid.append(backend)
+    return backends, invalid
+
+
+def _env_bool(name):
+    return _clean_env(name).lower() in {"1", "true", "yes", "on"}
+
+
+def _amd_health_url(location, port):
+    """llama-server's /health: the Windows Portal's host-native server, or the container."""
+    native_base = _clean_env("NATIVE_LLM_BASE_URL").rstrip("/")
+    if location == "host" and native_base:
+        return _join_url(native_base, "health")
+    host_port = _clean_env("OLLAMA_PORT", port) if location == "container" else port
+    return _join_url(f"http://127.0.0.1:{host_port}", "health")
+
+
+def _probe_health(url):
+    try:
+        with request.urlopen(url, timeout=2.0) as response:
+            status = getattr(response, "status", response.getcode())
+            body = response.read(4096).decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        return "unhealthy", "unknown", f"health_http_{exc.code}"
+    except (error.URLError, TimeoutError, OSError):
+        return "unreachable", "unknown", "health_unreachable"
+
+    version = "unknown"
+    try:
+        payload = json.loads(body) if body else {}
+        if isinstance(payload, dict) and payload.get("version"):
+            version = str(payload["version"])
+    except json.JSONDecodeError:
+        pass
+    if 200 <= int(status) < 300:
+        return "reachable", version, None
+    return "unhealthy", version, f"health_http_{status}"
+
+
+def _amd_runtime_report():
+    gpu_backend = (_clean_env("GPU_BACKEND") or _clean_env("CAP_LLM_BACKEND")).lower()
+    amd_env_present = any(
+        _clean_env(name)
+        for name in (
+            "AMD_INFERENCE_RUNTIME",
+            "AMD_INFERENCE_BACKEND",
+            "AMD_INFERENCE_LOCATION",
+            "AMD_INFERENCE_SUPPORTED_BACKENDS",
+        )
+    )
+    # In API mode the API serves the model and no AMD runtime runs here, so
+    # there is nothing to probe (Strixy in API mode reported it unreachable).
+    api_mode = bool(_clean_env("EXTERNAL_LLM_URL")) or _clean_env("LLM_BACKEND").lower() == "external"
+    if (gpu_backend != "amd" and not amd_env_present) or api_mode:
+        return {
+            "available": False,
+            "reason": "api_mode" if api_mode else "not_amd",
+            "runtime": "none",
+            "location": "none",
+            "runtimeMode": "none",
+            "managedByODS": False,
+            "selectedBackend": "none",
+            "supportedBackends": [],
+            "defaultBackend": "none",
+            "health": "not_checked",
+            "warnings": [],
+        }
+
+    warnings = []
+    runtime = _clean_env("AMD_INFERENCE_RUNTIME").lower()
+    selected_backend = _clean_env("AMD_INFERENCE_BACKEND").lower()
+    location = _clean_env("AMD_INFERENCE_LOCATION").lower()
+    runtime_mode = _clean_env("AMD_INFERENCE_RUNTIME_MODE").lower()
+    supported_backends, invalid_backends = _split_backends(_clean_env("AMD_INFERENCE_SUPPORTED_BACKENDS"))
+    managed_raw = _clean_env("AMD_INFERENCE_MANAGED").lower()
+    managed = _env_bool("AMD_INFERENCE_MANAGED")
+    port = _clean_env("AMD_INFERENCE_PORT", "8080") or "8080"
+
+    if invalid_backends:
+        warnings.append("amd_supported_backends_invalid")
+    if not runtime:
+        runtime = "none"
+        warnings.append("amd_runtime_env_missing")
+    if not selected_backend:
+        selected_backend = "unknown"
+        warnings.append("amd_backend_env_missing")
+    if not location:
+        location = "unknown"
+        warnings.append("amd_location_env_missing")
+    if not runtime_mode:
+        runtime_mode = "unknown"
+        warnings.append("amd_runtime_mode_env_missing")
+    if not managed_raw:
+        warnings.append("amd_managed_env_missing")
+    if not supported_backends:
+        warnings.append("amd_supported_backends_env_missing")
+    elif selected_backend not in {"unknown", "none"} and selected_backend not in supported_backends:
+        warnings.append("amd_selected_backend_not_supported")
+
+    if not port.isdigit() or not (1 <= int(port) <= 65535):
+        port = "8080"
+        warnings.append("amd_port_invalid")
+
+    health = "not_checked"
+    version = "unknown"
+    health_url = None
+    reason = None
+    if runtime == "llama-server" and location == "host" \
+            and _clean_env("ODS_HOST_LLM_TRANSPORT") == "model-router" \
+            and _clean_env("NATIVE_LLM_CONTAINER_BASE_URL"):
+        # Under WSL's default NAT networking this host cannot reach Windows
+        # loopback. The LLM backend check above already probed the server
+        # through ods-model-router, the path the stack uses; report that.
+        health_url = _join_url(_clean_env("NATIVE_LLM_CONTAINER_BASE_URL").rstrip("/"), "health")
+        if _clean_env("LLM_STATUS") == "ok":
+            health = "reachable"
+        else:
+            health = "unreachable"
+            warnings.append("health_unreachable")
+    elif runtime == "llama-server":
+        health_url = _amd_health_url(location, port)
+        health, version, health_warning = _probe_health(health_url)
+        if health_warning:
+            warnings.append(health_warning)
+    elif runtime == "lemonade":
+        # Compatibility read for one release: an .env the Lemonade migration
+        # has not rewritten yet. ODS no longer ships that runtime.
+        reason = "runtime_retired"
+        warnings.append("amd_runtime_lemonade_retired")
+    else:
+        reason = "runtime_not_configured"
+
+    return {
+        "available": runtime == "llama-server",
+        "reason": reason,
+        "runtime": runtime,
+        "location": location,
+        "runtimeMode": runtime_mode,
+        "managedByODS": managed,
+        "selectedBackend": selected_backend,
+        "supportedBackends": supported_backends,
+        "defaultBackend": selected_backend if selected_backend else "none",
+        "healthUrl": health_url,
+        "health": health,
+        "version": version,
+        "warnings": warnings,
+    }
+
+
+amd_runtime = _amd_runtime_report()
+
+
+def _read_text(path, max_chars=120_000):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) > max_chars:
+        return text[-max_chars:]
+    return text
+
+
+def _latest_install_report():
+    reports = []
+    try:
+        reports = [p for p in root_dir.glob("install-report-*.txt") if p.is_file()]
+    except OSError:
+        reports = []
+    if not reports:
+        return None
+    return max(reports, key=lambda p: p.stat().st_mtime)
+
+
+def _parse_kv_lines(text):
+    values = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            values[key] = value.strip()
+    return values
+
+
+def _truthy(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_arg(value):
+    try:
+        return int(str(value or "0").strip())
+    except ValueError:
+        return 0
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def _source_mentions_zero_containers(text):
+    lowered = text.lower()
+    return (
+        "docker compose did not create any managed containers" in lowered
+        or "zero managed containers" in lowered
+    )
+
+
+def _zero_container_failure_is_stale(failure_sources, compose_launch_path):
+    if docker_daemon != "true":
+        return False
+    if _int_arg(ods_managed_container_count) <= 0 or _int_arg(ods_running_container_count) <= 0:
+        return False
+    if not compose_launch_path.exists():
+        return False
+
+    zero_source_mtimes = [
+        _mtime(path)
+        for path, text in failure_sources
+        if path and _source_mentions_zero_containers(text)
+    ]
+    if not zero_source_mtimes:
+        return False
+
+    return _mtime(compose_launch_path) > max(zero_source_mtimes)
+
+
+def _env_file_values():
+    env_path = root_dir / ".env"
+    if not env_path.exists():
+        return {}
+    return _parse_kv_lines(_read_text(env_path))
+
+
+def _compose_files_from_flags(flags_text):
+    if not flags_text.strip():
+        return []
+    try:
+        tokens = shlex.split(flags_text)
+    except ValueError:
+        tokens = flags_text.split()
+    files = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token in {"-f", "--file"} and idx + 1 < len(tokens):
+            files.append(tokens[idx + 1])
+            idx += 2
+            continue
+        if token.startswith("--file="):
+            files.append(token.split("=", 1)[1])
+        idx += 1
+    return files
+
+
+def _has_compose_file(files, expected):
+    return any(pathlib.PurePosixPath(item).name == expected or item == expected for item in files)
+
+
+def _looks_like_litellm_route(value):
+    lowered = (value or "").lower()
+    return "litellm" in lowered or ":4000" in lowered
+
+
+def _looks_like_local_llama_route(value):
+    value = (value or "").strip()
+    if not value:
+        return False
+    try:
+        route = parse.urlsplit(value if "://" in value or value.startswith("//") else "//" + value)
+        hostname = (route.hostname or "").lower().rstrip(".")
+        port = route.port
+    except ValueError:
+        return False
+    # A provider path or query can contain a local URL without selecting it.
+    # Diagnose the actual destination rather than matching text anywhere.
+    if hostname in {"llama-server", "ods-llama-server", "model-router", "ods-model-router"}:
+        return True
+    return hostname in {"localhost", "127.0.0.1", "::1", "host.docker.internal"} and port in {
+        8080, 9099, 11434,
+    }
+
+
+def _source(path):
+    try:
+        return path.relative_to(root_dir).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _evidence(source, detail):
+    return {"source": source, "detail": detail}
+
+
+def _diagnosis(diag_id, severity, confidence, title, evidence, impact, next_steps):
+    return {
+        "id": diag_id,
+        "severity": severity,
+        "confidence": confidence,
+        "title": title,
+        "evidence": evidence,
+        "impact": impact,
+        "next_steps": next_steps,
+    }
+
+
+def _inference_issue(issue_id, severity, source, detail):
+    return {
+        "id": issue_id,
+        "severity": severity,
+        "source": source,
+        "detail": detail,
+    }
+
+
+def _collect_inference_contract():
+    env_values = _env_file_values()
+
+    def env_get(name, default=""):
+        return env_values.get(name) or _clean_env(name, default)
+
+    flags_path = root_dir / ".compose-flags"
+    flags_text = _read_text(flags_path, max_chars=20_000) if flags_path.exists() else ""
+    compose_flags_exists = flags_path.exists()
+    compose_files = _compose_files_from_flags(flags_text)
+
+    ods_mode = (env_get("ODS_MODE", "local") or "local").strip().lower()
+    gpu_backend = (env_get("GPU_BACKEND", "") or "").strip().lower()
+    llm_backend = env_get("LLM_BACKEND", "")
+    external_llm_url = env_get("EXTERNAL_LLM_URL", "")
+    llm_api_url = env_get("LLM_API_URL", "")
+    hermes_base_url = env_get("HERMES_LLM_BASE_URL", "")
+    # The Windows Portal's llama-server runs outside the stack; LiteLLM and
+    # model-router reach it with LLAMA_SERVER_API_KEY.
+    native_llm_url = env_get("NATIVE_LLM_BASE_URL", "")
+    host_native = bool(native_llm_url.strip())
+    native_key_configured = bool(env_get("LLAMA_SERVER_API_KEY", "").strip())
+    # Compatibility read for one release: Lemonade-era settings the migration
+    # has not rewritten yet (the installer runs it; `ods update` does not).
+    lemonade_era = (
+        ods_mode == "lemonade"
+        or llm_backend.strip().lower() == "lemonade"
+        or _truthy(env_get("LEMONADE_EXTERNAL"))
+        or env_get("AMD_INFERENCE_RUNTIME").strip().lower() == "lemonade"
+    )
+
+    cloud_overlay = _has_compose_file(compose_files, "docker-compose.cloud.yml")
+    host_native_overlay = _has_compose_file(compose_files, "docker-compose.host-native-llm.yml")
+    local_inference_overlay = any(
+        _has_compose_file(compose_files, name)
+        for name in (
+            "docker-compose.nvidia.yml",
+            "docker-compose.amd.yml",
+            "docker-compose.cpu.yml",
+            "docker-compose.arc.yml",
+            "docker-compose.intel.yml",
+            "docker-compose.apple.yml",
+            "docker-compose.macos.yml",
+        )
+    )
+
+    generic_external = bool(external_llm_url.strip()) or llm_backend.strip().lower() == "external"
+    external_inference = ods_mode == "cloud" or generic_external
+    expected_owner = "external" if external_inference else "ods"
+    expected_gateway = "litellm" if external_inference or host_native else "llama-server"
+
+    issues = []
+    if lemonade_era:
+        issues.append(
+            _inference_issue(
+                "ODS-RUNTIME-LEMONADE-RETIRED",
+                "blocker",
+                ".env",
+                "The .env still selects the Lemonade runtime, which ODS no longer ships.",
+            )
+        )
+    elif ods_mode not in {"local", "cloud", "hybrid"}:
+        issues.append(
+            _inference_issue(
+                "ODS-RUNTIME-MODE-UNKNOWN",
+                "blocker",
+                ".env",
+                f"ODS_MODE={ods_mode!r} is not one of local/cloud/hybrid.",
+            )
+        )
+
+    if ods_mode == "cloud":
+        if compose_flags_exists and not cloud_overlay:
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-CLOUD-OVERLAY-MISSING",
+                    "blocker",
+                    ".compose-flags",
+                    "ODS_MODE=cloud but docker-compose.cloud.yml is not in the resolved compose stack.",
+                )
+            )
+        if _looks_like_local_llama_route(llm_api_url):
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-CLOUD-LLM-LOCAL-ROUTE",
+                    "blocker",
+                    ".env",
+                    f"ODS_MODE=cloud but LLM_API_URL points at local llama-server ({llm_api_url}).",
+                )
+            )
+        if _looks_like_local_llama_route(hermes_base_url):
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-CLOUD-HERMES-LOCAL-ROUTE",
+                    "blocker",
+                    ".env",
+                    f"ODS_MODE=cloud but HERMES_LLM_BASE_URL points at local llama-server ({hermes_base_url}).",
+                )
+            )
+        if llm_api_url and not _looks_like_litellm_route(llm_api_url):
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-CLOUD-GATEWAY-BYPASS",
+                    "warn",
+                    ".env",
+                    f"ODS_MODE=cloud normally routes ODS services through LiteLLM, but LLM_API_URL={llm_api_url}.",
+                )
+            )
+
+    if host_native:
+        if compose_flags_exists and cloud_overlay:
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-HOST-NATIVE-CLOUD-OVERLAY-CONFLICT",
+                    "blocker",
+                    ".compose-flags",
+                    "The cloud overlay disables model-router; the Windows llama-server route uses its own overlay so Pixel and model switching remain live.",
+                )
+            )
+        if compose_flags_exists and not host_native_overlay:
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-HOST-NATIVE-OVERLAY-MISSING",
+                    "warn",
+                    ".compose-flags",
+                    "NATIVE_LLM_BASE_URL is set but docker-compose.host-native-llm.yml is not in the compose stack.",
+                )
+            )
+        if _looks_like_local_llama_route(llm_api_url):
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-HOST-NATIVE-LOCAL-ROUTE",
+                    "blocker",
+                    ".env",
+                    f"The model runs in llama-server on Windows, but LLM_API_URL points at the in-stack llama-server ({llm_api_url}).",
+                )
+            )
+        if not native_key_configured:
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-HOST-NATIVE-KEY-MISSING",
+                    "warn",
+                    ".env",
+                    "LLAMA_SERVER_API_KEY is empty, so LiteLLM and model-router send no key to the Windows llama-server, which requires one.",
+                )
+            )
+
+    if ods_mode == "local" and not host_native and not generic_external and not lemonade_era:
+        if compose_flags_exists and cloud_overlay:
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-LOCAL-CLOUD-OVERLAY",
+                    "warn",
+                    ".compose-flags",
+                    "ODS_MODE=local but docker-compose.cloud.yml is still in the compose stack.",
+                )
+            )
+        if _looks_like_litellm_route(llm_api_url):
+            issues.append(
+                _inference_issue(
+                    "ODS-RUNTIME-LOCAL-LITELLM-ROUTE",
+                    "warn",
+                    ".env",
+                    f"ODS_MODE=local routes directly to llama-server on every GPU, but LLM_API_URL={llm_api_url}.",
+                )
+            )
+
+    diagnoses = []
+    issue_titles = {
+        "ODS-RUNTIME-MODE-UNKNOWN": "Runtime mode is not recognized",
+        "ODS-RUNTIME-CLOUD-OVERLAY-MISSING": "Cloud mode is missing the cloud compose overlay",
+        "ODS-RUNTIME-CLOUD-LLM-LOCAL-ROUTE": "Cloud mode still routes chat clients to local llama-server",
+        "ODS-RUNTIME-CLOUD-HERMES-LOCAL-ROUTE": "Cloud mode still routes Hermes to local llama-server",
+        "ODS-RUNTIME-CLOUD-GATEWAY-BYPASS": "Cloud mode bypasses the LiteLLM gateway",
+        "ODS-RUNTIME-LEMONADE-RETIRED": "Settings still select the retired Lemonade runtime",
+        "ODS-RUNTIME-HOST-NATIVE-CLOUD-OVERLAY-CONFLICT": "The Windows llama-server route incorrectly includes the cloud compose overlay",
+        "ODS-RUNTIME-HOST-NATIVE-OVERLAY-MISSING": "The Windows llama-server route is missing its compose overlay",
+        "ODS-RUNTIME-HOST-NATIVE-LOCAL-ROUTE": "The Windows llama-server route still sends clients to the in-stack llama-server",
+        "ODS-RUNTIME-HOST-NATIVE-KEY-MISSING": "The Windows llama-server route has no API key",
+        "ODS-RUNTIME-LOCAL-CLOUD-OVERLAY": "Local mode still has the cloud compose overlay",
+        "ODS-RUNTIME-LOCAL-LITELLM-ROUTE": "Local mode routes through LiteLLM unexpectedly",
+    }
+    next_steps = {
+        "ODS-RUNTIME-CLOUD-OVERLAY-MISSING": [
+            "Regenerate compose flags with ODS_MODE=cloud and include docker-compose.cloud.yml.",
+            "Run `ods restart` after correcting .env/.compose-flags.",
+        ],
+        "ODS-RUNTIME-CLOUD-LLM-LOCAL-ROUTE": [
+            "Set LLM_API_URL to the LiteLLM service URL used by the stack, usually http://litellm:4000.",
+            "Do not point cloud mode at llama-server unless ODS is intentionally managing local inference.",
+        ],
+        "ODS-RUNTIME-CLOUD-HERMES-LOCAL-ROUTE": [
+            "Set HERMES_LLM_BASE_URL to http://litellm:4000/v1 for cloud mode.",
+            "Restart Hermes after updating the generated config/template.",
+        ],
+        "ODS-RUNTIME-CLOUD-GATEWAY-BYPASS": [
+            "Route ODS services through LiteLLM so hosted, private-cloud, and auth behavior stay consistent.",
+        ],
+        "ODS-RUNTIME-LEMONADE-RETIRED": [
+            "Rerun the installer of this release to move the Lemonade-era settings to the llama.cpp runtime (`ods update` only refreshes images); your model files and active model are kept.",
+        ],
+        "ODS-RUNTIME-HOST-NATIVE-CLOUD-OVERLAY-CONFLICT": [
+            "Regenerate compose flags without docker-compose.cloud.yml; docker-compose.host-native-llm.yml disables only the in-stack llama-server and keeps model-router.",
+        ],
+        "ODS-RUNTIME-HOST-NATIVE-OVERLAY-MISSING": [
+            "Rerun setup from the ODS Portal so the compose stack includes docker-compose.host-native-llm.yml.",
+        ],
+        "ODS-RUNTIME-HOST-NATIVE-LOCAL-ROUTE": [
+            "Route clients through LiteLLM, usually http://litellm:4000, which holds the Windows llama-server's key.",
+        ],
+        "ODS-RUNTIME-HOST-NATIVE-KEY-MISSING": [
+            "Rerun setup from the ODS Portal; it passes the llama-server key with --native-llm-api-key-env.",
+        ],
+        "ODS-RUNTIME-LOCAL-CLOUD-OVERLAY": [
+            "Regenerate compose flags for local mode so local inference starts normally.",
+        ],
+        "ODS-RUNTIME-LOCAL-LITELLM-ROUTE": [
+            "Set LLM_API_URL back to http://llama-server:8080 unless you route local inference through LiteLLM on purpose.",
+        ],
+        "ODS-RUNTIME-MODE-UNKNOWN": [
+            "Set ODS_MODE to local, cloud, or hybrid.",
+        ],
+    }
+    for issue in issues:
+        diagnoses.append(
+            _diagnosis(
+                issue["id"],
+                issue["severity"],
+                "high" if issue["severity"] == "blocker" else "medium",
+                issue_titles.get(issue["id"], "Inference runtime contract mismatch"),
+                [_evidence(issue["source"], issue["detail"])],
+                "ODS services can report healthy while chat, agents, or model routing target the wrong inference owner.",
+                next_steps.get(issue["id"], ["Regenerate .env/.compose-flags with the installer and restart ODS."]),
+            )
+        )
+
+    return {
+        "ods_mode": ods_mode,
+        "gpu_backend": gpu_backend,
+        "llm_backend": llm_backend,
+        "expected_inference_owner": expected_owner,
+        "expected_gateway": expected_gateway,
+        "host_native_llm": host_native,
+        "llm_api_url": llm_api_url,
+        "hermes_llm_base_url": hermes_base_url,
+        "compose_files": compose_files,
+        "signals": {
+            "compose_flags_exists": compose_flags_exists,
+            "cloud_overlay": cloud_overlay,
+            "host_native_overlay": host_native_overlay,
+            "local_inference_overlay": local_inference_overlay,
+            "native_key_configured": native_key_configured,
+        },
+        "issues": issues,
+        "issue_counts": {
+            "blockers": sum(1 for item in issues if item["severity"] == "blocker"),
+            "warnings": sum(1 for item in issues if item["severity"] == "warn"),
+        },
+        "diagnoses": diagnoses,
+    }
+
+
+def _extract_image(text):
+    match = re.search(
+        r"failed to resolve reference\s+\"?([^\"\s]+:[A-Za-z0-9._-]+)\"?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+    match = re.search(
+        r"([a-z0-9._-]+(?:[.:][0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9._-]+).*?(?:not found|manifest unknown)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(1) if match else ""
+
+
+def _is_windows_alpine_probe_failure(text):
+    lowered = text.lower()
+    has_alpine_probe = (
+        "alpine:3.20" in lowered
+        or "unable to find image 'alpine" in lowered
+        or 'unable to find image "alpine' in lowered
+    )
+    if not has_alpine_probe:
+        return False
+    return (
+        "docker could not download" in lowered
+        or "bind-mount probe" in lowered
+        or "file-sharing probe" in lowered
+        or "cannot bind-mount" in lowered
+    )
+
+
+def _collect_install_artifacts():
+    latest_report = _latest_install_report()
+    compose_launch = root_dir / "logs" / "compose-launch.txt"
+    compose_up = root_dir / "logs" / "compose-up.log"
+    install_log = root_dir / "logs" / "install.log"
+    env_file = root_dir / ".env"
+    compose_flags = root_dir / ".compose-flags"
+    return {
+        "root_dir": root_dir.as_posix(),
+        "env_file": {
+            "path": _source(env_file),
+            "exists": env_file.is_file(),
+        },
+        "compose_flags_file": {
+            "path": _source(compose_flags),
+            "exists": compose_flags.is_file(),
+        },
+        "compose_launch_record": {
+            "path": _source(compose_launch),
+            "exists": compose_launch.is_file(),
+        },
+        "compose_up_log": {
+            "path": _source(compose_up),
+            "exists": compose_up.is_file(),
+        },
+        "install_log": {
+            "path": _source(install_log),
+            "exists": install_log.is_file(),
+        },
+        "latest_install_report": (
+            {
+                "path": _source(latest_report),
+                "exists": True,
+            }
+            if latest_report
+            else {"path": None, "exists": False}
+        ),
+        "current_ods_containers": {
+            "managed": _int_arg(ods_managed_container_count),
+            "running": _int_arg(ods_running_container_count),
+        },
+    }
+
+
+def _collect_install_diagnoses(artifacts):
+    diagnoses = []
+    env_path = root_dir / ".env"
+    flags_path = root_dir / ".compose-flags"
+    compose_launch_path = root_dir / "logs" / "compose-launch.txt"
+    compose_up_path = root_dir / "logs" / "compose-up.log"
+    install_log_path = root_dir / "logs" / "install.log"
+    latest_report_path = _latest_install_report()
+
+    installed_like = (
+        flags_path.exists()
+        or compose_launch_path.exists()
+        or (root_dir / "data").exists()
+        or bool(latest_report_path)
+    )
+    if installed_like and not env_path.exists():
+        diagnoses.append(
+            _diagnosis(
+                "ODS-INSTALL-ENV-MISSING",
+                "blocker",
+                "high",
+                "Install directory is missing .env",
+                [
+                    _evidence(_source(env_path), "Expected installer-generated .env was not found."),
+                    _evidence(artifacts["root_dir"], "Doctor root appears to be an installed ODS tree."),
+                ],
+                "Docker Compose and service config can resolve missing or default values, causing startup failures.",
+                [
+                    "Re-run the installer from the source checkout.",
+                    "Run ODS commands from the installed directory that contains .env.",
+                ],
+            )
+        )
+
+    if compose_launch_path.exists():
+        launch_text = _read_text(compose_launch_path)
+        launch = _parse_kv_lines(launch_text)
+        launch_cwd = launch.get("cwd")
+        if launch_cwd:
+            try:
+                launch_cwd_path = pathlib.Path(launch_cwd).resolve()
+            except OSError:
+                launch_cwd_path = pathlib.Path(launch_cwd)
+            if launch_cwd_path != root_dir:
+                diagnoses.append(
+                    _diagnosis(
+                        "ODS-COMPOSE-CWD-MISMATCH",
+                        "blocker",
+                        "high",
+                        "Compose launch record points at a different working directory",
+                        [
+                            _evidence(_source(compose_launch_path), f"cwd={launch_cwd}"),
+                            _evidence("doctor.root_dir", root_dir.as_posix()),
+                        ],
+                        "Compose can miss .env or use the wrong relative compose files when launched outside the install directory.",
+                        [
+                            f"Run ODS commands from {root_dir.as_posix()}.",
+                            "Use `ods start` / `ods restart` instead of raw docker compose from a source checkout.",
+                        ],
+                    )
+                )
+
+    failure_sources = []
+    if latest_report_path:
+        failure_sources.append((latest_report_path, _read_text(latest_report_path)))
+    if compose_up_path.exists():
+        failure_sources.append((compose_up_path, _read_text(compose_up_path)))
+    if install_log_path.exists():
+        failure_sources.append((install_log_path, _read_text(install_log_path)))
+    combined_failure_text = "\n".join(text for _, text in failure_sources if text)
+
+    if combined_failure_text:
+        failed_image = _extract_image(combined_failure_text)
+        if failed_image:
+            evidence = []
+            if latest_report_path:
+                evidence.append(_evidence(_source(latest_report_path), f"Failed image: {failed_image}"))
+            if compose_up_path.exists():
+                evidence.append(_evidence(_source(compose_up_path), f"Failed image: {failed_image}"))
+            diagnoses.append(
+                _diagnosis(
+                    "ODS-DOCKER-IMAGE-UNRESOLVED",
+                    "blocker",
+                    "high",
+                    "Docker image reference could not be resolved",
+                    evidence,
+                    "The stack cannot start until the image tag is corrected, republished, or replaced by a supported fallback.",
+                    [
+                        f"Check whether `{failed_image}` exists in the registry.",
+                        "Update the image pin or pull a known-good ODS version, then re-run the installer.",
+                    ],
+                )
+            )
+
+        lowered = combined_failure_text.lower()
+        if _source_mentions_zero_containers(
+            combined_failure_text
+        ) and not _zero_container_failure_is_stale(failure_sources, compose_launch_path):
+            diagnoses.append(
+                _diagnosis(
+                    "ODS-COMPOSE-ZERO-CONTAINERS",
+                    "blocker",
+                    "high",
+                    "Docker Compose completed without creating ODS containers",
+                    [
+                        _evidence(_source(latest_report_path), "Report/log mentions zero managed containers.")
+                        if latest_report_path
+                        else _evidence(_source(compose_up_path), "Compose log mentions zero managed containers.")
+                    ],
+                    "Startup may appear to finish while no service is actually managed by the resolved compose stack.",
+                    [
+                        "Open logs/compose-launch.txt and run the saved ps/logs commands.",
+                        "Fix the compose/runtime error and re-run the installer.",
+                    ],
+                )
+            )
+
+        if "modulenotfounderror: no module named 'yaml'" in lowered or "pyyaml is required" in lowered:
+            diagnoses.append(
+                _diagnosis(
+                    "ODS-PYTHON-PYYAML-MISSING",
+                    "blocker",
+                    "high",
+                    "Selected Python cannot import PyYAML",
+                    [
+                        _evidence(
+                            _source(latest_report_path) if latest_report_path else _source(compose_up_path),
+                            "Failure text mentions missing yaml/PyYAML.",
+                        )
+                    ],
+                    "Compose resolution and generated config validation depend on PyYAML and can fail before services start.",
+                    [
+                        "Re-run the installer so it can install PyYAML or create the private installer venv.",
+                        "If using Conda/venv, deactivate it and retry with the system Python.",
+                    ],
+                )
+            )
+
+        alpine_probe_source = None
+        for source_path, source_text in failure_sources:
+            if _is_windows_alpine_probe_failure(source_text):
+                alpine_probe_source = source_path
+                break
+        if alpine_probe_source:
+            diagnoses.append(
+                _diagnosis(
+                    "ODS-WINDOWS-FILE-SHARING-PROBE-IMAGE",
+                    "warn",
+                    "medium",
+                    "Windows bind-mount probe was blocked before the file-sharing check completed",
+                    [
+                        _evidence(
+                            _source(alpine_probe_source),
+                            "Failure text includes Alpine probe image pull/download or bind-mount probe failure.",
+                        )
+                    ],
+                    "Docker Desktop can report a file-sharing failure when the real prerequisite is the probe image/network path.",
+                    [
+                        "Run `docker pull alpine:3.20` and verify Docker Desktop has internet access.",
+                        "Then verify Docker Desktop > Settings > Resources > File Sharing includes the install directory.",
+                    ],
+                )
+            )
+
+    # Deduplicate by id while preserving order; one diagnosis per root cause keeps
+    # the human output stable and avoids noisy repeats across install report/log.
+    seen = set()
+    unique = []
+    for item in diagnoses:
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        unique.append(item)
+    return unique
+
+
+install_artifacts = _collect_install_artifacts()
+inference_contract = _collect_inference_contract()
+diagnoses = _collect_install_diagnoses(install_artifacts) + inference_contract.get("diagnoses", [])
+inference_contract_public = dict(inference_contract)
+inference_contract_public.pop("diagnoses", None)
+
+report = {
+    "version": "1",
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "autofix_hints": [],
+    "capability_profile": cap,
+    "preflight": pre,
+    "install_artifacts": install_artifacts,
+    "diagnoses": diagnoses,
+    "runtime": {
+        "docker_cli": docker_cli == "true",
+        "docker_daemon": docker_daemon == "true",
+        "docker_access_denied": docker_access_denied == "true",
+        "compose_cli": compose_cli == "true",
+        "dashboard_http": dashboard_http == "true",
+        "webui_enabled": webui_enabled == "true",
+        "webui_http": webui_http == "true",
+        "llm_backend": {
+            "status": os.environ.get("LLM_STATUS", "unknown"),
+            "provider": os.environ.get("LLM_PROVIDER", ""),
+            "url": os.environ.get("LLM_URL", ""),
+            "model": os.environ.get("LLM_MODEL", ""),
+            "local_running_warning": os.environ.get("LLM_LOCAL_WARNING", "false") == "true",
+            "recovery_hint": os.environ.get("LLM_RECOVERY", ""),
+        },
+        "stt_model_cached": stt_cached,
+        "stt_model_name": stt_model_name,
+        "tts_http": tts_http,
+        "tts_port": tts_port,
+        "dgx_spark_gpu": dgx_spark_gpu == "true",
+        "dgx_spark_gpu_name": dgx_spark_gpu_name,
+        "dgx_spark_compute_cap": dgx_spark_compute_cap,
+        "llama_cuda_archs": llama_cuda_archs,
+        "dgx_spark_cuda_arch_check": {
+            "status": dgx_spark_arch_status,
+            "message": dgx_spark_arch_message,
+        },
+        "hermes_slash_workers": {
+            "count": hermes_slash_worker_count_num,
+            "max_count": hermes_slash_worker_max_count_num,
+            "status": "warn"
+            if hermes_slash_worker_count_num > hermes_slash_worker_max_count_num
+            else "pass",
+        },
+        "rootless_docker": os.environ.get("ROOTLESS_DOCKER") == "true",
+        "rootless_subid_check": {
+            "status": os.environ.get("ROOTLESS_SUBID_STATUS", "skipped"),
+            "user": os.environ.get("ROOTLESS_SUBID_USER", ""),
+            "subuid_total": _int_value(os.environ.get("ROOTLESS_SUBUID_TOTAL")),
+            "subgid_total": _int_value(os.environ.get("ROOTLESS_SUBGID_TOTAL")),
+        },
+        "amd_runtime": amd_runtime,
+        "inference_contract": inference_contract_public,
+    },
+    "extensions": ext_diagnostics,
+    "summary": {
+        "preflight_blockers": pre.get("summary", {}).get("blockers", 0),
+        "preflight_warnings": pre.get("summary", {}).get("warnings", 0),
+        "runtime_warnings": (
+            (1 if dgx_spark_arch_status == "warn" else 0)
+            + (1 if stt_cached in {"false", "service_down"} else 0)
+            + (1 if tts_http == "false" else 0)
+            + (1 if hermes_slash_worker_count_num > hermes_slash_worker_max_count_num else 0)
+            + (1 if os.environ.get("ROOTLESS_SUBID_STATUS") in {"warn", "fail"} else 0)
+            + len(amd_runtime.get("warnings", []))
+            + inference_contract.get("issue_counts", {}).get("warnings", 0)
+        ),
+        "runtime_contract_blockers": inference_contract.get("issue_counts", {}).get("blockers", 0),
+        "runtime_contract_warnings": inference_contract.get("issue_counts", {}).get("warnings", 0),
+        "diagnoses_total": len(diagnoses),
+        "diagnoses_blockers": sum(1 for d in diagnoses if d.get("severity") == "blocker"),
+        "diagnoses_warnings": sum(1 for d in diagnoses if d.get("severity") == "warn"),
+        "runtime_ready": (docker_daemon == "true" and compose_cli == "true"),
+        "extensions_total": len(ext_diagnostics),
+        "extensions_healthy": sum(1 for e in ext_diagnostics if e.get("health_status") == "healthy"),
+        "extensions_issues": sum(1 for e in ext_diagnostics if len(e.get("issues", [])) > 0),
+    },
+}
+
+fix_hints = []
+for diagnosis in diagnoses:
+    fix_hints.extend(diagnosis.get("next_steps", []))
+
+for check in pre.get("checks", []):
+    status = check.get("status")
+    action = (check.get("action") or "").strip()
+    if status in {"blocker", "warn"} and action:
+        fix_hints.append(action)
+
+runtime = report["runtime"]
+if not runtime["docker_cli"]:
+    fix_hints.append("Install Docker CLI/Docker Desktop and reopen your terminal.")
+if runtime["docker_cli"] and runtime["docker_access_denied"]:
+    fix_hints.append("Docker is running, but this account cannot use it yet. Log out and back in "
+                     "(or run 'newgrp docker') so the docker group membership applies, then run "
+                     "ods doctor again.")
+elif runtime["docker_cli"] and not runtime["docker_daemon"]:
+    fix_hints.append("Start Docker daemon/Desktop before launching ODS.")
+if not runtime["compose_cli"]:
+    fix_hints.append("Install Docker Compose v2 plugin (or docker-compose).")
+if runtime["docker_daemon"] and not runtime["dashboard_http"]:
+    fix_hints.append(f"Run installer/start command, then verify dashboard on http://127.0.0.1:{dashboard_port}.")
+if runtime["docker_daemon"] and runtime["webui_enabled"] and not runtime["webui_http"]:
+    fix_hints.append(f"Verify Open WebUI container and port {webui_port} mapping.")
+
+llm_status = os.environ.get("LLM_STATUS", "unknown")
+llm_recovery = os.environ.get("LLM_RECOVERY", "")
+llm_provider = os.environ.get("LLM_PROVIDER", "")
+llm_local_warn = os.environ.get("LLM_LOCAL_WARNING", "false") == "true"
+llm_failure = os.environ.get("LLM_FAILURE", "")
+
+if llm_status == "fail" and llm_recovery:
+    if llm_provider != "llama-server" and llm_failure in ("key-refused", "key-required"):
+        fix_hints.append(f"External LLM backend ({llm_provider}) answered but did not accept a stored API key. Hint: {llm_recovery}")
+    elif llm_provider != "llama-server":
+        fix_hints.append(f"External LLM backend ({llm_provider}) is unreachable. Hint: {llm_recovery}")
+    else:
+        fix_hints.append(f"Local llama-server is unreachable. Hint: {llm_recovery}")
+
+if llm_local_warn:
+    fix_hints.append("External LLM is configured but the local llama-server container is still running. Stop it with: ods stop llama-server")
+# Rootless daemon without (enough) subordinate IDs: images fail to extract
+# with "uid/gid map out of range" long after doctor reports healthy Docker.
+# Two hints: the fixed 100000-165535 range is only safe to suggest when the
+# user has NO allocation; with an existing-but-small range that command
+# could overlap what is already allocated, so ask for a non-overlapping
+# extension instead.
+_rootless_subid = report["runtime"]["rootless_subid_check"]
+if _rootless_subid["status"] == "fail":
+    fix_hints.append(
+        "Rootless Docker: no subordinate ID allocation for "
+        f"{_rootless_subid['user']} "
+        f"(subuids={_rootless_subid['subuid_total']}, subgids={_rootless_subid['subgid_total']}). "
+        f"Run: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {_rootless_subid['user']} "
+        "then restart the rootless Docker daemon (systemctl --user restart docker)."
+    )
+elif _rootless_subid["status"] == "warn":
+    fix_hints.append(
+        "Rootless Docker: subordinate ID allocation for "
+        f"{_rootless_subid['user']} is below 65536 "
+        f"(subuids={_rootless_subid['subuid_total']}, subgids={_rootless_subid['subgid_total']}). "
+        "Extend it to at least 65536 IDs with a range that does not overlap "
+        "existing entries in /etc/subuid and /etc/subgid "
+        f"(sudo usermod --add-subuids <start>-<start+65535> --add-subgids <start>-<start+65535> {_rootless_subid['user']}), "
+        "then restart the rootless Docker daemon (systemctl --user restart docker)."
+    )
+
+# STT model cache: service up but model missing is a common silent failure
+if stt_cached == "false" and stt_recovery:
+    fix_hints.append(
+        f"Whisper STT model '{stt_model_name}' not cached — transcription will 404. "
+        f"Run: {stt_recovery}"
+    )
+elif stt_cached == "service_down":
+    fix_hints.append("Whisper STT is not responding. Run: ods repair voice")
+
+if tts_http == "false":
+    fix_hints.append("Kokoro TTS is not responding. Run: ods repair voice")
+
+if hermes_slash_worker_count_num > hermes_slash_worker_max_count_num:
+    fix_hints.append(
+        f"Hermes has {hermes_slash_worker_count_num} slash_worker children "
+        f"(policy max {hermes_slash_worker_max_count_num}). Run: ods repair hermes-workers"
+    )
+
+if dgx_spark_arch_status == "warn":
+    fix_hints.append(
+        "This GPU (DGX Spark GB10 or RTX Spark N1X, compute capability 12.1) runs a llama-server without "
+        "sm_121 kernels, so its answers can come back as '????'. Rerun the ODS installer: it selects the "
+        "CUDA 13 llama.cpp image (server-cuda13) pinned for this GPU. If you set LLAMA_SERVER_IMAGE yourself, "
+        "use that image or a llama.cpp build made with -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121."
+    )
+
+for warning in amd_runtime.get("warnings", []):
+    if warning == "health_unreachable":
+        fix_hints.append("AMD inference runtime is configured but its health endpoint is unreachable. Start the runtime or run 'ods restart'.")
+    elif warning == "amd_supported_backends_env_missing":
+        fix_hints.append("AMD runtime capabilities are missing from .env. Re-run the installer or add AMD_INFERENCE_SUPPORTED_BACKENDS.")
+    elif warning == "amd_selected_backend_not_supported":
+        fix_hints.append("AMD_INFERENCE_BACKEND is not listed in AMD_INFERENCE_SUPPORTED_BACKENDS. Check the installer-generated .env.")
+
+# Extension-specific hints
+for ext in ext_diagnostics:
+    ext_id = ext.get("id", "unknown")
+    container_state = ext.get("container_state", "unknown")
+    issues = ext.get("issues", [])
+    for issue in issues:
+        if issue == "container_not_running":
+            if container_state == "not_found":
+                fix_hints.append(f"Extension {ext_id}: not installed (image not built). Skipped by installer or disabled by tier system.")
+            else:
+                fix_hints.append(f"Extension {ext_id}: container not running. Run 'ods start {ext_id}'.")
+        elif issue == "health_check_failed":
+            fix_hints.append(f"Extension {ext_id}: health check failed. Check logs with 'docker logs ods-{ext_id}'.")
+        elif issue == "gpu_backend_incompatible":
+            fix_hints.append(f"Extension {ext_id}: incompatible with current GPU backend. Consider disabling.")
+        elif issue.startswith("missing_dependency:"):
+            dep = issue.split(":", 1)[1]
+            fix_hints.append(f"Extension {ext_id}: missing dependency '{dep}'. Run 'ods enable {dep}'.")
+
+
+# Deduplicate while preserving order
+seen = set()
+uniq_hints = []
+for hint in fix_hints:
+    if hint in seen:
+        continue
+    seen.add(hint)
+    uniq_hints.append(hint)
+
+report["autofix_hints"] = uniq_hints  # overwrite initial empty list
+
+path = pathlib.Path(report_file)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+PY
+
+echo "ODS Doctor report: $REPORT_FILE"
+echo "  Preflight blockers: ${PREFLIGHT_BLOCKERS:-0}"
+echo "  Preflight warnings: ${PREFLIGHT_WARNINGS:-0}"
+echo "  Docker daemon: $DOCKER_DAEMON"
+if [[ "$DOCKER_ACCESS_DENIED" == "true" ]]; then
+    echo "  Docker access: permission denied for $(id -un); log out and back in (or run 'newgrp docker')"
+fi
+echo "  Compose CLI:   $COMPOSE_CLI"
+"$PYTHON_CMD" - "$REPORT_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    data = json.load(open(path, "r", encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+
+# Show extension summary
+summary = data.get("summary", {})
+ext_total = summary.get("extensions_total", 0)
+ext_healthy = summary.get("extensions_healthy", 0)
+ext_issues = summary.get("extensions_issues", 0)
+
+if ext_total > 0:
+    print(f"  Extensions:    {ext_healthy}/{ext_total} healthy, {ext_issues} with issues")
+
+dgx_check = data.get("runtime", {}).get("dgx_spark_cuda_arch_check", {})
+if dgx_check.get("status") == "warn":
+    print(f"  Spark GPU:     warning - {dgx_check.get('message')}")
+elif dgx_check.get("status") == "pass":
+    print("  Spark GPU:     llama-server includes sm_121 kernels")
+
+amd_runtime = data.get("runtime", {}).get("amd_runtime", {})
+if amd_runtime.get("available"):
+    print(
+        "  AMD Runtime:   "
+        f"{amd_runtime.get('runtime')} / {amd_runtime.get('selectedBackend')} / "
+        f"{amd_runtime.get('location')} / {amd_runtime.get('health')}"
+    )
+elif amd_runtime.get("reason") not in (None, "", "not_amd", "api_mode"):
+    print(f"  AMD Runtime:   {amd_runtime.get('reason')}")
+
+hermes_workers = data.get("runtime", {}).get("hermes_slash_workers", {})
+if hermes_workers.get("status") == "warn":
+    print(
+        "  Hermes:        "
+        f"{hermes_workers.get('count')} slash_worker processes "
+        f"(policy max {hermes_workers.get('max_count')})"
+    )
+
+diagnoses = data.get("diagnoses") or []
+if diagnoses:
+    blockers = sum(1 for item in diagnoses if item.get("severity") == "blocker")
+    warnings = sum(1 for item in diagnoses if item.get("severity") == "warn")
+    print(f"  Diagnoses:     {len(diagnoses)} total, {blockers} blocker(s), {warnings} warning(s)")
+    for item in diagnoses[:5]:
+        print(f"    - {item.get('id')}: {item.get('title')}")
+
+hints = data.get("autofix_hints") or []
+if hints:
+    print("  Suggested fixes:")
+    for hint in hints[:10]:
+        print(f"    - {hint}")
+
+# The ODS community Discord (ODS_HELP_DISCORD_URL in installers/lib/constants.sh).
+if diagnoses or hints:
+    print("  Need help? Ask on the ODS Discord: https://discord.gg/4ntNp9MAwC")
+    print("    Attach a redacted support bundle: scripts/ods-support-bundle.sh")
+PY

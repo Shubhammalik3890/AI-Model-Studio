@@ -1,0 +1,299 @@
+#!/usr/bin/env pwsh
+<#
+ODS Windows installer (WSL2-delegated MVP).
+Runs preflight checks on Windows, then delegates to install-core.sh inside WSL.
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$NoDelegate,
+    [switch]$SkipDockerCheck,
+    [string]$Distro = "",
+    [string]$InstallRoot = "",
+    [string]$DockerDesktopPath = "",
+    [switch]$OpenPortal,
+    [string]$StateRoot = "",
+    [string]$ReportPath = "$env:TEMP\\ods-windows-preflight.json",
+    # Linux flags for a new installation only; a rerun keeps the installed selection.
+    [string[]]$NewInstallationArgs = @(),
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$PassthroughArgs
+)
+
+$ErrorActionPreference = "Stop"
+$checks = @()
+$requestedInstallRoot = $InstallRoot
+$requestedDockerDesktopPath = $DockerDesktopPath
+. (Join-Path $PSScriptRoot "wsl-lifecycle.ps1") -Distro $Distro -StateRoot $StateRoot
+# Dot-sourcing binds the lifecycle script's own DockerDesktopPath parameter in
+# this scope. Keep the verified path supplied by the Portal entry point.
+$DockerDesktopPath = $requestedDockerDesktopPath
+
+function Write-Section([string]$Message) {
+    Write-Host ""
+    Write-Host $Message -ForegroundColor Cyan
+}
+
+function Add-Check([string]$Id, [string]$Status, [string]$Message, [string]$Action = "") {
+    $script:checks += [pscustomobject]@{
+        id = $Id
+        status = $Status
+        message = $Message
+        action = $Action
+    }
+}
+
+function Convert-ToWslPath([string]$WindowsPath) {
+    if ($WindowsPath -match '^([A-Za-z]):\\(.*)$') {
+        $drive = $Matches[1].ToLower()
+        $rest = $Matches[2] -replace '\\', '/'
+        return "/mnt/$drive/$rest"
+    }
+    return $WindowsPath -replace '\\', '/'
+}
+
+Write-Host "ODS Windows installer (WSL2 path)" -ForegroundColor Cyan
+
+Write-Section "Checking prerequisites"
+if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+    Write-Host "[ERROR] WSL is not installed." -ForegroundColor Red
+    Write-Host "Install WSL first: wsl --install"
+    Add-Check "wsl-installed" "blocker" "WSL is not installed." "Run: wsl --install"
+} else {
+    Add-Check "wsl-installed" "pass" "WSL command is available."
+}
+
+$wslStatus = ""
+if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+    try {
+        $wslStatus = (& wsl.exe --status 2>$null | Out-String)
+    } catch { }
+    if ($wslStatus -match "Default Version:\s*2") {
+        Add-Check "wsl-default-version" "pass" "WSL default version is 2."
+    } else {
+        Add-Check "wsl-default-version" "warn" "WSL default version is not clearly set to 2." "Run: wsl --set-default-version 2"
+    }
+}
+
+$distroList = @()
+if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+    $distroList = @(& wsl.exe -l -q 2>$null | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ -and $_ -notmatch "^docker-desktop(?:-data)?$" })
+}
+if (-not $distroList) {
+    Write-Host "[ERROR] No WSL distro found." -ForegroundColor Red
+    Write-Host "Install Ubuntu (example): wsl --install -d Ubuntu"
+    Add-Check "wsl-distro" "blocker" "No WSL distro found." "Run: wsl --install -d Ubuntu"
+} else {
+    Add-Check "wsl-distro" "pass" "Detected WSL distro(s): $($distroList -join ', ')"
+}
+
+if ([string]::IsNullOrWhiteSpace($Distro)) {
+    if ($distroList.Count -gt 0) {
+        $Distro = $distroList[0].Trim()
+    }
+}
+
+if (-not $SkipDockerCheck) {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        Write-Host "[WARN] docker CLI not found on Windows PATH." -ForegroundColor Yellow
+        Write-Host "Install Docker Desktop and enable WSL integration."
+        Add-Check "docker-cli" "warn" "docker CLI not found on Windows PATH." "Install Docker Desktop and reopen terminal."
+    } else {
+        Add-Check "docker-cli" "pass" "docker CLI found."
+        try {
+            $dockerInfo = docker info 2>$null | Out-String
+            $null = docker version --format '{{.Server.Version}}' 2>$null
+            Write-Host "[OK] Docker Desktop engine reachable."
+            Add-Check "docker-daemon" "pass" "Docker Desktop engine reachable."
+            if ($dockerInfo -match "WSL2:\s*true") {
+                Add-Check "docker-wsl2" "pass" "Docker reports WSL2 backend enabled."
+            } else {
+                Add-Check "docker-wsl2" "warn" "Docker WSL2 backend not confirmed from docker info output." "Enable 'Use the WSL2 based engine' in Docker Desktop settings."
+            }
+        } catch {
+            Write-Host "[WARN] Docker Desktop not reachable yet." -ForegroundColor Yellow
+            Write-Host "Start Docker Desktop before running install for real."
+            Add-Check "docker-daemon" "warn" "Docker Desktop not reachable." "Start Docker Desktop and retry."
+        }
+    }
+}
+
+if ($Distro) {
+    try {
+        $wslDocker = (& wsl.exe -d $Distro -- bash -lc "command -v docker >/dev/null && echo ok || echo missing" 2>$null).Trim()
+        if ($wslDocker -eq "ok") {
+            Add-Check "wsl-docker-cli" "pass" "docker CLI available inside WSL distro '$Distro'."
+        } else {
+            Add-Check "wsl-docker-cli" "warn" "docker CLI unavailable inside WSL distro '$Distro'." "Enable Docker Desktop WSL integration for this distro."
+        }
+    } catch {
+        Add-Check "wsl-docker-cli" "warn" "Could not verify docker CLI inside WSL distro '$Distro'." "Open WSL and run: docker info"
+    }
+}
+
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    Write-Host "[OK] NVIDIA tooling detected on Windows host."
+    Add-Check "windows-nvidia-smi" "pass" "nvidia-smi available on Windows host."
+} else {
+    Write-Host "[INFO] nvidia-smi not found on Windows host (non-NVIDIA or not installed)."
+    Add-Check "windows-nvidia-smi" "warn" "nvidia-smi not detected on Windows host." "Install/update NVIDIA driver if targeting NVIDIA acceleration."
+}
+
+if ($Distro) {
+    try {
+        $wslNvidia = (& wsl.exe -d $Distro -- bash -lc "if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi -L >/dev/null 2>&1 && echo ok || echo missing; else echo missing; fi" 2>$null).Trim()
+        if ($wslNvidia -eq "ok") {
+            Add-Check "wsl-nvidia-smi" "pass" "NVIDIA GPU visible inside WSL."
+        } else {
+            Add-Check "wsl-nvidia-smi" "warn" "NVIDIA GPU not visible inside WSL." "Verify WSL GPU support and Docker Desktop GPU passthrough."
+        }
+    } catch {
+        Add-Check "wsl-nvidia-smi" "warn" "Could not verify NVIDIA GPU inside WSL." "Open WSL and run: nvidia-smi"
+    }
+}
+
+try {
+    $blockers = @($checks | Where-Object { $_.status -eq "blocker" }).Count
+    $warnings = @($checks | Where-Object { $_.status -eq "warn" }).Count
+    $report = [pscustomobject]@{
+        version = "1"
+        generated_at = (Get-Date).ToUniversalTime().ToString("o")
+        distro = $Distro
+        summary = [pscustomobject]@{
+            checks = $checks.Count
+            blockers = $blockers
+            warnings = $warnings
+            can_proceed = ($blockers -eq 0)
+        }
+        checks = $checks
+    }
+    $report | ConvertTo-Json -Depth 8 | Set-Content -Path $ReportPath -Encoding UTF8
+    Write-Host "[INFO] Preflight report: $ReportPath"
+} catch {
+    Write-Host "[WARN] Could not write preflight report: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+if (@($checks | Where-Object { $_.status -eq "blocker" }).Count -gt 0) {
+    Write-Host "[ERROR] Preflight blockers found. Fix them, then retry." -ForegroundColor Red
+    $checks | Where-Object { $_.status -eq "blocker" } | ForEach-Object {
+        Write-Host "  - $($_.message)" -ForegroundColor Red
+        if ($_.action) { Write-Host "    Fix: $($_.action)" }
+    }
+    exit 1
+}
+
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+$repoRootWsl = Convert-ToWslPath $repoRoot
+
+Write-Section "WSL delegation target"
+Write-Host "Repo path (Windows): $repoRoot"
+Write-Host "Repo path (WSL):     $repoRootWsl"
+
+$wslCommand = New-ODSWslInstallerCommand $repoRootWsl $PassthroughArgs ""
+Write-Host "Command:"
+Write-Host "  wsl.exe bash -lc `"$wslCommand`""
+
+if ($NoDelegate) {
+    Write-Host ""
+    Write-Host "Delegation skipped (--NoDelegate)." -ForegroundColor Yellow
+    exit 0
+}
+
+# Establish the independent Windows-owned WSL client before the installer's
+# client can exit. The installed directory may not exist until install-core runs.
+if ($requestedInstallRoot) {
+    $linuxInstallRoot = $requestedInstallRoot
+} else {
+    $rootCommand = New-ODSWslRootCommand $repoRootWsl
+    $linuxInstallRoot = (& wsl.exe --distribution $Distro --exec bash -lc $rootCommand | Select-Object -Last 1).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Could not resolve the Linux installation directory" }
+}
+$Distro = Resolve-ODSWslRegisteredDistro $Distro
+$lifetimeIdentity = Get-ODSWslIdentity $Distro $linuxInstallRoot
+# Pin the resolver result into the actual installer invocation, even when a
+# later login shell would choose different environment defaults.
+$wslCommand = New-ODSWslInstallerCommand $repoRootWsl $PassthroughArgs $lifetimeIdentity.installRoot
+# Help and dry-run retain their preview semantics: no persistent Windows task.
+$lifetimeRequired = -not (@($PassthroughArgs | Where-Object { $_ -cin @('--dry-run','--help','-h') }).Count -gt 0)
+if ($lifetimeRequired) {
+    # Secure an explicit state base before the per-instance initializer can
+    # create it as an ordinary inherited parent directory.
+    if ($StateRoot) { Initialize-ODSPrivateDirectory $script:ODSWslStateRoot }
+    Initialize-ODSPrivateDirectory $lifetimeIdentity.directory
+    $lifetimeLock = Open-ODSPrivateLock (Join-Path $lifetimeIdentity.directory 'command.lock')
+    try { $null = Start-ODSWslLifetime $lifetimeIdentity } finally { $lifetimeLock.Dispose() }
+    Write-Host "ODS WSL lifetime is active independently of this installer window."
+    $stateHint = if ($StateRoot) { " -StateRoot `"$StateRoot`"" } else { '' }
+    Write-Host "Lifecycle: powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\wsl-lifecycle.ps1`" -Action status|stop|start|restart -Distro `"$Distro`" -InstallRoot `"$linuxInstallRoot`"$stateHint"
+    # Record, before install-core creates it, whether this root already holds
+    # an installation (every uninstall removes .env, even with --keep-data).
+    & wsl.exe --distribution $Distro --exec /usr/bin/test -e "$($lifetimeIdentity.installRoot)/.env"
+    $newInstallation = $LASTEXITCODE -eq 1
+    # Portal setup's -NewInstallationArgs apply to a new installation only. A
+    # rerun leaves them out, so install-core keeps the owner's current
+    # selection (for example Hermes added from the Extensions Library).
+    if ($newInstallation -and $NewInstallationArgs) {
+        $PassthroughArgs = @($PassthroughArgs | Where-Object { $null -ne $_ }) + @($NewInstallationArgs | Where-Object { $_ -cnotin $PassthroughArgs })
+        $wslCommand = New-ODSWslInstallerCommand $repoRootWsl $PassthroughArgs $lifetimeIdentity.installRoot
+        Write-Host "New installation: the Linux installer also gets $($NewInstallationArgs -join ' ')"
+    }
+}
+
+Write-Section "Running installer in WSL"
+if ($Distro) {
+    & wsl.exe -d $Distro bash -lc $wslCommand
+} else {
+    & wsl.exe bash -lc $wslCommand
+}
+$installerExitCode = $LASTEXITCODE
+if ($installerExitCode -eq 0 -and $lifetimeRequired -and '--pixel' -cin $PassthroughArgs) {
+    $agentAddress=Update-ODSWslAgentAddress $lifetimeIdentity
+    if ($agentAddress.mode -eq 'wsl-nat-bridge') {
+        if ($agentAddress.changed) { Invoke-ODSWslNativeUnit $lifetimeIdentity 'restart' 'ods-host-agent.service' }
+        Start-ODSWslAgentRelay $lifetimeIdentity
+    } else { Stop-ODSWslAgentRelay $lifetimeIdentity }
+    $verifyPath = Convert-ToWslPath (Join-Path $PSScriptRoot 'verify-wsl-portal.sh')
+    $verifyCommand = 'bash ' + (ConvertTo-ODSBashArgument $verifyPath) + ' ' + (ConvertTo-ODSBashArgument $linuxInstallRoot)
+    # Capture stdout only (stderr stays on the console) to read the Portal URL.
+    $verifyOutput = @(& wsl.exe --distribution $Distro --exec bash -lc $verifyCommand)
+    $installerExitCode = $LASTEXITCODE
+    $verifyOutput | Where-Object { $_ -notmatch '^ODS_PORTAL_URL=' } | ForEach-Object { Write-Host $_ }
+    if ($installerExitCode -ne 0) {
+        Write-Warning 'Pixel/Portal verification failed. ODS is not ready; inspect the reported service or endpoint and rerun the same install command. No Hermes fallback was started.'
+    } else {
+        # Only a verified installation receives automatic sign-in recovery.
+        # A prior explicit stop preference is preserved across installer reruns;
+        # a new installation does not inherit the stop its uninstall recorded.
+        if ($DockerDesktopPath -or (Test-Path -LiteralPath (Join-Path $lifetimeIdentity.directory 'startup-config.json'))) {
+            Enable-ODSWslStartup $lifetimeIdentity $DockerDesktopPath -NewInstallation:$newInstallation
+            Write-Host "Durable lifecycle: powershell -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $lifetimeIdentity.directory 'startup.ps1')`" -Action status -Distro `"$Distro`" -InstallRoot `"$linuxInstallRoot`"$stateHint"
+        } else {
+            Write-Warning 'Use the Windows Portal setup entry point to enable verified sign-in recovery.'
+        }
+    }
+    if ($installerExitCode -eq 0 -and $OpenPortal) {
+        $portalUrl = @($verifyOutput | ForEach-Object { if ($_ -match '^ODS_PORTAL_URL=(http://localhost:[0-9]{1,5}/pixel)$') { $Matches[1] } } | Select-Object -Last 1)
+        if ($portalUrl.Count -eq 1) {
+            # The ODS app (an Edge app window with the ODS icon), or the
+            # 'ODS Portal' web link when Edge or the shortcut is unavailable.
+            . (Join-Path $PSScriptRoot 'windows/lib/app-shortcut.ps1')
+            $appIcon = Join-Path (Split-Path -Parent $PSScriptRoot) 'extensions/services/dashboard/public/osmantic-os.ico'
+            $shortcuts = @(Publish-ODSPortalShortcut -PortalUrl $portalUrl[0] -IconSource $appIcon)
+            if ($shortcuts.Count -and $lifetimeRequired) {
+                # Uninstall (wsl-lifecycle disable-startup -RetireRelay) removes
+                # exactly these. Like the shortcut itself, never fail the install.
+                try {
+                    Write-ODSWslJson (Join-Path $lifetimeIdentity.directory 'shortcuts.json') @{ shortcuts = @(Get-ODSPortalShortcutRecord $shortcuts) }
+                } catch {
+                    Write-Warning "Uninstall will not remove the ODS shortcuts: their record was not saved: $($_.Exception.Message)"
+                }
+            }
+            Write-Host "Opening Portal: $($portalUrl[0])"
+            Start-Process $portalUrl[0]
+        }
+    }
+}
+if ($installerExitCode -ne 0 -and $lifetimeRequired) {
+    Write-Warning "Installation failed. The ODS WSL lifetime remains available for diagnosis; use lifecycle release to release only its WSL client if the incomplete install cannot stop normally."
+}
+exit $installerExitCode

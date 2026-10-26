@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en" translate="no" class="notranslate">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Browser translation can replace text nodes owned by React during streams. -->
+    <meta name="google" content="notranslate" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="description" content="ODS Dashboard - Control your local AI" />
+    <title>ODS</title>
+    <script src="/pixel-mascot.js?v=portal-cloud-20260918"></script>
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/ods-metal-favicon.svg?v=20260908" />
+
+    <!-- PWA manifest — makes the dashboard installable as "ODS" on phone home screens -->
+    <link rel="manifest" href="/manifest.webmanifest?v=os-20260627" />
+    <meta name="theme-color" content="#0f0f13" />
+
+    <!-- iOS PWA support: "Add to Home Screen" → standalone mode with custom icon and title -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="ODS" />
+    <link rel="apple-touch-icon" href="/osmantic-os-icon-192.png" />
+    <!-- Prevent a flash of the wrong theme; must stay synchronous in <head>. -->
+    <script src="/theme-init.js"></script>
+    <style>
+      /* Critical CSS for instant load feel */
+      body {
+        margin: 0;
+        background: var(--theme-bg, #111212);
+        color: var(--theme-text, #e4e4e7);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+      #root {
+        min-height: 100vh;
+      }
+      .loading-screen {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        flex-direction: column;
+        gap: 1rem;
+      }
+      .loading-logo {
+        font-family: inherit;
+        font-size: 1.5rem;
+        font-weight: bold;
+        color: var(--theme-loading-logo, #dedfe3);
+        letter-spacing: 0.1em;
+        animation: pulse 2s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 0.6; transform: scale(1); }
+        50% { opacity: 1; transform: scale(1.1); }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="loading-screen">
+        <div class="loading-logo">ODS</div>
+        <div>Loading ODS...</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.jsx"></script>
+    <script src="/sw-register.js" defer></script>
+  </body>
+</html>

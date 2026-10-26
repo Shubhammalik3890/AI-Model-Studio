@@ -1,0 +1,3721 @@
+"""Focused tests for the models router helpers."""
+
+from __future__ import annotations
+
+import importlib
+import asyncio
+import json
+import os
+import sys
+import threading
+import time
+import types
+import httpx
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import AsyncMock
+
+import pytest
+
+from models import BootstrapStatus, GPUInfo
+
+
+def _hf_sibling(filename: str, size: int, sha: str) -> dict:
+    return {
+        "rfilename": filename,
+        "size": size,
+        "lfs": {"size": size, "sha256": sha},
+    }
+
+
+def test_active_model_reader_preserves_unmatched_quote(monkeypatch, tmp_path):
+    import routers.models as models_router
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("GGUF_FILE=model-v2.gguf'\n", encoding="utf-8")
+    monkeypatch.setattr(models_router, "_ENV_PATH", env_path)
+
+    assert models_router._read_active_model() == "model-v2.gguf'"
+
+
+def test_huggingface_artifacts_group_complete_shards_and_require_integrity():
+    import routers.models as models_router
+
+    sha_a = "a" * 64
+    sha_b = "b" * 64
+    payload = {
+        "siblings": [
+            _hf_sibling("model-Q4_K_M.gguf", 1024, sha_a),
+            _hf_sibling("model-Q5_K_M-00001-of-00002.gguf", 2048, sha_a),
+            _hf_sibling("model-Q5_K_M-00002-of-00002.gguf", 4096, sha_b),
+            _hf_sibling("broken-Q6_K-00001-of-00002.gguf", 2048, sha_a),
+            _hf_sibling("mmproj-model-f16.gguf", 512, sha_a),
+            _hf_sibling("vision-projector.gguf", 512, sha_a),
+            _hf_sibling("model-lora-Q8_0.gguf", 512, sha_a),
+            {"rfilename": "missing-integrity.gguf", "size": 100},
+            _hf_sibling("config.json", 200, sha_a),
+        ],
+    }
+
+    artifacts = models_router._hf_gguf_artifacts(payload)
+
+    assert len(artifacts) == 2
+    assert artifacts[0]["label"] == "model-Q4_K_M.gguf"
+    assert artifacts[0]["quantization"] == "Q4_K_M"
+    assert artifacts[1]["split"] is True
+    assert artifacts[1]["sizeBytes"] == 6144
+    assert [item["filename"] for item in artifacts[1]["files"]] == [
+        "model-Q5_K_M-00001-of-00002.gguf",
+        "model-Q5_K_M-00002-of-00002.gguf",
+    ]
+
+
+def test_huggingface_split_artifacts_do_not_mix_matching_nested_directories():
+    import routers.models as models_router
+
+    payload = {
+        "siblings": [
+            _hf_sibling(f"{folder}/model-Q4-0000{part}-of-00002.gguf", 1024, char * 64)
+            for folder, char in (("one", "a"), ("two", "b"))
+            for part in (1, 2)
+        ],
+    }
+
+    artifacts = models_router._hf_gguf_artifacts(payload)
+
+    assert [artifact["label"] for artifact in artifacts] == [
+        "one/model-Q4 (2 parts)",
+        "two/model-Q4 (2 parts)",
+    ]
+    assert all(len(artifact["files"]) == 2 for artifact in artifacts)
+
+
+def test_huggingface_search_count_excludes_non_model_gguf_artifacts():
+    import routers.models as models_router
+
+    result = models_router._hf_search_item({
+        "id": "org/model",
+        "siblings": [
+            {"rfilename": "model-Q4_K_M.gguf"},
+            {"rfilename": "mmproj-model-f16.gguf"},
+            {"rfilename": "vision-projector.gguf"},
+            {"rfilename": "adapter-lora.gguf"},
+        ],
+    })
+
+    assert result is not None
+    assert result["ggufFileCount"] == 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_context", "expected_source"),
+    [
+        (
+            {
+                "gguf": {"context_length": 8192},
+                "config": {"max_position_embeddings": 131072},
+            },
+            8192,
+            "gguf_metadata",
+        ),
+        (
+            {"config": {"text_config": {"model_max_length": 262144}}},
+            262144,
+            "hub_config",
+        ),
+        ({}, None, "unavailable"),
+    ],
+)
+def test_huggingface_context_prefers_gguf_metadata_without_inventing_fallback(
+    payload, expected_context, expected_source,
+):
+    import routers.models as models_router
+
+    assert models_router._hf_context_length(payload) == (
+        expected_context,
+        expected_source,
+    )
+
+
+def test_huggingface_context_accepts_large_authoritative_gguf_window():
+    import routers.models as models_router
+
+    assert models_router._hf_context_length({
+        "gguf": {"context_length": 8_388_608},
+        "config": {"max_position_embeddings": 131072},
+    }) == (8_388_608, "gguf_metadata")
+
+
+def test_huggingface_context_rejects_tokenizer_sentinel_from_hub_config():
+    import routers.models as models_router
+
+    assert models_router._hf_context_length({
+        "config": {"model_max_length": 10 ** 30},
+    }) == (None, "unavailable")
+
+
+@pytest.mark.asyncio
+async def test_huggingface_repository_requests_gguf_metadata_with_blob_integrity(
+    monkeypatch,
+):
+    import routers.models as models_router
+
+    seen = {}
+
+    async def fake_get(
+        path,
+        *,
+        params=None,
+        timeout_seconds=20.0,
+        connect_timeout_seconds=8.0,
+    ):
+        seen["path"] = path
+        seen["params"] = params
+        seen["timeout_seconds"] = timeout_seconds
+        seen["connect_timeout_seconds"] = connect_timeout_seconds
+        return {
+            "id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+            "sha": "a" * 40,
+            "pipeline_tag": "text-generation",
+            "gguf": {"context_length": 8192},
+            "siblings": [{
+                "rfilename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+                "lfs": {"size": 400_000_000, "sha256": "b" * 64},
+            }],
+        }, httpx.Headers()
+
+    monkeypatch.setattr(models_router, "_hf_get_json", fake_get)
+    monkeypatch.setattr(models_router, "_read_model_records", lambda *_args, **_kwargs: [])
+
+    details = await models_router._hf_repo_details(
+        "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    )
+
+    assert seen == {
+        "path": "/api/models/Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "params": {
+            "blobs": "true",
+            "expand": [
+                "gguf",
+                "sha",
+                "downloads",
+                "likes",
+                "lastModified",
+                "pipeline_tag",
+                "gated",
+                "private",
+                "tags",
+                "cardData",
+            ],
+        },
+        "timeout_seconds": 60.0,
+        "connect_timeout_seconds": 20.0,
+    }
+    assert details["contextLength"] == 8192
+    assert details["contextSource"] == "gguf_metadata"
+    assert details["sha"] == "a" * 40
+    assert details["artifacts"][0]["files"][0]["sha256"] == "b" * 64
+
+
+def test_huggingface_search_tolerates_malformed_activity_counts():
+    import routers.models as models_router
+
+    result = models_router._hf_search_item({
+        "id": "org/model",
+        "downloads": "unknown",
+        "likes": {"unexpected": True},
+        "siblings": 42,
+        "tags": 42,
+    })
+
+    assert result is not None
+    assert result["downloads"] == 0
+    assert result["likes"] == 0
+    assert result["tags"] == []
+
+
+@pytest.mark.parametrize("payload", [
+    {"id": "org/speech-model", "pipeline_tag": "automatic-speech-recognition"},
+    {"id": "org/embed-model", "pipeline_tag": "text-generation"},
+    {"id": "org/model", "pipeline_tag": "feature-extraction"},
+    {"id": "org/model", "tags": ["sentence-transformers"]},
+])
+def test_huggingface_non_llm_repositories_are_browse_only(payload):
+    import routers.models as models_router
+
+    compatible, reason = models_router._hf_llm_runtime_compatibility(payload)
+
+    assert compatible is False
+    assert reason
+
+
+def test_huggingface_text_generation_repository_is_importable():
+    import routers.models as models_router
+
+    compatible, reason = models_router._hf_llm_runtime_compatibility({
+        "id": "org/chat-model",
+        "pipeline_tag": "text-generation",
+        "tags": ["conversational"],
+    })
+
+    assert compatible is True
+    assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_huggingface_get_retries_one_transient_transport_failure(monkeypatch):
+    import routers.models as models_router
+
+    attempts = 0
+
+    class Response:
+        status_code = 200
+        headers = httpx.Headers()
+
+        @staticmethod
+        def json():
+            return {"id": "org/model"}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectError("temporary", request=httpx.Request("GET", url))
+            return Response()
+
+    monkeypatch.setattr(models_router.httpx, "AsyncClient", Client)
+
+    payload, _headers = await models_router._hf_get_json("/api/models/org/model")
+
+    assert attempts == 2
+    assert payload == {"id": "org/model"}
+
+
+@pytest.mark.asyncio
+async def test_huggingface_get_sends_token_only_as_bearer_header(monkeypatch):
+    import routers.models as models_router
+
+    seen_headers = []
+
+    class Response:
+        status_code = 200
+        headers = httpx.Headers()
+
+        @staticmethod
+        def json():
+            return {"id": "org/private-model"}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, **kwargs):
+            seen_headers.append(kwargs["headers"])
+            return Response()
+
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "hf_private_read_token")
+    monkeypatch.setattr(models_router.httpx, "AsyncClient", Client)
+
+    payload, _headers = await models_router._hf_get_json("/api/models/org/private-model")
+
+    assert payload == {"id": "org/private-model"}
+    assert seen_headers == [{
+        "User-Agent": "ODS-dashboard/2.5 model-library",
+        "Authorization": "Bearer hf_private_read_token",
+    }]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status_code", "expected_status", "detail"), [
+    (401, 403, "accepted license and a valid HF_TOKEN"),
+    (403, 403, "accepted license and a valid HF_TOKEN"),
+    (429, 429, "rate limit reached"),
+])
+async def test_huggingface_get_maps_auth_and_rate_limit_failures(
+    monkeypatch, status_code, expected_status, detail,
+):
+    import routers.models as models_router
+
+    class Response:
+        headers = httpx.Headers()
+
+        def __init__(self):
+            self.status_code = status_code
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(models_router.httpx, "AsyncClient", Client)
+
+    with pytest.raises(models_router.HTTPException) as exc_info:
+        await models_router._hf_get_json("/api/models/org/restricted-model")
+
+    assert exc_info.value.status_code == expected_status
+    assert detail in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_huggingface_search_returns_stale_cache_on_transient_hub_failure(monkeypatch):
+    import routers.models as models_router
+
+    cache_key = ("qwen", "downloads", 20, "public")
+    cached = {
+        "models": [{"id": "org/model"}],
+        "query": "qwen",
+        "sort": "downloads",
+        "authenticated": False,
+        "source": "huggingface",
+    }
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "")
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE", {
+        cache_key: (time.monotonic() - models_router._HF_SEARCH_CACHE_TTL_SECONDS - 1, cached),
+    })
+
+    async def fail_request(*_args, **_kwargs):
+        raise models_router.HTTPException(status_code=504, detail="Hub timeout")
+
+    monkeypatch.setattr(models_router, "_hf_get_json", fail_request)
+
+    result = await models_router.search_huggingface_models(
+        q="qwen",
+        sort="downloads",
+        limit=20,
+        api_key="test",
+    )
+
+    assert result == {**cached, "stale": True}
+
+
+@pytest.mark.asyncio
+async def test_huggingface_exact_repository_works_without_search_index(monkeypatch):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "")
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE", {})
+    calls = []
+
+    async def metadata(path, **kwargs):
+        calls.append((path, kwargs))
+        assert path == "/api/models/owner/Model-GGUF", "The unavailable search index must not be called"
+        return {
+            "id": "owner/model-GGUF", "downloads": 12,
+            "siblings": [{"rfilename": "model-Q4_K_M.gguf"}],
+        }, {}
+
+    monkeypatch.setattr(models_router, "_hf_get_json", metadata)
+    result = await models_router.search_huggingface_models(
+        q=" owner/Model-GGUF ", sort="downloads", limit=20, api_key="test",
+    )
+    assert [item["id"] for item in result["models"]] == ["owner/model-GGUF"]
+    assert result["models"][0]["ggufFileCount"] == 1
+    assert result["authenticated"] is False
+    assert calls == [("/api/models/owner/Model-GGUF", {"timeout_seconds": 6.0, "connect_timeout_seconds": 3.0})]
+
+
+@pytest.mark.asyncio
+async def test_huggingface_repository_prefix_falls_back_only_when_not_found(monkeypatch):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "")
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE", {})
+    calls = []
+
+    async def metadata(path, **kwargs):
+        calls.append(path)
+        if path == "/api/models/owner/partial":
+            raise models_router.HTTPException(status_code=404, detail="Not found")
+        assert kwargs["params"]["search"] == "owner/partial"
+        return [{"id": "owner/partial-GGUF", "siblings": [{"rfilename": "model.gguf"}]}], {}
+
+    monkeypatch.setattr(models_router, "_hf_get_json", metadata)
+    result = await models_router.search_huggingface_models(
+        q="owner/partial", sort="downloads", limit=20, api_key="test",
+    )
+    assert calls == ["/api/models/owner/partial", "/api/models"]
+    assert result["models"][0]["id"] == "owner/partial-GGUF"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 429, 502, 504])
+async def test_huggingface_exact_repository_preserves_access_and_transient_errors(monkeypatch, status):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "")
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE", {})
+    calls = []
+
+    async def metadata(path, **_kwargs):
+        calls.append(path)
+        raise models_router.HTTPException(status_code=status, detail="Hub refused")
+
+    monkeypatch.setattr(models_router, "_hf_get_json", metadata)
+    with pytest.raises(models_router.HTTPException) as error:
+        await models_router.search_huggingface_models(q="owner/model", sort="downloads", limit=20, api_key="test")
+    assert error.value.status_code == status
+    assert calls == ["/api/models/owner/model"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repository", [[], {"id": "another/model"}, {}])
+async def test_huggingface_exact_repository_rejects_unrelated_metadata(monkeypatch, repository):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "")
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE", {})
+
+    async def metadata(*_args, **_kwargs):
+        return repository, {}
+
+    monkeypatch.setattr(models_router, "_hf_get_json", metadata)
+    with pytest.raises(models_router.HTTPException) as error:
+        await models_router.search_huggingface_models(q="owner/model", sort="downloads", limit=20, api_key="test")
+    assert error.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_huggingface_exact_repository_keeps_gguf_only_filter(monkeypatch):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "")
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE", {})
+
+    async def metadata(*_args, **_kwargs):
+        return {"id": "owner/model", "siblings": [{"rfilename": "model.safetensors"}]}, {}
+
+    monkeypatch.setattr(models_router, "_hf_get_json", metadata)
+    result = await models_router.search_huggingface_models(q="owner/model", sort="downloads", limit=20, api_key="test")
+    assert result["models"] == []
+
+
+def test_huggingface_cache_identity_changes_without_exposing_token(monkeypatch):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "hf_first_secret")
+    first = models_router._hf_cache_identity()
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "hf_second_secret")
+    second = models_router._hf_cache_identity()
+
+    assert first != second
+    assert "hf_first_secret" not in first
+    assert "hf_second_secret" not in second
+
+
+@pytest.mark.parametrize(("raw_url", "expected"), [
+    (
+        "https://cdn-avatars.huggingface.co/v1/production/uploads/avatar.png",
+        "https://cdn-avatars.huggingface.co/v1/production/uploads/avatar.png",
+    ),
+    ("/avatars/user.svg", "https://huggingface.co/avatars/user.svg"),
+    ("https://example.test/avatar.png", None),
+    ("https://huggingface.co.evil.test/avatar.png", None),
+    ("http://huggingface.co/avatar.png", None),
+    ("", None),
+])
+def test_huggingface_avatar_url_only_allows_official_hosts(raw_url, expected):
+    import routers.models as models_router
+
+    assert models_router._hf_trusted_avatar_url(raw_url) == expected
+
+
+@pytest.mark.asyncio
+async def test_huggingface_avatar_resolves_organization_then_user_and_caches(monkeypatch):
+    import routers.models as models_router
+
+    requests = []
+
+    async def profile(path, **_kwargs):
+        requests.append(path)
+        if "/organizations/" in path:
+            raise models_router.HTTPException(status_code=404, detail="not found")
+        return {
+            "avatarUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/real.png",
+        }, httpx.Headers()
+
+    monkeypatch.setattr(models_router, "_HF_AVATAR_CACHE", {})
+    monkeypatch.setattr(models_router, "_hf_cache_identity", lambda: "public")
+    monkeypatch.setattr(models_router, "_hf_get_json", profile)
+
+    first = await models_router._hf_author_avatar_url("unsloth")
+    second = await models_router._hf_author_avatar_url("unsloth")
+
+    assert first == "https://cdn-avatars.huggingface.co/v1/production/uploads/real.png"
+    assert second == first
+    assert requests == [
+        "/api/organizations/unsloth/overview",
+        "/api/users/unsloth/overview",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_huggingface_avatar_does_not_cache_transient_hub_failure(monkeypatch):
+    import routers.models as models_router
+
+    requests = 0
+
+    async def unavailable(_path, **_kwargs):
+        nonlocal requests
+        requests += 1
+        raise models_router.HTTPException(status_code=504, detail="timeout")
+
+    monkeypatch.setattr(models_router, "_HF_AVATAR_CACHE", {})
+    monkeypatch.setattr(models_router, "_hf_get_json", unavailable)
+
+    assert await models_router._hf_author_avatar_url("org") is None
+    assert await models_router._hf_author_avatar_url("org") is None
+    assert requests == 2
+
+
+@pytest.mark.asyncio
+async def test_huggingface_avatar_does_not_redirect_to_untrusted_profile_value(monkeypatch):
+    import routers.models as models_router
+
+    async def profile(_path, **_kwargs):
+        return {"avatarUrl": "https://attacker.test/tracker.png"}, httpx.Headers()
+
+    monkeypatch.setattr(models_router, "_HF_AVATAR_CACHE", {})
+    monkeypatch.setattr(models_router, "_hf_get_json", profile)
+
+    assert await models_router._hf_author_avatar_url("org") is None
+
+
+def test_huggingface_avatar_endpoint_redirects_to_verified_profile_image(test_client, monkeypatch):
+    import routers.models as models_router
+
+    monkeypatch.setattr(
+        models_router,
+        "_hf_author_avatar_url",
+        AsyncMock(return_value="https://cdn-avatars.huggingface.co/avatar.png"),
+    )
+
+    response = test_client.get(
+        "/api/models/huggingface/authors/unsloth/avatar",
+        headers=test_client.auth_headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "https://cdn-avatars.huggingface.co/avatar.png"
+    assert response.headers["cache-control"] == "public, max-age=3600"
+
+
+def test_huggingface_search_cache_is_lru_bounded(monkeypatch):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE", {})
+    monkeypatch.setattr(models_router, "_HF_SEARCH_CACHE_MAX_ENTRIES", 2)
+    keys = [(name, "downloads", 20, "public") for name in ("a", "b", "c")]
+
+    models_router._hf_cache_put(keys[0], {"models": ["a"]})
+    models_router._hf_cache_put(keys[1], {"models": ["b"]})
+    assert models_router._hf_cache_get(keys[0]) is not None
+    models_router._hf_cache_put(keys[2], {"models": ["c"]})
+
+    assert len(models_router._HF_SEARCH_CACHE) == 2
+    assert keys[0] in models_router._HF_SEARCH_CACHE
+    assert keys[1] not in models_router._HF_SEARCH_CACHE
+    assert keys[2] in models_router._HF_SEARCH_CACHE
+
+
+def test_import_registry_is_shared_readable_on_posix(monkeypatch, tmp_path):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "DATA_DIR", str(tmp_path))
+    models_router._write_imported_library([{"id": "model", "source": "huggingface"}])
+
+    registry = tmp_path / "model-imports.json"
+    assert registry.exists()
+    if os.name != "nt":
+        assert registry.stat().st_mode & 0o777 == 0o644
+
+
+def test_huggingface_import_record_pins_revision_and_renames_remote_paths():
+    import routers.models as models_router
+
+    details = {
+        "id": "org/repo",
+        "sha": "c" * 40,
+        "contextLength": 65536,
+        "contextSource": "hub_config",
+        "license": "apache-2.0",
+        "url": "https://huggingface.co/org/repo",
+    }
+    artifact = {
+        "id": "d" * 20,
+        "quantization": "Q4_K_M",
+        "files": [{
+            "filename": "quant/model-Q4_K_M.gguf",
+            "sizeBytes": 2 * 1024**3,
+            "sha256": "e" * 64,
+        }],
+    }
+
+    record = models_router._hf_import_record({**details, "artifacts": [artifact]}, artifact)
+
+    assert record["source"] == "huggingface"
+    assert record["source_revision"] == "c" * 40
+    assert record["context_length"] == 32768
+    assert record["max_context_length"] == 65536
+    assert record["context_limit_known"] is True
+    assert "/resolve/" + ("c" * 40) + "/quant/model-Q4_K_M.gguf" in record["gguf_url"]
+    assert "/" not in record["gguf_file"]
+    assert record["gguf_sha256"] == "e" * 64
+    assert record["size_bytes"] == 2 * 1024**3
+
+
+def test_huggingface_import_uses_distinct_local_files_for_distinct_revisions():
+    import routers.models as models_router
+
+    artifact = {
+        "id": "d" * 20,
+        "quantization": "Q4_K_M",
+        "files": [{
+            "filename": "model-Q4_K_M.gguf",
+            "sizeBytes": 1024,
+            "sha256": "e" * 64,
+        }],
+    }
+    base_details = {
+        "id": "org/repo",
+        "contextLength": 32768,
+        "contextSource": "hub_config",
+        "license": "apache-2.0",
+        "url": "https://huggingface.co/org/repo",
+    }
+
+    first = models_router._hf_import_record(
+        {**base_details, "sha": "a" * 40},
+        artifact,
+    )
+    second = models_router._hf_import_record(
+        {**base_details, "sha": "b" * 40},
+        artifact,
+    )
+
+    assert first["id"] != second["id"]
+    assert first["gguf_file"] != second["gguf_file"]
+    assert first["gguf_file"].endswith(".gguf")
+    assert second["gguf_file"].endswith(".gguf")
+
+
+def test_huggingface_import_uses_conservative_context_when_metadata_is_absent():
+    import routers.models as models_router
+
+    details = {
+        "id": "org/repo",
+        "sha": "c" * 40,
+        "contextLength": None,
+        "contextSource": "unavailable",
+        "license": "apache-2.0",
+        "url": "https://huggingface.co/org/repo",
+    }
+    artifact = {
+        "id": "d" * 20,
+        "quantization": "Q4_K_M",
+        "files": [{
+            "filename": "model-Q4_K_M.gguf",
+            "sizeBytes": 1024,
+            "sha256": "e" * 64,
+        }],
+    }
+
+    record = models_router._hf_import_record(details, artifact)
+
+    assert record["context_length"] == 8192
+    assert record["max_context_length"] is None
+    assert record["context_limit_known"] is False
+    assert record["context_source"] == "unavailable"
+
+
+def test_model_library_merges_hub_imports_without_curated_override(monkeypatch, tmp_path):
+    import routers.models as models_router
+
+    curated_path = tmp_path / "model-library.json"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    curated_path.write_text(json.dumps({"models": [{"id": "curated", "gguf_file": "curated.gguf"}]}))
+    (data_dir / "model-imports.json").write_text(json.dumps({"models": [
+        {"id": "community", "gguf_file": "community.gguf", "source": "huggingface"},
+        {"id": "curated", "gguf_file": "override.gguf", "source": "huggingface"},
+        {"id": "wrong-source", "gguf_file": "wrong.gguf", "source": "local"},
+    ]}))
+    monkeypatch.setattr(models_router, "_LIBRARY_PATH", curated_path)
+    monkeypatch.setattr(models_router, "DATA_DIR", str(data_dir))
+
+    merged = models_router._load_library()
+
+    assert [item["id"] for item in merged] == ["curated", "community"]
+
+
+def _hf_import_details() -> dict:
+    return {
+        "id": "org/repo",
+        "sha": "c" * 40,
+        "contextLength": 65536,
+        "contextSource": "hub_config",
+        "license": "apache-2.0",
+        "url": "https://huggingface.co/org/repo",
+        "private": False,
+        "runtimeCompatible": True,
+        "runtimeReason": None,
+        "artifacts": [{
+            "id": "d" * 20,
+            "label": "model-Q4_K_M.gguf",
+            "quantization": "Q4_K_M",
+            "files": [{
+                "filename": "model-Q4_K_M.gguf",
+                "sizeBytes": 1024,
+                "sha256": "e" * 64,
+            }],
+        }],
+    }
+
+
+def test_huggingface_import_retains_retry_state_after_agent_failure(
+    test_client, monkeypatch, tmp_path,
+):
+    import routers.models as models_router
+
+    async def fake_details(_repo_id):
+        return _hf_import_details()
+
+    attempts = 0
+
+    def flaky_agent(_path, payload, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert payload["gguf_sha256"] == "e" * 64
+        if attempts == 1:
+            raise models_router.HTTPException(status_code=503, detail="agent unavailable")
+        return {"status": "started"}
+
+    monkeypatch.setattr(models_router, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(models_router, "_hf_repo_details", fake_details)
+    monkeypatch.setattr(models_router, "_call_agent_model", flaky_agent)
+    monkeypatch.setattr(models_router, "_bootstrap_upgrade_download_conflict", lambda: None)
+
+    request = {
+        "repoId": "org/repo",
+        "artifactId": "d" * 20,
+    }
+    first = test_client.post(
+        "/api/models/huggingface/import",
+        headers=test_client.auth_headers,
+        json=request,
+    )
+    assert first.status_code == 503
+    assert "X-ODS-Import-Started" not in first.headers
+    registry_path = tmp_path / "model-imports.json"
+    first_registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert len(first_registry["models"]) == 1
+
+    second = test_client.post(
+        "/api/models/huggingface/import",
+        headers=test_client.auth_headers,
+        json=request,
+    )
+    assert second.status_code == 200
+    assert second.json()["status"] == "started"
+    second_registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert second_registry == first_registry
+    assert attempts == 2
+
+
+@pytest.mark.parametrize("restricted_field", ["private", "gated"])
+def test_huggingface_restricted_import_requires_token_before_registry_write(
+    test_client, monkeypatch, tmp_path, restricted_field,
+):
+    import routers.models as models_router
+
+    details = _hf_import_details()
+    details[restricted_field] = True
+
+    async def fake_details(_repo_id):
+        return details
+
+    monkeypatch.setattr(models_router, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(models_router, "_hf_repo_details", fake_details)
+    monkeypatch.setattr(models_router, "_hf_token", lambda: "")
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: pytest.fail("host agent must not receive an unauthorized import"),
+    )
+
+    response = test_client.post(
+        "/api/models/huggingface/import",
+        headers=test_client.auth_headers,
+        json={"repoId": "org/repo", "artifactId": "d" * 20},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Private or gated repositories require HF_TOKEN"
+    assert not (tmp_path / "model-imports.json").exists()
+
+
+def test_agent_disk_refusal_becomes_a_plain_507(monkeypatch):
+    import routers.models as models_router
+
+    agent_body = {
+        "error": "Not enough free disk space for this model",
+        "code": "insufficient_disk_space",
+        "requiredBytes": 10 * 1024 ** 3,
+        "freeBytes": 11 * 1024 ** 3,
+        "marginBytes": 5 * 1024 ** 3,
+    }
+
+    def refuse(*_args, **_kwargs):
+        raise models_router.AgentHTTPError(507, "insufficient storage", json.dumps(agent_body))
+
+    monkeypatch.setattr(models_router, "request_agent_json", refuse)
+
+    with pytest.raises(models_router.HTTPException) as raised:
+        models_router._call_agent_model("/v1/model/download", {"gguf_file": "m.gguf"})
+
+    assert raised.value.status_code == 507
+    detail = raised.value.detail
+    assert isinstance(detail, dict)
+    assert detail["code"] == "insufficient_disk_space"
+    assert detail["requiredBytes"] == agent_body["requiredBytes"]
+    assert detail["message"] == (
+        "Not enough free disk space for this model. It needs 10.0 GB, ODS keeps 5.0 GB "
+        "free, and 11.0 GB is free now. Delete models you no longer use or free up space "
+        "on this drive, then retry."
+    )
+
+
+def test_huggingface_import_disk_refusal_is_definitively_not_started(
+    test_client, monkeypatch, tmp_path,
+):
+    import routers.models as models_router
+
+    async def fake_details(_repo_id):
+        return _hf_import_details()
+
+    def refuse(_path, _payload, **_kwargs):
+        raise models_router.HTTPException(
+            status_code=507,
+            detail=models_router._insufficient_disk_detail({
+                "requiredBytes": 1024, "freeBytes": 0, "marginBytes": 2 * 1024 ** 3,
+            }),
+        )
+
+    monkeypatch.setattr(models_router, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(models_router, "_hf_repo_details", fake_details)
+    monkeypatch.setattr(models_router, "_call_agent_model", refuse)
+    monkeypatch.setattr(models_router, "_bootstrap_upgrade_download_conflict", lambda: None)
+
+    response = test_client.post(
+        "/api/models/huggingface/import",
+        headers=test_client.auth_headers,
+        json={"repoId": "org/repo", "artifactId": "d" * 20},
+    )
+
+    assert response.status_code == 507
+    assert response.headers["X-ODS-Import-Started"] == "false"
+    assert response.json()["detail"]["code"] == "insufficient_disk_space"
+
+
+def test_huggingface_preparation_failure_is_definitively_not_started(test_client, monkeypatch):
+    import routers.models as models_router
+
+    async def unavailable_metadata(_repo_id):
+        raise OSError("fixture storage failure")
+
+    monkeypatch.setattr(models_router, "_hf_repo_details", unavailable_metadata)
+    monkeypatch.setattr(models_router, "_call_agent_model", lambda *args, **kwargs: pytest.fail("not dispatched"))
+    response = test_client.post(
+        "/api/models/huggingface/import", headers=test_client.auth_headers,
+        json={"repoId": "org/repo", "artifactId": "d" * 20},
+    )
+    assert response.status_code == 500
+    assert response.headers["X-ODS-Import-Started"] == "false"
+    assert "No download was started" in response.json()["detail"]
+
+
+def test_huggingface_import_does_not_overwrite_corrupt_registry(
+    test_client, monkeypatch, tmp_path,
+):
+    import routers.models as models_router
+
+    async def fake_details(_repo_id):
+        return _hf_import_details()
+
+    registry_path = tmp_path / "model-imports.json"
+    original = '{"version": 1, "models": ['
+    registry_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(models_router, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(models_router, "_hf_repo_details", fake_details)
+    monkeypatch.setattr(models_router, "_bootstrap_upgrade_download_conflict", lambda: None)
+
+    response = test_client.post(
+        "/api/models/huggingface/import",
+        headers=test_client.auth_headers,
+        json={"repoId": "org/repo", "artifactId": "d" * 20},
+    )
+
+    assert response.status_code == 409
+    assert "not overwritten" in response.json()["detail"]
+    assert registry_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("models_fail", [False, True])
+def test_generic_external_fallback_never_probes_a_vendor_health_route(monkeypatch, models_fail):
+    import routers.models as models_router
+
+    seen_urls = []
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # Servable models with no loaded status: not proof of the resident one.
+            return {"data": [{"id": "Gemma-4-E2B-it-GGUF"}, {"id": "Qwen3.6-35B-A3B-GGUF"}]}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url):
+            seen_urls.append(url)
+            if models_fail:
+                raise httpx.ConnectError("unavailable")
+            return _Response()
+
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "external")
+    monkeypatch.setenv("EXTERNAL_LLM_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("LLM_URL", "http://host.docker.internal:8000/v1")
+    monkeypatch.setattr(models_router.httpx, "AsyncClient", _Client)
+
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(
+            models_router._fetch_llama_loaded_model("llama-server", 8080)
+        )
+    finally:
+        loop.close()
+
+    assert result is None
+    assert seen_urls == ["http://host.docker.internal:8000/v1/models"]
+
+
+def test_fetch_loaded_model_uses_configured_llm_url(monkeypatch):
+    """A configured LLM_URL names the runtime, not llama-server DNS."""
+    import routers.models as models_router
+
+    seen_urls: list[str] = []
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [
+                {"id": "idle-model.gguf", "status": {"value": "idle"}},
+                {"id": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", "status": {"value": "loaded"}},
+            ]}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url):
+            seen_urls.append(url)
+            return _Response()
+
+    monkeypatch.setenv("LLM_URL", "http://host.docker.internal:8080/v1")
+    monkeypatch.setattr(models_router.httpx, "AsyncClient", _Client)
+
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(
+            models_router._fetch_llama_loaded_model("llama-server", 8080)
+        )
+    finally:
+        loop.close()
+
+    assert result == "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    assert seen_urls == ["http://host.docker.internal:8080/v1/models"]
+
+
+def test_default_model_discovery_timeout_covers_slow_local_runtime():
+    import routers.models as models_router
+
+    assert models_router._MODEL_DISCOVERY_TIMEOUT_SECONDS >= 10.0
+
+
+@pytest.mark.parametrize("lifecycle_active", [False, True])
+def test_api_models_discovery_shares_a_deadline_without_losing_host_state(
+    test_client, monkeypatch, tmp_path, lifecycle_active,
+):
+    models_router, install_dir, _ = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4", "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf", "size_mb": 5760,
+        "vram_required_gb": 8, "context_length": 32768,
+        "quantization": "Q4_K_M", "specialty": "General",
+        "description": "Balanced default.", "llm_model_name": "qwen3.5-9b",
+    }])
+    cancelled = []
+
+    async def primary():
+        await asyncio.sleep(0.6)
+        return None
+
+    async def fallback(*_args):
+        try:
+            await asyncio.sleep(0.6)
+            return "Qwen3.5-9B-Q4_K_M.gguf"
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    monkeypatch.setattr(models_router, "_MODEL_DISCOVERY_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(models_router, "get_loaded_model", primary)
+    monkeypatch.setattr(models_router, "_fetch_llama_loaded_model", fallback)
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 0}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda: {
+        "status": "idle", "lifecycleActive": lifecycle_active,
+        "activeOperation": "remote_provider_apply" if lifecycle_active else None,
+        "modelTransactionPending": True,
+    })
+    response = test_client.get("/api/models", headers=test_client.auth_headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert cancelled == [True]
+    assert data["currentModel"] is None
+    assert data["modelRecoveryPending"] is True
+    assert data["modelLifecycle"] == ({
+        "active": True, "operation": "remote_provider_apply",
+        "target": None, "modelId": None,
+    } if lifecycle_active else None)
+
+
+def test_agent_model_status_collapses_concurrent_poll_bursts(monkeypatch):
+    import routers.models as models_router
+
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def fake_request(method, path, *, timeout, payload=None):
+        nonlocal calls
+        assert method == "GET"
+        assert path == "/v1/model/status"
+        assert timeout == 5
+        assert payload is None
+        with calls_lock:
+            calls += 1
+        time.sleep(0.05)
+        return {"status": "downloading", "percent": 42}
+
+    monkeypatch.setattr(models_router, "request_agent_json", fake_request)
+    monkeypatch.setattr(models_router, "_AGENT_MODEL_STATUS_CACHE_TTL_SECONDS", 1.0)
+    monkeypatch.setattr(models_router, "_agent_model_status_cache_at", 0.0)
+    monkeypatch.setattr(models_router, "_agent_model_status_cache_value", None)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: models_router._get_agent_model_status(), range(16)))
+
+    assert calls == 1
+    assert results == [{"status": "downloading", "percent": 42}] * 16
+
+
+def test_agent_model_status_and_actions_share_transport(monkeypatch):
+    import routers.models as models_router
+
+    calls = []
+
+    def fake_request(method, path, *, timeout, payload=None):
+        calls.append((method, path, timeout, payload))
+        return {"status": "idle" if method == "GET" else "started"}
+
+    monkeypatch.setattr(models_router, "request_agent_json", fake_request)
+    monkeypatch.setattr(models_router, "_AGENT_MODEL_STATUS_CACHE_TTL_SECONDS", 0.0)
+    monkeypatch.setattr(models_router, "_agent_model_status_cache_at", 0.0)
+
+    assert models_router._get_agent_model_status() == {"status": "idle"}
+    assert models_router._call_agent_model("/v1/model/download", {"model": "test"}) == {
+        "status": "started"
+    }
+    assert calls == [
+        ("GET", "/v1/model/status", 5, None),
+        ("POST", "/v1/model/download", 30, {"model": "test"}),
+    ]
+
+
+def test_agent_model_status_extracts_lifecycle():
+    import routers.models as models_router
+
+    lifecycle = models_router._model_lifecycle_from_agent_status({
+        "status": "idle",
+        "lifecycleActive": True,
+        "activeOperation": "model_activation",
+        "activeTarget": "qwen3.5-9b-q4",
+        "activeModelId": "qwen3.5-9b-q4",
+    })
+
+    assert lifecycle == {
+        "active": True,
+        "operation": "model_activation",
+        "target": "qwen3.5-9b-q4",
+        "modelId": "qwen3.5-9b-q4",
+    }
+
+
+def test_api_models_marks_backend_activation_target(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }])
+    (data_dir / "models" / "Qwen3.5-9B-Q4_K_M.gguf").write_text(
+        "model",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "_fetch_llama_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        models_router,
+        "get_llama_metrics",
+        AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 0}),
+    )
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=32768))
+    monkeypatch.setattr(models_router, "SERVICES", {"llama-server": {"host": "localhost", "port": 8080}})
+    monkeypatch.setattr(
+        models_router,
+        "_get_agent_model_status",
+        lambda: {
+            "status": "idle",
+            "lifecycleActive": True,
+            "activeOperation": "model_activation",
+            "activeTarget": "qwen3.5-9b-q4",
+            "activeModelId": "qwen3.5-9b-q4",
+            "activationPhase": "rolling_back",
+            "activationFailureCode": "runtime_load_failed",
+            "modelTransactionPending": True,
+        },
+    )
+
+    resp = test_client.get("/api/models", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["currentModel"] is None
+    assert payload["modelLifecycle"] == {
+        "active": True,
+        "operation": "model_activation",
+        "target": "qwen3.5-9b-q4",
+        "modelId": "qwen3.5-9b-q4",
+    }
+    row = payload["models"][0]
+    assert row["status"] == "downloaded"
+    assert row["modelOperation"] == payload["modelLifecycle"]
+
+    assert payload["modelActivation"] == {"active": True, "phase": "rolling_back", "failureCode": "runtime_load_failed"}
+    assert payload["modelRecoveryPending"] is True
+
+
+def test_agent_activation_conflict_preserves_target(monkeypatch):
+    import routers.models as models_router
+
+    payload = {
+        "error": "Another model activation is in progress",
+        "activeModelId": "phi4-mini-q4",
+    }
+
+    def conflict(*_args, **_kwargs):
+        raise models_router.AgentHTTPError(409, payload["error"], json.dumps(payload))
+
+    monkeypatch.setattr(models_router, "request_agent_json", conflict)
+
+    with pytest.raises(models_router.HTTPException) as exc_info:
+        models_router._call_agent_model("/v1/model/activate", {"model_id": "phi4-mini-q4"}, timeout=600)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == payload
+
+
+def test_agent_activation_preserves_preflight_validation_detail(monkeypatch):
+    import routers.models as models_router
+
+    payload = {
+        "error": "ODS-managed Pixel requires a model context of at least 4096 tokens",
+        "code": "pixel_context_too_small",
+    }
+
+    def invalid(*_args, **_kwargs):
+        raise models_router.AgentHTTPError(400, payload["error"], json.dumps(payload))
+
+    monkeypatch.setattr(models_router, "request_agent_json", invalid)
+
+    with pytest.raises(models_router.HTTPException) as exc_info:
+        models_router._call_agent_model(
+            "/v1/model/activate",
+            {"model_id": "ministral3-8b-instruct-2512-q4", "context_length": 8192},
+            timeout=600,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == payload
+
+
+def test_agent_activation_waits_out_a_pixel_access_reproof(monkeypatch):
+    # Strixy: a switch that landed while the Pixel access monitor re-proved
+    # (it holds the model lifecycle for a few seconds every ~45 s) got 409.
+    import routers.models as models_router
+
+    calls = 0
+    conflict_payload = {
+        "error": "Cannot activate a model while pixel_startup_reproof is in progress",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "pixel_startup_reproof",
+    }
+
+    def request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise models_router.AgentHTTPError(409, conflict_payload["error"], json.dumps(conflict_payload))
+        return {"status": "started"}
+
+    monkeypatch.setattr(models_router, "request_agent_json", request)
+    monkeypatch.setattr(models_router.time, "sleep", lambda _seconds: None)
+    assert models_router._call_agent_model(
+        "/v1/model/activate", {"model_id": "qwen3.5-9b-q4"}, timeout=600,
+        retry_pixel_busy_seconds=1.0,
+    ) == {"status": "started"}
+    assert calls == 3
+    assert models_router._MODEL_PIXEL_BUSY_ACTIVATION_GRACE_SECONDS >= 20.0
+
+
+def test_pixel_busy_retry_is_bounded_and_not_granted_to_other_operations(monkeypatch):
+    import routers.models as models_router
+
+    clock = [100.0]
+    calls: list[str] = []
+
+    def busy(operation):
+        def request(*_args, **_kwargs):
+            calls.append(operation)
+            clock[0] += 0.5
+            payload = {"code": "model_lifecycle_busy", "activeOperation": operation}
+            raise models_router.AgentHTTPError(409, "busy", json.dumps(payload))
+        return request
+
+    monkeypatch.setattr(models_router.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(models_router.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(models_router, "request_agent_json", busy("pixel_startup_reproof"))
+    with pytest.raises(models_router.HTTPException) as exc_info:
+        models_router._call_agent_model("/v1/model/activate", {}, retry_pixel_busy_seconds=5.0)
+    assert exc_info.value.status_code == 409
+    assert 5 <= len(calls) <= 12  # Retried within the grace, then surfaced.
+
+    calls.clear()
+    monkeypatch.setattr(models_router, "request_agent_json", busy("model_activation"))
+    with pytest.raises(models_router.HTTPException):
+        models_router._call_agent_model("/v1/model/activate", {}, retry_pixel_busy_seconds=5.0)
+    assert calls == ["model_activation"]  # Another model operation is never waited out.
+
+
+def test_agent_activation_waits_for_download_lifecycle_teardown(monkeypatch):
+    import routers.models as models_router
+
+    calls = 0
+    conflict_payload = {
+        "error": "Cannot activate a model while model_download is in progress",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "model_download",
+        "activeModelId": None,
+    }
+
+    def request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise models_router.AgentHTTPError(
+                409,
+                conflict_payload["error"],
+                json.dumps(conflict_payload),
+            )
+        return {"status": "started"}
+
+    monkeypatch.setattr(models_router, "request_agent_json", request)
+    monkeypatch.setattr(models_router.time, "sleep", lambda _seconds: None)
+
+    assert models_router._call_agent_model(
+        "/v1/model/activate",
+        {"model_id": "qwen3.5-35b-a3b-q4"},
+        timeout=600,
+        retry_download_busy_seconds=1.0,
+    ) == {"status": "started"}
+    assert calls == 3
+
+
+def test_agent_activation_waits_past_old_download_teardown_bound(monkeypatch):
+    import routers.models as models_router
+
+    calls = 0
+    current_time = {"value": 0.0}
+    conflict_payload = {
+        "error": "Cannot activate a model while model_download is in progress",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "model_download",
+        "activeModelId": None,
+    }
+
+    def request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 5:
+            raise models_router.AgentHTTPError(
+                409,
+                conflict_payload["error"],
+                json.dumps(conflict_payload),
+            )
+        return {"status": "started"}
+
+    def sleep(_seconds):
+        current_time["value"] += 10.0
+
+    monkeypatch.setattr(models_router, "request_agent_json", request)
+    monkeypatch.setattr(models_router.time, "monotonic", lambda: current_time["value"])
+    monkeypatch.setattr(models_router.time, "sleep", sleep)
+
+    assert models_router._MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS >= 120.0
+    assert models_router._call_agent_model(
+        "/v1/model/activate",
+        {"model_id": "qwen3.5-122b-a10b-q4"},
+        timeout=600,
+        retry_download_busy_seconds=models_router._MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS,
+    ) == {"status": "started"}
+    assert calls == 5
+    assert current_time["value"] > 30.0
+
+
+def test_agent_activation_does_not_retry_unrelated_lifecycle_conflict(monkeypatch):
+    import routers.models as models_router
+
+    calls = 0
+    conflict_payload = {
+        "error": "Another model activation is in progress",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "model_activation",
+        "activeModelId": "phi4-mini-q4",
+    }
+
+    def request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise models_router.AgentHTTPError(
+            409,
+            conflict_payload["error"],
+            json.dumps(conflict_payload),
+        )
+
+    monkeypatch.setattr(models_router, "request_agent_json", request)
+    monkeypatch.setattr(models_router.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(models_router.HTTPException) as exc_info:
+        models_router._call_agent_model(
+            "/v1/model/activate",
+            {"model_id": "qwen3.5-35b-a3b-q4"},
+            timeout=600,
+            retry_download_busy_seconds=1.0,
+        )
+
+    assert calls == 1
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == conflict_payload
+
+
+def test_already_active_model_uses_env_file_before_stale_process_env(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    (install_dir / ".env").write_text(
+        "GGUF_FILE=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf\n"
+        "LLM_MODEL=qwen3.6-35b-a3b\n",
+        encoding="utf-8",
+    )
+    model_file = data_dir / "models" / "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    model_file.parent.mkdir(parents=True, exist_ok=True)
+    model_file.write_text("model", encoding="utf-8")
+    monkeypatch.setenv("LLM_MODEL", "qwen3.5-2b")
+    monkeypatch.setattr(
+        models_router,
+        "_fetch_loaded_model_sync",
+        lambda: "extra.Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    )
+    _write_activation_receipt(
+        data_dir,
+        "qwen3.6-35b-a3b-ud-q4",
+        "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "extra.Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    )
+
+    already_active, loaded_model = models_router._already_active_model(
+        "qwen3.6-35b-a3b-ud-q4",
+        {
+            "id": "qwen3.6-35b-a3b-ud-q4",
+            "gguf_file": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "llm_model_name": "qwen3.6-35b-a3b",
+        },
+    )
+
+    assert already_active is True
+    assert loaded_model == "extra.Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+
+
+def test_false_context_receipt_is_not_activation_ready(monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    model = {
+        "id": "qwen3.5-2b-q4",
+        "gguf_file": "Qwen3.5-2B-Q4_K_M.gguf",
+    }
+    (data_dir / "model-activation-receipt.json").write_text(
+        json.dumps({
+            "schema": "ods.model-activation-receipt.v1",
+            "status": "complete",
+            "modelId": model["id"],
+            "ggufFile": model["gguf_file"],
+            "runtimeModelId": f"extra.{model['gguf_file']}",
+            "contextLength": 65536,
+            "contextVerified": False,
+            "consumers": {"dashboard": "live_env"},
+        }),
+        encoding="utf-8",
+    )
+
+    assert models_router._activation_receipt_matches(
+        model["id"], model, f"extra.{model['gguf_file']}"
+    ) is False
+    assert models_router._verified_activation_context(
+        f"extra.{model['gguf_file']}"
+    ) is None
+
+
+def test_verified_context_receipt_supplies_runtime_context(monkeypatch, tmp_path):
+    models_router, _install_dir, data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    (data_dir / "model-activation-receipt.json").write_text(
+        json.dumps({
+            "schema": "ods.model-activation-receipt.v1",
+            "status": "complete",
+            "modelId": "qwen3.5-2b-q4",
+            "ggufFile": "Qwen3.5-2B-Q4_K_M.gguf",
+            "runtimeModelId": "extra.Qwen3.5-2B-Q4_K_M.gguf",
+            "contextLength": 65536,
+            "contextVerified": True,
+            "consumers": {"dashboard": "live_env"},
+        }),
+        encoding="utf-8",
+    )
+
+    assert models_router._verified_activation_context(
+        "extra.Qwen3.5-2B-Q4_K_M.gguf"
+    ) == 65536
+
+
+def test_configured_context_empty_file_value_falls_through_to_file_max_context(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+
+    assert models_router._configured_context_length() == 65536
+
+
+def test_configured_context_legacy_file_max_precedes_stale_process_context(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    (install_dir / ".env").write_text(
+        "MAX_CONTEXT=131072\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+
+    assert models_router._configured_context_length() == 131072
+
+
+def test_configured_context_falls_back_to_process_env_without_persisted_values(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, _install_dir, _data_dir = _patch_model_router_paths(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.setenv("CTX_SIZE", "32768")
+
+    assert models_router._configured_context_length() == 32768
+
+
+def test_load_model_noops_lemonade_active_identity_without_chat_probe(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.6-35b-a3b-ud-q4",
+        "name": "Qwen 3.6 35B-A3B UD",
+        "gguf_file": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "size_mb": 21616,
+        "vram_required_gb": 24,
+        "context_length": 131072,
+        "quantization": "Q4_K_M",
+        "specialty": "Quality",
+        "description": "Large active Lemonade model.",
+        "llm_model_name": "qwen3.6-35b-a3b",
+    }])
+    (data_dir / "models" / "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf").write_text(
+        "model",
+        encoding="utf-8",
+    )
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\n"
+        "LLM_BACKEND=lemonade\n"
+        "LLM_MODEL=qwen3.6-35b-a3b\n"
+        "GGUF_FILE=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "lemonade")
+    monkeypatch.setattr(
+        models_router,
+        "_fetch_loaded_model_sync",
+        lambda: "Qwen3.6-35B-A3B-UD-Q4_K_M",
+    )
+    _write_activation_receipt(
+        data_dir,
+        "qwen3.6-35b-a3b-ud-q4",
+        "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "Qwen3.6-35B-A3B-UD-Q4_K_M",
+    )
+
+    def fail_agent_call(*_args, **_kwargs):
+        raise AssertionError("an already-active model should not call host-agent activate")
+
+    monkeypatch.setattr(models_router, "_call_agent_model", fail_agent_call)
+
+    resp = test_client.post(
+        "/api/models/qwen3.6-35b-a3b-ud-q4/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "already_active",
+        "model_id": "qwen3.6-35b-a3b-ud-q4",
+        "loadedModel": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+    }
+
+
+def test_get_gpu_vram_returns_none_on_nvml_error(monkeypatch):
+    """Operational NVML failures should degrade to unknown GPU rather than 500."""
+
+    class FakeNVMLError(Exception):
+        pass
+
+    def _raise_nvml_error():
+        raise FakeNVMLError("driver not loaded")
+
+    real_gpu = sys.modules.get("gpu")
+    real_pynvml = sys.modules.get("pynvml")
+
+    monkeypatch.setitem(sys.modules, "gpu", types.SimpleNamespace(get_gpu_info=_raise_nvml_error))
+    monkeypatch.setitem(sys.modules, "pynvml", types.SimpleNamespace(NVMLError=FakeNVMLError))
+
+    import routers.models as models_router
+
+    importlib.reload(models_router)
+    assert models_router._get_gpu_vram() is None
+
+    if real_gpu is None:
+        monkeypatch.delitem(sys.modules, "gpu", raising=False)
+    else:
+        monkeypatch.setitem(sys.modules, "gpu", real_gpu)
+
+    if real_pynvml is None:
+        monkeypatch.delitem(sys.modules, "pynvml", raising=False)
+    else:
+        monkeypatch.setitem(sys.modules, "pynvml", real_pynvml)
+
+    importlib.reload(models_router)
+
+
+def _write_model_library(install_dir, models):
+    config_dir = install_dir / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "model-library.json").write_text(
+        json.dumps({"version": 2, "models": models}),
+        encoding="utf-8",
+    )
+    (install_dir / "data" / "models").mkdir(parents=True)
+
+
+def _write_activation_receipt(data_dir, model_id, gguf_file, runtime_model_id=None):
+    (data_dir / "model-activation-receipt.json").write_text(
+        json.dumps({
+            "schema": "ods.model-activation-receipt.v1",
+            "status": "complete",
+            "modelId": model_id,
+            "ggufFile": gguf_file,
+            "runtimeModelId": runtime_model_id or gguf_file,
+            "consumers": {"dashboard": "live_env"},
+        }),
+        encoding="utf-8",
+    )
+
+
+def _patch_model_router_paths(monkeypatch, tmp_path):
+    import helpers
+    import routers.models as models_router
+
+    install_dir = tmp_path / "ods"
+    data_dir = install_dir / "data"
+    data_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text("ODS_MODE=local\n", encoding="utf-8")
+    monkeypatch.setattr(helpers, "_PERF_FILE", data_dir / "model_performance.json")
+    monkeypatch.setattr(models_router, "INSTALL_DIR", str(install_dir))
+    monkeypatch.setattr(models_router, "DATA_DIR", str(data_dir))
+    monkeypatch.setattr(models_router, "_LIBRARY_PATH", install_dir / "config" / "model-library.json")
+    monkeypatch.setattr(models_router, "_MODELS_DIR", data_dir / "models")
+    monkeypatch.setattr(models_router, "_ENV_PATH", install_dir / ".env")
+    monkeypatch.setattr(models_router, "ODS_MODE_EFFECTIVE", "local")
+    # Hermetic by default: the development host's own GPU must not change
+    # which context a load plans. Tests that need hardware patch it back.
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: None)
+    return models_router, install_dir, data_dir
+
+
+@pytest.mark.parametrize("mode", ["local", "hybrid", "lemonade"])
+def test_model_activation_mode_policy_allows_matching_local_modes(mode):
+    import routers.models as models_router
+
+    assert models_router._model_activation_mode_denial(mode, mode, "llama-server") is None
+
+
+def test_model_activation_mode_policy_rejects_external_backend():
+    import routers.models as models_router
+
+    denial = models_router._model_activation_mode_denial("local", "local", "external")
+
+    assert denial == {
+        "error": "local_mode_required",
+        "code": "external_llm_managed",
+        "reason": "external_backend_selected",
+        "message": (
+            "Local model activation is unavailable while ODS uses your own "
+            "model server. Change the model in that server, or rerun the "
+            "installer with an ODS-managed backend to activate downloaded models."
+        ),
+        "effectiveMode": "local",
+        "configuredMode": "local",
+        "llmBackend": "external",
+    }
+
+
+@pytest.mark.parametrize(
+    ("effective_mode", "configured_mode", "expected_code", "expected_reason"),
+    [
+        ("cloud", "cloud", "local_mode_required", "effective_mode_not_local"),
+        ("unknown", "local", "ods_mode_unknown", "mode_unknown"),
+        ("local", "invalid", "ods_mode_unknown", "mode_unknown"),
+        ("cloud", "local", "ods_mode_mismatch", "mode_mismatch"),
+        ("local", "cloud", "ods_mode_mismatch", "mode_mismatch"),
+    ],
+)
+def test_load_model_rejects_unsafe_mode_before_lookup_or_agent_call(
+    test_client,
+    monkeypatch,
+    tmp_path,
+    effective_mode,
+    configured_mode,
+    expected_code,
+    expected_reason,
+):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    (install_dir / ".env").write_text(
+        f"ODS_MODE={configured_mode}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "ODS_MODE_EFFECTIVE", effective_mode)
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "llama-server")
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe activation reached host agent")
+        ),
+    )
+
+    response = test_client.post(
+        "/api/models/not-installed/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    message = detail.pop("message")
+    assert message.startswith("Local model activation is unavailable")
+    assert detail == {
+        "error": "local_mode_required",
+        "code": expected_code,
+        "reason": expected_reason,
+        "effectiveMode": models_router.normalize_ods_mode(effective_mode),
+        "configuredMode": models_router.normalize_ods_mode(configured_mode),
+        "llmBackend": "llama-server",
+        "requestedModelId": "not-installed",
+    }
+
+
+def test_load_model_rejects_external_backend_before_lookup_or_agent_call(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    (install_dir / ".env").write_text("ODS_MODE=local\n", encoding="utf-8")
+    monkeypatch.setattr(models_router, "ODS_MODE_EFFECTIVE", "local")
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "external")
+    monkeypatch.setattr(
+        models_router,
+        "_find_loadable_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("external activation reached model lookup")
+        ),
+    )
+
+    response = test_client.post(
+        "/api/models/downloaded-model/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "external_llm_managed"
+    assert detail["reason"] == "external_backend_selected"
+    assert detail["llmBackend"] == "external"
+    assert detail["requestedModelId"] == "downloaded-model"
+
+
+def test_load_model_refuses_to_interrupt_an_active_pixel_stream(monkeypatch):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "_model_activation_mode_denial", lambda *_args: None)
+    monkeypatch.setattr(models_router, "_find_loadable_model", lambda _model_id: {"id": "next-model"})
+    monkeypatch.setattr(models_router, "_already_active_model", lambda *_args: (False, None))
+    monkeypatch.setattr(models_router, "pixel_stream_active", lambda: True)
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("active Pixel turn reached host-agent activation")
+        ),
+    )
+
+    with pytest.raises(models_router.HTTPException) as exc_info:
+        models_router.load_model("next-model", body=None)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == {
+        "code": "pixel_chat_active",
+        "message": "Portal is working. Stop the active response before changing models.",
+        "requestedModelId": "next-model",
+    }
+
+
+def _gpu():
+    return GPUInfo(
+        name="NVIDIA GeForce RTX 4060",
+        memory_used_mb=1024,
+        memory_total_mb=8192,
+        memory_percent=12.5,
+        utilization_percent=0,
+        temperature_c=40,
+        gpu_backend="nvidia",
+    )
+
+
+def test_api_models_returns_full_catalog_without_fake_tokens(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [
+        {
+            "id": "phi4-mini-q4",
+            "name": "Phi-4 Mini",
+            "gguf_file": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "size_mb": 2490,
+            "vram_required_gb": 4,
+            "context_length": 128000,
+            "quantization": "Q4_K_M",
+            "specialty": "Balanced",
+            "description": "Compact 128K model.",
+            "tokens_per_sec_estimate": 130,
+            "llm_model_name": "phi-4-mini",
+        },
+        {
+            "id": "deepseek-r1-7b-q4",
+            "name": "DeepSeek R1 7B",
+            "gguf_file": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
+            "size_mb": 4680,
+            "vram_required_gb": 7,
+            "context_length": 32768,
+            "quantization": "Q4_K_M",
+            "specialty": "Reasoning",
+            "description": "Reasoning model.",
+            "tokens_per_sec_estimate": 80,
+            "llm_model_name": "deepseek-r1-distill-qwen-7b",
+        },
+    ])
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 0}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+
+    resp = test_client.get("/api/models", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert [model["id"] for model in payload["models"]] == ["phi4-mini-q4", "deepseek-r1-7b-q4"]
+    assert payload["models"][0]["tokensPerSec"] is None
+    assert payload["models"][0]["tokensPerSecEstimate"] == 130
+    assert payload["models"][0]["performance"]["source"] == "benchmark_required"
+    assert payload["hostRuntime"] is False
+    assert "externalLemonade" not in payload
+
+
+def test_api_models_reports_unmatched_external_runtime_without_fake_performance(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    agent_paths: list = []
+
+    def request_agent_json(_method, path, **_kwargs):
+        agent_paths.append(path)
+        return {}
+
+    monkeypatch.setattr(models_router, "request_agent_json", request_agent_json)
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "external")
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda _keys: {
+        "LLM_BACKEND": "external",
+    })
+    _write_model_library(install_dir, [{
+        "id": "qwen3.6-35b-a3b-ud-q4",
+        "name": "Qwen 3.6 35B-A3B",
+        "gguf_file": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "size_mb": 21110,
+        "vram_required_gb": 24,
+        "context_length": 131072,
+        "quantization": "UD-Q4_K_M",
+        "specialty": "Quality",
+        "description": "Catalog quantization, not the observed external runtime.",
+        "llm_model_name": "qwen3.6-35b-a3b",
+    }])
+    runtime_name = "Qwen3.6-35B-A3B-GGUF"
+    recorded = []
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=runtime_name))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 42}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "record_model_performance", lambda *args, **kwargs: recorded.append((args, kwargs)))
+
+    response = test_client.get("/api/models", headers=test_client.auth_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    active = [entry for entry in payload["models"] if entry["status"] == "loaded"]
+    assert len(active) == 1
+    assert active[0]["name"] == runtime_name
+    assert active[0]["metadata"]["source"] == "runtime"
+    assert active[0]["sizeGb"] is None
+    assert active[0]["vramRequired"] is None
+    assert active[0]["quantization"] is None
+    assert payload["currentModel"] is None
+    assert payload["activationReadyModel"] is None
+    assert payload["loadedModel"] == runtime_name
+    assert payload["hostRuntime"] is False
+    # The owner's own server is never a Windows runtime this install manages.
+    assert "/v1/model/management" not in agent_paths
+    assert recorded == []
+
+
+@pytest.mark.parametrize(
+    ("transport", "legacy_transport", "runtime_mode", "backend", "external", "expected"),
+    [
+        # The WSL Portal drives llama-server.exe on Windows through the bridge.
+        ("model-router", "", "", "llama-server", "", True),
+        ("", "", "windows-portal-llama-server", "llama-server", "", True),
+        # An unmigrated Portal .env names its transport with the legacy key.
+        ("", "model-router", "", "lemonade", "true", True),
+        # An unmigrated .env for the owner's own Lemonade is never controlled here.
+        ("", "", "", "lemonade", "true", True),
+        # A retired line left after the migration decides nothing.
+        ("", "", "", "llama-server", "true", False),
+        ("direct", "", "windows-native-llama-server", "llama-server", "", False),
+        ("", "", "linux-container", "llama-server", "", False),
+        ("", "", "", "external", "", False),
+    ],
+)
+def test_windows_hosted_runtime_flag(
+    monkeypatch, transport, legacy_transport, runtime_mode, backend, external, expected
+):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda _keys: {
+        "ODS_HOST_LLM_TRANSPORT": transport,
+        "LEMONADE_HOST_TRANSPORT": legacy_transport,
+        "AMD_INFERENCE_RUNTIME_MODE": runtime_mode,
+        "LLM_BACKEND": backend,
+        "LEMONADE_EXTERNAL": external,
+    })
+
+    assert models_router._windows_hosted_runtime() is expected
+    assert not hasattr(models_router, "_external_lemonade_runtime")
+
+
+@pytest.mark.parametrize("values", [
+    # An unmigrated .env for the owner's own Lemonade.
+    {"LLM_BACKEND": "lemonade", "LEMONADE_EXTERNAL": "true"},
+    # The Portal, while the host agent cannot prove it may change the runtime.
+    {"LLM_BACKEND": "llama-server", "ODS_HOST_LLM_TRANSPORT": "model-router"},
+])
+def test_load_model_rejects_an_uncontrollable_windows_runtime_before_catalog_lookup(
+    test_client, monkeypatch, tmp_path, values,
+):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "request_agent_json", lambda *_args, **_kwargs: {
+        "managed": True, "canActivate": False, "canUnload": True, "running": False,
+    })
+    (install_dir / ".env").write_text("ODS_MODE=lemonade\n", encoding="utf-8")
+    monkeypatch.setattr(models_router, "ODS_MODE_EFFECTIVE", "local")
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "llama-server")
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda _keys: values)
+    monkeypatch.setattr(
+        models_router,
+        "_find_loadable_model",
+        lambda _model_id: (_ for _ in ()).throw(
+            AssertionError("an uncontrollable runtime reached catalog lookup")
+        ),
+    )
+
+    response = test_client.post(
+        "/api/models/downloaded-model/load", headers=test_client.auth_headers
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "error": "This installation cannot change the model runtime on the Windows host right now",
+        "code": "external_runtime_unmanaged",
+        "requestedModelId": "downloaded-model",
+    }
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    ("get", "/api/models/external-observation"),
+    ("post", "/api/models/external-adopt"),
+])
+def test_retired_external_adoption_answers_gone_after_auth(test_client, monkeypatch, method, path):
+    import routers.models as models_router
+
+    monkeypatch.setattr(models_router, "request_agent_json", lambda *_args, **_kwargs: (
+        _ for _ in ()).throw(AssertionError("a retired endpoint never reaches the host agent")))
+    assert getattr(test_client, method)(path).status_code == 401
+    response = getattr(test_client, method)(path, headers=test_client.auth_headers)
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "external_lemonade_removed"
+
+
+def test_download_model_rejects_while_bootstrap_upgrade_active(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [
+        {
+            "id": "phi4-mini-q4",
+            "name": "Phi-4 Mini",
+            "gguf_file": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "gguf_url": "https://example.test/Phi-4-mini-instruct-Q4_K_M.gguf",
+            "size_mb": 2490,
+            "vram_required_gb": 4,
+            "context_length": 128000,
+            "quantization": "Q4_K_M",
+            "specialty": "Balanced",
+            "description": "Compact 128K model.",
+            "tokens_per_sec_estimate": 130,
+            "llm_model_name": "phi-4-mini",
+        },
+    ])
+    monkeypatch.setattr(
+        models_router,
+        "get_bootstrap_status",
+        lambda: BootstrapStatus(
+            active=True,
+            model_name="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            percent=8.5,
+        ),
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("bootstrap-busy download reached host agent")
+        ),
+    )
+
+    resp = test_client.post(
+        "/api/models/phi4-mini-q4/download",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "ODS is still downloading Qwen3.6-35B-A3B-UD-Q4_K_M.gguf, its first full model. Other model downloads can start when it finishes.",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "bootstrap_upgrade",
+        "activeTarget": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "requestedModelId": "phi4-mini-q4",
+    }
+
+
+def test_load_model_rejects_while_bootstrap_upgrade_active(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [
+        {
+            "id": "qwen3.5-9b-q4",
+            "name": "Qwen 3.5 9B",
+            "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+            "size_mb": 5760,
+            "vram_required_gb": 8,
+            "context_length": 32768,
+            "quantization": "Q4_K_M",
+            "specialty": "General",
+            "description": "Balanced default.",
+            "llm_model_name": "qwen3.5-9b",
+        },
+    ])
+    (data_dir / "models" / "Qwen3.5-9B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    monkeypatch.setattr(models_router, "_already_active_model", lambda *_args: (False, None))
+    monkeypatch.setattr(
+        models_router,
+        "get_bootstrap_status",
+        lambda: BootstrapStatus(
+            active=True,
+            model_name="Qwen3.5-9B-Q4_K_M.gguf",
+            percent=100.0,
+        ),
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("bootstrap-busy load reached host agent")
+        ),
+    )
+
+    resp = test_client.post(
+        "/api/models/qwen3.5-9b-q4/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "ODS is still downloading Qwen3.5-9B-Q4_K_M.gguf, its first full model. Other model downloads can start when it finishes.",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "bootstrap_upgrade",
+        "activeTarget": "Qwen3.5-9B-Q4_K_M.gguf",
+        "requestedModelId": "qwen3.5-9b-q4",
+    }
+
+
+def test_download_model_rejects_while_bootstrap_upgrade_retry_pending(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [
+        {
+            "id": "phi4-mini-q4",
+            "name": "Phi-4 Mini",
+            "gguf_file": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "gguf_url": "https://example.test/Phi-4-mini-instruct-Q4_K_M.gguf",
+            "size_mb": 2490,
+            "vram_required_gb": 4,
+            "context_length": 128000,
+            "quantization": "Q4_K_M",
+            "specialty": "Balanced",
+            "description": "Compact 128K model.",
+            "tokens_per_sec_estimate": 130,
+            "llm_model_name": "phi-4-mini",
+        },
+    ])
+    (data_dir / "bootstrap-status.json").write_text(
+        json.dumps({
+            "status": "failed",
+            "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "eta": "Download failed after 6 attempts; partial file preserved for resume.",
+        }),
+        encoding="utf-8",
+    )
+    (data_dir / "bootstrap-upgrade.args").write_text(
+        "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf\nhttps://example.test/full.gguf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "get_bootstrap_status", lambda: BootstrapStatus(active=False))
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("retry-pending bootstrap download reached host agent")
+        ),
+    )
+
+    resp = test_client.post(
+        "/api/models/phi4-mini-q4/download",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "ODS's first download of Qwen3.6-35B-A3B-UD-Q4_K_M.gguf stopped before it finished, and it goes before other model downloads. Restart ODS to retry it (ods restart). The reason is in logs/model-upgrade.log in your ODS folder.",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "bootstrap_upgrade_retry_pending",
+        "activeTarget": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "requestedModelId": "phi4-mini-q4",
+    }
+
+
+def test_download_model_rejects_stale_active_bootstrap_upgrade_as_retry_pending(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [
+        {
+            "id": "phi4-mini-q4",
+            "name": "Phi-4 Mini",
+            "gguf_file": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "gguf_url": "https://example.test/Phi-4-mini-instruct-Q4_K_M.gguf",
+            "size_mb": 2490,
+            "vram_required_gb": 4,
+            "context_length": 128000,
+            "quantization": "Q4_K_M",
+            "specialty": "Balanced",
+            "description": "Compact 128K model.",
+            "tokens_per_sec_estimate": 130,
+            "llm_model_name": "phi-4-mini",
+        },
+    ])
+    monkeypatch.setattr(models_router, "_STALE_ACTIVE_BOOTSTRAP_STATUS_SECONDS", 60)
+    (data_dir / "bootstrap-status.json").write_text(
+        json.dumps({
+            "status": "downloading",
+            "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "updatedAt": "2000-01-01T00:00:00+00:00",
+            "bytesDownloaded": 143274063,
+        }),
+        encoding="utf-8",
+    )
+    (data_dir / "bootstrap-upgrade.args").write_text(
+        "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf\nhttps://example.test/full.gguf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale bootstrap download reached host agent")
+        ),
+    )
+
+    resp = test_client.post(
+        "/api/models/phi4-mini-q4/download",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "ODS's first download of Qwen3.6-35B-A3B-UD-Q4_K_M.gguf stopped before it finished, and it goes before other model downloads. Restart ODS to retry it (ods restart). The reason is in logs/model-upgrade.log in your ODS folder.",
+        "code": "model_lifecycle_busy",
+        "activeOperation": "bootstrap_upgrade_retry_pending",
+        "activeTarget": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "requestedModelId": "phi4-mini-q4",
+    }
+
+
+@pytest.mark.parametrize("mode", ["generation_interval", "live_output_interval"])
+def test_api_models_falls_back_to_loaded_model_probe(test_client, monkeypatch, tmp_path, mode):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }])
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "_fetch_llama_loaded_model", AsyncMock(return_value="Qwen3.5-9B-Q4_K_M.gguf"))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 33.0, "lifetime_tokens": 0, "throughput_mode": mode, "throughput_state": "measured", "throughput_sampled_at": 1000, "throughput_model": "Qwen3.5-9B-Q4_K_M.gguf"}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=32768))
+    monkeypatch.setattr(models_router, "SERVICES", {"llama-server": {"host": "localhost", "port": 8080}})
+
+    monkeypatch.setattr(models_router, "_last_recorded_throughput_sample", None)
+    recorded = []
+    monkeypatch.setattr(models_router, "record_model_performance", lambda *args, **kwargs: recorded.append((args, kwargs)))
+    resp = test_client.get("/api/models", headers=test_client.auth_headers)
+    again = test_client.get("/api/models", headers=test_client.auth_headers)
+    assert again.status_code == 200
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={
+        "tokens_per_second": 33.0, "throughput_state": "retained",
+        "throughput_model": "Qwen3.5-9B-Q4_K_M.gguf", "throughput_sampled_at": 1000,
+    }))
+    held = test_client.get("/api/models", headers=test_client.auth_headers)
+    assert held.status_code == 200
+    assert len(recorded) == (0 if mode == "live_output_interval" else 1)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["currentModel"] == "qwen3.5-9b-q4"
+    assert payload["loadedModel"] == "Qwen3.5-9B-Q4_K_M.gguf"
+    if mode == "live_output_interval":
+        assert payload["models"][0]["performance"]["source"] != "measured_local"
+    else:
+        assert payload["models"][0]["performance"]["source"] == "measured_local"
+
+
+def test_model_probe_uses_physical_backend_not_litellm_alias(monkeypatch, tmp_path):
+    import routers.models as models_router
+
+    values = {
+        "AMD_INFERENCE_LOCATION": "host",
+        "LLM_API_URL": "http://litellm:4000",
+        "NATIVE_LLM_CONTAINER_BASE_URL": "http://host.docker.internal:13305/v1",
+        "LEMONADE_CONTAINER_BASE_URL": "http://host.docker.internal:13306/api/v1",
+    }
+    monkeypatch.setattr(models_router, "INSTALL_DIR", str(tmp_path))
+    monkeypatch.setattr(models_router, "read_env_value", lambda key, _root: values.get(key, ""))
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "llama-server")
+
+    # A Windows-hosted llama-server, as containers reach it.
+    assert models_router._configured_llm_base_url("llama-server", 8080) == "http://host.docker.internal:13305"
+    # The origin's one-release legacy name.
+    values.pop("NATIVE_LLM_CONTAINER_BASE_URL")
+    assert models_router._configured_llm_base_url("llama-server", 8080) == "http://host.docker.internal:13306"
+    # The gateway's aliases never identify the served model (R2).
+    values.pop("LEMONADE_CONTAINER_BASE_URL")
+    values["AMD_INFERENCE_LOCATION"] = "container"
+    assert models_router._configured_llm_base_url("llama-server", 8080) == "http://llama-server:8080"
+
+
+def test_external_model_probe_uses_physical_backend_not_litellm_alias(monkeypatch, tmp_path):
+    import routers.models as models_router
+
+    values = {
+        "LLM_API_URL": "http://litellm:4000/v1",
+        "EXTERNAL_LLM_CONTAINER_URL": "http://host.docker.internal:8000",
+    }
+    monkeypatch.setattr(models_router, "INSTALL_DIR", str(tmp_path))
+    monkeypatch.setattr(models_router, "read_env_value", lambda key, _root: values.get(key))
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "external")
+
+    assert models_router._configured_llm_base_url("llama-server", 8080) == "http://host.docker.internal:8000"
+
+
+def test_api_models_marks_installer_configured_model(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }])
+    (install_dir / ".env").write_text(
+        "ODS_MODE=cloud\n"
+        "LLM_MODEL=qwen3.5-9b\n"
+        "GGUF_FILE=Qwen3.5-9B-Q4_K_M.gguf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 0}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+
+    resp = test_client.get("/api/models", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    model = resp.json()["models"][0]
+    assert resp.json()["configuredModel"] == "qwen3.5-9b-q4"
+    assert resp.json()["odsMode"] == "local"
+    assert resp.json()["configuredMode"] == "cloud"
+    assert model["recommended"] is True
+    assert model["configured"] is True
+    assert model["recommendation"]["source"] == "installer_configured"
+    assert "Benchmark" in model["performanceLabel"]
+
+
+def test_benchmark_endpoint_rejects_not_loaded_model(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }])
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value="other-model"))
+    monkeypatch.setattr(models_router, "_fetch_llama_loaded_model", AsyncMock(return_value="other-model"))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 0}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=32768))
+    monkeypatch.setattr(models_router, "SERVICES", {"llama-server": {"host": "localhost", "port": 8080}})
+
+    resp = test_client.post(
+        "/api/models/qwen3.5-9b-q4/benchmark",
+        headers=test_client.auth_headers,
+        json={"max_tokens": 64},
+    )
+
+    assert resp.status_code == 409
+    assert "Load the model" in resp.json()["detail"]
+
+
+def test_load_model_noops_when_requested_model_already_loaded(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }])
+    (data_dir / "models" / "Qwen3.5-9B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\n"
+        "LLM_MODEL=qwen3.5-9b\n"
+        "GGUF_FILE=Qwen3.5-9B-Q4_K_M.gguf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: "extra.Qwen3.5-9B-Q4_K_M.gguf")
+    _write_activation_receipt(
+        data_dir,
+        "qwen3.5-9b-q4",
+        "Qwen3.5-9B-Q4_K_M.gguf",
+        "extra.Qwen3.5-9B-Q4_K_M.gguf",
+    )
+
+    def fail_agent_call(*_args, **_kwargs):
+        raise AssertionError("already-active model should not call host-agent activate")
+
+    monkeypatch.setattr(models_router, "_call_agent_model", fail_agent_call)
+
+    resp = test_client.post("/api/models/qwen3.5-9b-q4/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "already_active",
+        "model_id": "qwen3.5-9b-q4",
+        "loadedModel": "extra.Qwen3.5-9B-Q4_K_M.gguf",
+    }
+
+
+def test_load_model_reconfigures_active_model_when_context_changes(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    model = {
+        "id": "qwen3.5-4b-q4",
+        "name": "Qwen 3.5 4B",
+        "gguf_file": "Qwen3.5-4B-Q4_K_M.gguf",
+        "size_mb": 2741,
+        "vram_required_gb": 5,
+        "context_length": 8192,
+        "max_context_length": 262144,
+        "quantization": "Q4_K_M",
+        "specialty": "Balanced",
+        "description": "Long-context model.",
+        "llm_model_name": "qwen3.5-4b",
+    }
+    _write_model_library(install_dir, [model])
+    (data_dir / "models" / model["gguf_file"]).write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\n"
+        "LLM_MODEL=qwen3.5-4b\n"
+        f"GGUF_FILE={model['gguf_file']}\n"
+        "CTX_SIZE=65536\n"
+        "MAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_fetch_loaded_model_sync",
+        lambda: f"extra.{model['gguf_file']}",
+    )
+    _write_activation_receipt(
+        data_dir,
+        model["id"],
+        model["gguf_file"],
+        f"extra.{model['gguf_file']}",
+    )
+    calls = []
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda path, body, timeout=30, **kwargs: calls.append(
+            (path, body, timeout, kwargs)
+        )
+        or {"status": "activated", "context_length": body.get("context_length")},
+    )
+
+    resp = test_client.post(
+        f"/api/models/{model['id']}/load",
+        headers=test_client.auth_headers,
+        json={"context_length": 262144},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["context_length"] == 262144
+    assert calls == [(
+        "/v1/model/activate",
+        {"model_id": model["id"], "context_length": 262144},
+        2700,
+        {
+            "retry_download_busy_seconds":
+                models_router._MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS,
+            "retry_pixel_busy_seconds":
+                models_router._MODEL_PIXEL_BUSY_ACTIVATION_GRACE_SECONDS,
+        },
+    )]
+
+
+@pytest.mark.parametrize("agent_outcome", ["activated", "failed"])
+def test_load_model_expires_status_cached_during_activation(
+    test_client,
+    monkeypatch,
+    tmp_path,
+    agent_outcome,
+):
+    """The confirming poll after the POST must not see the running lifecycle."""
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    model = {
+        "id": "qwen3.5-4b-q4",
+        "name": "Qwen 3.5 4B",
+        "gguf_file": "Qwen3.5-4B-Q4_K_M.gguf",
+        "size_mb": 2741,
+        "vram_required_gb": 5,
+        "context_length": 8192,
+        "quantization": "Q4_K_M",
+        "specialty": "Balanced",
+        "description": "Test model.",
+        "llm_model_name": "qwen3.5-4b",
+    }
+    _write_model_library(install_dir, [model])
+    (data_dir / "models" / model["gguf_file"]).write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\nLLM_MODEL=previous\nGGUF_FILE=previous.gguf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: "previous.gguf")
+    running = {
+        "lifecycle": {"active": True, "operation": "model_activation", "modelId": model["id"]},
+    }
+    settled = {"lifecycle": None}
+    agent_reads = []
+
+    def activate(path, body, timeout=30, **_kwargs):
+        # A dashboard poll during the activation caches the running lifecycle.
+        monkeypatch.setattr(models_router, "_agent_model_status_cache_value", running)
+        monkeypatch.setattr(models_router, "_agent_model_status_cache_at", models_router.time.monotonic())
+        if agent_outcome == "failed":
+            raise models_router.HTTPException(status_code=500, detail="rolled back")
+        return {"status": "activated", "model_id": body["model_id"]}
+
+    monkeypatch.setattr(models_router, "_call_agent_model", activate)
+    monkeypatch.setattr(
+        models_router,
+        "request_agent_json",
+        lambda method, path, **_kwargs: agent_reads.append((method, path)) or settled,
+    )
+
+    resp = test_client.post(f"/api/models/{model['id']}/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == (200 if agent_outcome == "activated" else 500)
+    assert models_router._get_agent_model_status() is settled
+    assert agent_reads == [("GET", "/v1/model/status")]
+
+
+def test_load_model_allows_advanced_context_override_but_rejects_invalid_range(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    model = {
+        "id": "small-context-model",
+        "name": "Small Context",
+        "gguf_file": "small-context.gguf",
+        "size_mb": 512,
+        "vram_required_gb": 2,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "Chat",
+        "description": "Small context model.",
+        "llm_model_name": "small-context",
+    }
+    _write_model_library(install_dir, [model])
+    (data_dir / "models" / model["gguf_file"]).write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text("ODS_MODE=local\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda path, body, timeout=30, **kwargs: calls.append(
+            (path, body, timeout, kwargs)
+        )
+        or {"status": "activated", "context_length": body["context_length"]},
+    )
+
+    invalid_type = test_client.post(
+        f"/api/models/{model['id']}/load",
+        headers=test_client.auth_headers,
+        json={"context_length": True},
+    )
+    advanced_override = test_client.post(
+        f"/api/models/{model['id']}/load",
+        headers=test_client.auth_headers,
+        json={"context_length": 65536},
+    )
+    unrestricted_override = test_client.post(
+        f"/api/models/{model['id']}/load",
+        headers=test_client.auth_headers,
+        json={"context_length": 2097152},
+    )
+    unsafe_integer = test_client.post(
+        f"/api/models/{model['id']}/load",
+        headers=test_client.auth_headers,
+        json={"context_length": 9007199254740992},
+    )
+
+    assert invalid_type.status_code == 400
+    assert "must be an integer" in invalid_type.json()["detail"]
+    assert advanced_override.status_code == 200
+    assert advanced_override.json()["context_length"] == 65536
+    assert calls[0][1] == {
+        "model_id": model["id"],
+        "context_length": 65536,
+    }
+    assert unrestricted_override.status_code == 200
+    assert calls[1][1] == {
+        "model_id": model["id"],
+        "context_length": 2097152,
+    }
+    assert unsafe_integer.status_code == 400
+    assert "must be a safe integer of at least 1024" in unsafe_integer.json()["detail"]
+
+
+def test_load_model_reconciles_matching_runtime_without_completion_receipt(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    model = {
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }
+    _write_model_library(install_dir, [model])
+    (data_dir / "models" / model["gguf_file"]).write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\n"
+        "LLM_MODEL=qwen3.5-9b\n"
+        "GGUF_FILE=Qwen3.5-9B-Q4_K_M.gguf\n"
+        "CTX_SIZE=65536\n"
+        "MAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_fetch_loaded_model_sync",
+        # Switchboard identity is intentionally opaque; the configured GGUF
+        # and active-model record remain the authoritative identity proof.
+        lambda: "ods/current",
+    )
+    calls = []
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: calls.append((path, body, timeout))
+        or {"status": "activated"},
+    )
+
+    resp = test_client.post("/api/models/qwen3.5-9b-q4/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "activated"
+    assert calls == [(
+        "/v1/model/activate",
+        {"model_id": model["id"], "context_length": 65536},
+        2700,
+    )]
+
+
+def test_load_model_preserves_context_when_env_bind_inode_is_stale(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    model = {
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }
+    _write_model_library(install_dir, [model])
+    (data_dir / "models" / model["gguf_file"]).write_text("model", encoding="utf-8")
+    # This is the old inode still visible through the container bind mount.
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\n"
+        "LLM_MODEL=qwen3.5-2b\n"
+        "GGUF_FILE=Qwen3.5-2B-Q4_K_M.gguf\n"
+        "CTX_SIZE=65536\n"
+        "MAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_fetch_loaded_model_sync",
+        lambda: f"extra.{model['gguf_file']}",
+    )
+    calls = []
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: calls.append((path, body, timeout))
+        or {"status": "activated"},
+    )
+
+    resp = test_client.post(
+        f"/api/models/{model['id']}/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert calls == [(
+        "/v1/model/activate",
+        {"model_id": model["id"], "context_length": 65536},
+        2700,
+    )]
+
+
+def test_load_model_delegates_when_live_backend_reports_different_model(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4",
+        "name": "Qwen 3.5 9B",
+        "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5760,
+        "vram_required_gb": 8,
+        "context_length": 32768,
+        "quantization": "Q4_K_M",
+        "specialty": "General",
+        "description": "Balanced default.",
+        "llm_model_name": "qwen3.5-9b",
+    }])
+    (data_dir / "models" / "Qwen3.5-9B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\n"
+        "LLM_MODEL=qwen3.5-9b\n"
+        "GGUF_FILE=Qwen3.5-9B-Q4_K_M.gguf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: "other-model.gguf")
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: {"status": "activated", "path": path, "body": body, "timeout": timeout},
+    )
+
+    resp = test_client.post("/api/models/qwen3.5-9b-q4/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "activated",
+        "path": "/v1/model/activate",
+        "body": {"model_id": "qwen3.5-9b-q4"},
+        "timeout": 2700,
+    }
+
+
+def test_load_model_uses_observed_download_teardown_grace(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-35b-a3b-q4",
+        "name": "Qwen 3.5 35B-A3B",
+        "gguf_file": "Qwen3.5-35B-A3B-Q4_K_M.gguf",
+        "size_mb": 21500,
+        "vram_required_gb": 24,
+        "context_length": 131072,
+        "quantization": "Q4_K_M",
+        "specialty": "Quality",
+        "description": "High-context model.",
+        "llm_model_name": "qwen3.5-35b-a3b",
+    }])
+    (data_dir / "models" / "Qwen3.5-35B-A3B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text("ODS_MODE=local\n", encoding="utf-8")
+
+    captured = {}
+
+    def agent_call(path, body, timeout=30, **kwargs):
+        captured.update({"path": path, "body": body, "timeout": timeout, **kwargs})
+        return {"status": "activated"}
+
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: "phi4-mini-q4")
+    monkeypatch.setattr(models_router, "_call_agent_model", agent_call)
+
+    resp = test_client.post("/api/models/qwen3.5-35b-a3b-q4/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert captured == {
+        "path": "/v1/model/activate",
+        "body": {"model_id": "qwen3.5-35b-a3b-q4"},
+        "timeout": 2700,
+        "retry_download_busy_seconds": models_router._MODEL_DOWNLOAD_BUSY_ACTIVATION_GRACE_SECONDS,
+        "retry_pixel_busy_seconds": models_router._MODEL_PIXEL_BUSY_ACTIVATION_GRACE_SECONDS,
+    }
+    assert captured["retry_download_busy_seconds"] >= 120.0
+
+
+def test_load_model_delegates_local_gguf_without_catalog_entry(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0.gguf").write_text(
+        "model",
+        encoding="utf-8",
+    )
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: {"status": "activated", "path": path, "body": body, "timeout": timeout},
+    )
+
+    resp = test_client.post(
+        "/api/models/OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "activated",
+        "path": "/v1/model/activate",
+        "body": {"model_id": "OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0"},
+        "timeout": 2700,
+    }
+
+
+def test_local_gguf_prefers_canonical_context_when_upgrade_aliases_diverge(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "LocalUpgrade.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=131072\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+
+    model = models_router._find_loadable_model("LocalUpgrade")
+
+    assert model["context_length"] == 131072
+
+
+def test_local_gguf_prefers_persisted_legacy_context_over_stale_process_value(
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "LocalUpgrade.gguf").write_text("model", encoding="utf-8")
+    (install_dir / ".env").write_text(
+        "CTX_SIZE=\nMAX_CONTEXT=65536\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CTX_SIZE", "8192")
+
+    model = models_router._find_loadable_model("LocalUpgrade")
+
+    assert model["context_length"] == 65536
+
+
+def test_local_gguf_scan_keeps_mixed_case_and_skips_empty(monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "MixedCaseModel.GGUF").write_text("model", encoding="utf-8")
+    (data_dir / "models" / "empty.gguf").write_text("", encoding="utf-8")
+    (data_dir / "models" / "partial.gguf.part").write_text("partial", encoding="utf-8")
+
+    assert models_router._scan_downloaded_models() == {
+        "MixedCaseModel.GGUF": len("model"),
+    }
+
+
+def test_download_status_prefers_host_agent_normalized_status(test_client, monkeypatch, tmp_path):
+    models_router, _install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    status_path = data_dir / "model-download-status.json"
+    status_path.write_text(
+        json.dumps({
+            "status": "downloading",
+            "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "bytesDownloaded": 0,
+            "bytesTotal": 2491874272,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        models_router,
+        "_get_agent_model_status",
+        lambda: {
+            "status": "failed",
+            "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "updatedAt": "2999-01-01T00:00:00+00:00",
+            "error": "Model download is not running; previous download was interrupted.",
+        },
+    )
+
+    resp = test_client.get("/api/models/download-status", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "failed"
+    assert "not running" in resp.json()["error"]
+
+
+def test_download_status_surfaces_stale_bootstrap_upgrade(test_client, monkeypatch, tmp_path):
+    models_router, _install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda: None)
+    monkeypatch.setattr(models_router, "_STALE_ACTIVE_BOOTSTRAP_STATUS_SECONDS", 60)
+    (data_dir / "bootstrap-status.json").write_text(
+        json.dumps({
+            "status": "downloading",
+            "model": "Qwen3.5-9B-Q4_K_M.gguf",
+            "percent": 3.0,
+            "bytesDownloaded": 143274063,
+            "bytesTotal": 0,
+            "speedBytesPerSec": 202069,
+            "updatedAt": "2000-01-01T00:00:00+00:00",
+        }),
+        encoding="utf-8",
+    )
+
+    resp = test_client.get("/api/models/download-status", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "failed"
+    assert payload["active"] is False
+    assert payload["isDownloading"] is False
+    assert payload["bootstrapStale"] is True
+    assert payload["model"] == "Qwen3.5-9B-Q4_K_M.gguf"
+    assert payload["bytesDownloaded"] == 143274063
+    assert "appears stalled" in payload["error"]
+
+
+def test_download_status_ignores_stale_terminal_agent_status(test_client, monkeypatch, tmp_path):
+    models_router, _install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        models_router,
+        "_get_agent_model_status",
+        lambda: {
+            "status": "failed",
+            "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "updatedAt": "2000-01-01T00:00:00+00:00",
+            "error": "Retry 1/3: curl exited with code -15",
+        },
+    )
+
+    resp = test_client.get("/api/models/download-status", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "idle"
+    assert payload["active"] is False
+    assert payload["isDownloading"] is False
+    assert payload["lastTerminalStatus"]["status"] == "failed"
+    assert "curl exited" in payload["lastTerminalStatus"]["error"]
+
+
+def test_download_status_treats_cancelled_agent_status_as_idle(test_client, monkeypatch, tmp_path):
+    models_router, _install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        models_router,
+        "_get_agent_model_status",
+        lambda: {
+            "status": "cancelled",
+            "model": "Qwen3-30B-A3B-Q4_K_M.gguf",
+            "updatedAt": "2999-01-01T00:00:00+00:00",
+            "error": "Download cancelled by user",
+        },
+    )
+
+    resp = test_client.get("/api/models/download-status", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "idle"
+    assert payload["active"] is False
+    assert payload["isDownloading"] is False
+    assert payload["lastTerminalStatus"]["status"] == "cancelled"
+    assert payload["lastTerminalStatus"]["model"] == "Qwen3-30B-A3B-Q4_K_M.gguf"
+
+
+def test_download_status_ignores_stale_terminal_status_file(test_client, monkeypatch, tmp_path):
+    models_router, _install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda: None)
+    status_path = data_dir / "model-download-status.json"
+    status_path.write_text(
+        json.dumps({
+            "status": "failed",
+            "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
+            "updatedAt": "2000-01-01T00:00:00+00:00",
+            "error": "previous download is incomplete or corrupt",
+        }),
+        encoding="utf-8",
+    )
+
+    resp = test_client.get("/api/models/download-status", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "idle"
+    assert payload["lastTerminalStatus"]["model"] == "Phi-4-mini-instruct-Q4_K_M.gguf"
+
+
+def test_download_status_treats_cancelled_status_file_as_idle(test_client, monkeypatch, tmp_path):
+    models_router, _install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda: None)
+    status_path = data_dir / "model-download-status.json"
+    status_path.write_text(
+        json.dumps({
+            "status": "canceled",
+            "model": "Qwen3-30B-A3B-Q4_K_M.gguf",
+            "updatedAt": "2999-01-01T00:00:00+00:00",
+            "error": "Download canceled by user",
+        }),
+        encoding="utf-8",
+    )
+
+    resp = test_client.get("/api/models/download-status", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "idle"
+    assert payload["active"] is False
+    assert payload["isDownloading"] is False
+    assert payload["lastTerminalStatus"]["status"] == "canceled"
+    assert payload["lastTerminalStatus"]["model"] == "Qwen3-30B-A3B-Q4_K_M.gguf"
+
+
+def test_load_model_resolves_local_gguf_by_stem_with_mixed_case_extension(
+    test_client,
+    monkeypatch,
+    tmp_path,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "MixedCaseModel.GGUF").write_text("model", encoding="utf-8")
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: {"status": "activated", "path": path, "body": body, "timeout": timeout},
+    )
+
+    resp = test_client.post(
+        "/api/models/MixedCaseModel/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert models_router._find_loadable_model("MixedCaseModel")["gguf_file"] == "MixedCaseModel.GGUF"
+    assert resp.json() == {
+        "status": "activated",
+        "path": "/v1/model/activate",
+        "body": {"model_id": "MixedCaseModel"},
+        "timeout": 2700,
+    }
+
+
+def test_local_gguf_model_uses_safe_logical_id_for_spaced_filename(monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "My Custom Model.Q8_0.GGUF").write_text("model", encoding="utf-8")
+
+    model = models_router._find_loadable_model("My Custom Model.Q8_0")
+
+    assert model["gguf_file"] == "My Custom Model.Q8_0.GGUF"
+    assert model["id"] == "My-Custom-Model.Q8_0"
+    assert model["llm_model_name"] == "My-Custom-Model.Q8_0"
+
+
+def test_local_gguf_ui_id_loads_and_deletes_spaced_filename(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    gguf = data_dir / "models" / "My Custom Model.Q8_0.GGUF"
+    gguf.write_text("model", encoding="utf-8")
+    calls = []
+
+    def agent_call(path, body, timeout=30, **_kwargs):
+        calls.append((path, body, timeout))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(models_router, "_call_agent_model", agent_call)
+
+    load_response = test_client.post(
+        "/api/models/My-Custom-Model.Q8_0/load",
+        headers=test_client.auth_headers,
+    )
+    delete_response = test_client.delete(
+        "/api/models/My-Custom-Model.Q8_0",
+        headers=test_client.auth_headers,
+    )
+
+    assert load_response.status_code == 200
+    assert delete_response.status_code == 200
+    assert calls == [
+        ("/v1/model/activate", {"model_id": "My-Custom-Model.Q8_0"}, 2700),
+        ("/v1/model/delete", {"gguf_file": "My Custom Model.Q8_0.GGUF"}, 20.0),
+    ]
+
+
+def test_delete_local_gguf_rejects_path_separators(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "nested.gguf").write_text("model", encoding="utf-8")
+    monkeypatch.setattr(
+        models_router,
+        "_call_agent_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsafe delete reached host agent")),
+    )
+
+    response = test_client.delete(
+        "/api/models/..%5Cnested",
+        headers=test_client.auth_headers,
+    )
+
+    assert response.status_code == 404
+
+
+def test_load_model_rejects_local_gguf_path_separators(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, [])
+    (data_dir / "models" / "nested.gguf").write_text("model", encoding="utf-8")
+
+    resp = test_client.post(
+        "/api/models/..%5Cnested/load",
+        headers=test_client.auth_headers,
+    )
+
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Switch-time context follows the install policy (one shared function:
+# model_selection.plan_model_context, reached through performance_oracle).
+# ---------------------------------------------------------------------------
+
+def _repo_catalog_entries(*model_ids):
+    from pathlib import Path as _Path
+
+    catalog = json.loads(
+        (_Path(__file__).resolve().parents[4] / "config" / "model-library.json").read_text(encoding="utf-8")
+    )
+    by_id = {entry["id"]: entry for entry in catalog["models"]}
+    return [by_id[model_id] for model_id in model_ids]
+
+
+def _rtx_5090():
+    return GPUInfo(
+        name="NVIDIA GeForce RTX 5090",
+        memory_used_mb=1024,
+        memory_total_mb=32607,
+        memory_percent=3.0,
+        utilization_percent=0,
+        temperature_c=40,
+        gpu_backend="nvidia",
+    )
+
+
+def _tower_env(install_dir, *, llm_model, gguf, ctx):
+    (install_dir / ".env").write_text(
+        "ODS_MODE=local\n"
+        f"LLM_MODEL={llm_model}\n"
+        f"GGUF_FILE={gguf}\n"
+        f"CTX_SIZE={ctx}\n"
+        f"MAX_CONTEXT={ctx}\n"
+        "SYSTEM_RAM_GB=61\n"
+        # Installs before the floor was part of selection recorded the
+        # pre-raise context here (tower1/tower3, build 67cb2ac0).
+        "MODEL_RECOMMENDED_MODEL=qwen3.5-27b\n"
+        "MODEL_RECOMMENDED_GGUF=Qwen3.5-27B-Q4_K_M.gguf\n"
+        "MODEL_RECOMMENDED_CONTEXT=32768\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(("target", "loaded_llm", "loaded_gguf"), [
+    # tower3: restoring the installer's pick replayed MODEL_RECOMMENDED_CONTEXT.
+    ("qwen3.5-27b-q4", "qwen3.6-27b", "Qwen3.6-27B-UD-Q4_K_XL.gguf"),
+    # tower1: a switch to the candidate served 32768 and Hermes returned 502.
+    ("qwen3.6-27b-ud-q4-k-xl", "qwen3.5-27b", "Qwen3.5-27B-Q4_K_M.gguf"),
+])
+def test_switch_on_rtx_5090_serves_the_hermes_floor(
+    test_client, monkeypatch, tmp_path, target, loaded_llm, loaded_gguf,
+):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    entries = _repo_catalog_entries("qwen3.5-27b-q4", "qwen3.6-27b-ud-q4-k-xl")
+    _write_model_library(install_dir, entries)
+    for entry in entries:
+        (data_dir / "models" / entry["gguf_file"]).write_text("model", encoding="utf-8")
+    _tower_env(install_dir, llm_model=loaded_llm, gguf=loaded_gguf, ctx=32768)
+    monkeypatch.setattr(models_router, "get_gpu_info", _rtx_5090)
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: loaded_gguf)
+    calls = []
+    monkeypatch.setattr(
+        models_router, "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: calls.append(body) or {"status": "activated"},
+    )
+
+    resp = test_client.post(f"/api/models/{target}/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert calls == [{"model_id": target, "context_length": 65536}]
+
+
+def test_switch_context_matches_the_listed_context(test_client, monkeypatch, tmp_path):
+    """The context the model list shows is the context a switch serves."""
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    entries = _repo_catalog_entries("qwen3.5-27b-q4", "qwen3.6-27b-ud-q4-k-xl", "qwen3.6-35b-a3b-ud-q4")
+    _write_model_library(install_dir, entries)
+    for entry in entries:
+        (data_dir / "models" / entry["gguf_file"]).write_text("model", encoding="utf-8")
+    _tower_env(install_dir, llm_model="qwen3.5-27b", gguf="Qwen3.5-27B-Q4_K_M.gguf", ctx=32768)
+    monkeypatch.setattr(models_router, "get_gpu_info", _rtx_5090)
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 0}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: None)
+    listed = {
+        entry["id"]: entry["contextLength"]
+        for entry in test_client.get("/api/models", headers=test_client.auth_headers).json()["models"]
+    }
+    calls = []
+    monkeypatch.setattr(
+        models_router, "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: calls.append(body) or {"status": "activated"},
+    )
+    for entry in entries:
+        test_client.post(f"/api/models/{entry['id']}/load", headers=test_client.auth_headers)
+
+    served = {body["model_id"]: body["context_length"] for body in calls}
+    assert served == {entry["id"]: listed[entry["id"]] for entry in entries}
+    assert served["qwen3.5-27b-q4"] == 65536
+    assert served["qwen3.6-35b-a3b-ud-q4"] == 131072
+
+
+def test_reload_below_the_floor_repairs_the_running_model(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, _repo_catalog_entries("qwen3.5-27b-q4"))
+    (data_dir / "models" / "Qwen3.5-27B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    _tower_env(install_dir, llm_model="qwen3.5-27b", gguf="Qwen3.5-27B-Q4_K_M.gguf", ctx=32768)
+    monkeypatch.setattr(models_router, "get_gpu_info", _rtx_5090)
+    monkeypatch.setattr(models_router, "_already_active_model", lambda *_args: (True, "Qwen3.5-27B-Q4_K_M.gguf"))
+    monkeypatch.setattr(models_router, "_verified_activation_context", lambda _loaded: 32768)
+    calls = []
+    monkeypatch.setattr(
+        models_router, "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: calls.append(body) or {"status": "activated"},
+    )
+
+    resp = test_client.post("/api/models/qwen3.5-27b-q4/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert calls == [{"model_id": "qwen3.5-27b-q4", "context_length": 65536}]
+
+
+def test_reload_at_the_floor_stays_idempotent(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, _repo_catalog_entries("qwen3.5-27b-q4"))
+    (data_dir / "models" / "Qwen3.5-27B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    _tower_env(install_dir, llm_model="qwen3.5-27b", gguf="Qwen3.5-27B-Q4_K_M.gguf", ctx=65536)
+    monkeypatch.setattr(models_router, "get_gpu_info", _rtx_5090)
+    monkeypatch.setattr(models_router, "_already_active_model", lambda *_args: (True, "Qwen3.5-27B-Q4_K_M.gguf"))
+    monkeypatch.setattr(models_router, "_verified_activation_context", lambda _loaded: 65536)
+
+    def fail_agent_call(*_args, **_kwargs):
+        raise AssertionError("an already-active model at the floor must not restart")
+
+    monkeypatch.setattr(models_router, "_call_agent_model", fail_agent_call)
+
+    resp = test_client.post("/api/models/qwen3.5-27b-q4/load", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "already_active"
+
+
+def _running_tower_model(monkeypatch, tmp_path, *, ctx=65536):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, _repo_catalog_entries("qwen3.5-27b-q4"))
+    (data_dir / "models" / "Qwen3.5-27B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    _tower_env(install_dir, llm_model="qwen3.5-27b", gguf="Qwen3.5-27B-Q4_K_M.gguf", ctx=ctx)
+    monkeypatch.setattr(models_router, "get_gpu_info", _rtx_5090)
+    monkeypatch.setattr(models_router, "_already_active_model", lambda *_args: (True, "Qwen3.5-27B-Q4_K_M.gguf"))
+    monkeypatch.setattr(models_router, "_verified_activation_context", lambda _loaded: ctx)
+    return models_router
+
+
+def test_a_fixed_template_restarts_the_running_model_at_its_context(test_client, monkeypatch, tmp_path):
+    """WP5 manual action: always a real switch (never "already active"), the context kept."""
+    models_router = _running_tower_model(monkeypatch, tmp_path, ctx=49152)
+    calls = []
+
+    def _call_agent(path, body, timeout=30, **_kwargs):
+        calls.append((path, body))
+        return {"status": "activated"}
+
+    monkeypatch.setattr(models_router, "_call_agent_model", _call_agent)
+
+    resp = test_client.post("/api/models/qwen3.5-27b-q4/chat-template", headers=test_client.auth_headers,
+                            json={"override": "qwen-tools-fix"})
+
+    assert resp.status_code == 200
+    assert calls == [("/v1/model/activate", {
+        "model_id": "qwen3.5-27b-q4", "context_length": 49152, "chat_template_override": "qwen-tools-fix",
+    })]
+
+
+@pytest.mark.parametrize("body", [None, {}, {"override": 7}, {"override": "Qwen Fix"}, {"override": "../x"},
+                                  {"override": "qwen-tools-fix", "context_length": 65536}])
+def test_a_fixed_template_request_names_exactly_one_template(test_client, monkeypatch, tmp_path, body):
+    models_router = _running_tower_model(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "_call_agent_model", lambda *_a, **_k: pytest.fail("not dispatched"))
+
+    resp = test_client.post("/api/models/qwen3.5-27b-q4/chat-template", headers=test_client.auth_headers,
+                            json=body)
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("windows", ["hosted", "legacy"])
+def test_windows_runtimes_refuse_a_fixed_template_in_words(test_client, monkeypatch, tmp_path, windows):
+    models_router = _running_tower_model(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "_windows_hosted_runtime", lambda: windows == "hosted")
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda keys: {
+        "AMD_INFERENCE_RUNTIME_MODE": "windows-native-llama-server" if windows == "legacy" else "linux-container"})
+    monkeypatch.setattr(models_router, "_call_agent_model", lambda *_a, **_k: pytest.fail("not dispatched"))
+
+    resp = test_client.post("/api/models/qwen3.5-27b-q4/chat-template", headers=test_client.auth_headers,
+                            json={"override": "qwen-tools-fix"})
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "chat_template_override_unsupported"
+    assert "cannot use a fixed chat template" in detail["message"]
+
+
+def test_the_agents_refusal_of_a_fixed_template_reaches_the_page(test_client, monkeypatch, tmp_path):
+    from host_agent_client import AgentHTTPError
+
+    models_router = _running_tower_model(monkeypatch, tmp_path)
+    refusal = {"error": "This fixed chat template is not for this model.", "code": "chat_template_override_not_matched"}
+
+    def agent(method, path, *, payload=None, timeout):
+        raise AgentHTTPError(409, "conflict", response_text=json.dumps(refusal))
+
+    monkeypatch.setattr(models_router, "request_agent_json", agent)
+
+    resp = test_client.post("/api/models/qwen3.5-27b-q4/chat-template", headers=test_client.auth_headers,
+                            json={"override": "qwen-tools-fix"})
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == refusal
+
+
+def test_a_plain_run_never_asks_for_a_fixed_template(test_client, monkeypatch, tmp_path):
+    models_router = _running_tower_model(monkeypatch, tmp_path, ctx=32768)
+    monkeypatch.setattr(models_router, "_already_active_model", lambda *_args: (False, None))
+    calls = []
+
+    def _call_agent(path, body, timeout=30, **_kwargs):
+        calls.append(body)
+        return {"status": "activated"}
+
+    monkeypatch.setattr(models_router, "_call_agent_model", _call_agent)
+
+    test_client.post("/api/models/qwen3.5-27b-q4/load", headers=test_client.auth_headers)
+
+    assert calls and "chat_template_override" not in calls[0]
+
+
+def test_explicit_context_is_never_replanned(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install_dir, _repo_catalog_entries("qwen3.5-27b-q4"))
+    (data_dir / "models" / "Qwen3.5-27B-Q4_K_M.gguf").write_text("model", encoding="utf-8")
+    _tower_env(install_dir, llm_model="qwen3.5-9b", gguf="Qwen3.5-9B-Q4_K_M.gguf", ctx=65536)
+    monkeypatch.setattr(models_router, "get_gpu_info", _rtx_5090)
+    monkeypatch.setattr(models_router, "_fetch_loaded_model_sync", lambda: "Qwen3.5-9B-Q4_K_M.gguf")
+    calls = []
+    monkeypatch.setattr(
+        models_router, "_call_agent_model",
+        lambda path, body, timeout=30, **_kwargs: calls.append(body) or {"status": "activated"},
+    )
+
+    test_client.post(
+        "/api/models/qwen3.5-27b-q4/load",
+        headers=test_client.auth_headers,
+        json={"context_length": 32768},
+    )
+
+    assert calls == [{"model_id": "qwen3.5-27b-q4", "context_length": 32768}]
+
+
+def test_listed_talk_verdict_reflects_the_served_context(test_client, monkeypatch, tmp_path):
+    models_router, install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    entries = _repo_catalog_entries("qwen3.5-27b-q4", "qwen3.6-27b-ud-q4-k-xl")
+    _write_model_library(install_dir, entries)
+    for entry in entries:
+        (data_dir / "models" / entry["gguf_file"]).write_text("model", encoding="utf-8")
+    _tower_env(install_dir, llm_model="qwen3.5-27b", gguf="Qwen3.5-27B-Q4_K_M.gguf", ctx=32768)
+    monkeypatch.setattr(models_router, "get_gpu_info", _rtx_5090)
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value="Qwen3.5-27B-Q4_K_M.gguf"))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={"tokens_per_second": 0}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=32768))
+
+    models = {
+        entry["id"]: entry
+        for entry in test_client.get("/api/models", headers=test_client.auth_headers).json()["models"]
+    }
+
+    running = models["qwen3.5-27b-q4"]
+    assert running["status"] == "loaded"
+    assert running["contextLength"] == 32768
+    talk = running["appCompatibility"]["hermesTalk"]
+    assert talk["status"] == "unsupported"
+    assert talk["code"] == "context_below_hermes_minimum"
+    assert "64K" in talk["userMessage"] and "32K" in talk["userMessage"]
+    # A model planned at the floor on this card is not blocked by context.
+    candidate = models["qwen3.6-27b-ud-q4-k-xl"]
+    assert candidate["contextLength"] == 65536
+    assert candidate["appCompatibility"]["hermesTalk"].get("code") != "context_below_hermes_minimum"
+
+
+def test_api_models_names_the_external_api_model_and_host(test_client, monkeypatch, tmp_path):
+    # Fleet, Tower3: in API mode the Models page could not say what serves
+    # chat. The response names the model and the API's host, never the key.
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "request_agent_json", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "external")
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda _keys: {"LLM_BACKEND": "external"})
+    env = {"EXTERNAL_LLM_MODEL": "deepseek-v4.1-flash", "EXTERNAL_LLM_URL": "https://api.example.test/v1"}
+    monkeypatch.setattr(models_router, "read_env_value", lambda key, *_args, **_kwargs: env.get(key, ""))
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4", "name": "Qwen 3.5 9B", "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5600, "vram_required_gb": 8, "context_length": 65536, "quantization": "Q4_K_M",
+        "specialty": "General", "description": "Local catalog entry.", "llm_model_name": "qwen3.5-9b",
+    }])
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+
+    payload = test_client.get("/api/models", headers=test_client.auth_headers).json()
+
+    assert payload["externalModel"] == "deepseek-v4.1-flash"
+    assert payload["externalHost"] == "api.example.test"
+
+
+@pytest.mark.parametrize(("url", "host"), [
+    ("https://api.example.test/v1", "api.example.test"),
+    ("http://10.0.0.5:8080", "10.0.0.5:8080"),
+    ("https://user:secret@api.example.test", "api.example.test"),
+    ("ftp://api.example.test", None),
+    ("", None),
+    ("not a url", None),
+])
+def test_external_api_host_keeps_only_host_and_port(url, host):
+    from routers import models as models_router
+    assert models_router._external_api_host(url) == host
+
+
+@pytest.mark.parametrize("code,cleanup_pending", [
+    ("model_delete_recovery_required", False),
+    ("model_delete_cleanup_pending", True),
+    ("model_delete_status_update_failed", False),
+    ("model_delete_status_update_failed", True),
+])
+def test_delete_api_preserves_recovery_detail(test_client, monkeypatch, tmp_path, code, cleanup_pending):
+    models_router, install, data = _patch_model_router_paths(monkeypatch, tmp_path)
+    _write_model_library(install, [])
+    (data / "models/inactive.gguf").write_bytes(b"inactive model")
+    message = "Recover files in model store directory .ods-model-delete-receipt"
+    payload: dict[str, object] = {
+        "error": message,
+        "code": code,
+        "recoveryDirectory": ".ods-model-delete-receipt",
+    }
+    if code in {"model_delete_cleanup_pending", "model_delete_status_update_failed"}:
+        payload["deletionCommitted"] = True
+    if cleanup_pending:
+        payload["cleanupPending"] = True
+    elif code == "model_delete_status_update_failed":
+        payload.pop("recoveryDirectory")
+
+    def failure(method, path, **_kwargs):
+        assert method == "POST" and path == "/v1/model/delete"
+        raise models_router.AgentHTTPError(500, message, json.dumps(payload))
+
+    monkeypatch.setattr(models_router, "request_agent_json", failure)
+    response = test_client.delete("/api/models/inactive", headers=test_client.auth_headers)
+    assert response.status_code == 502
+    assert response.json()["detail"] == payload
+
+
+@pytest.mark.parametrize("path,code", [
+    ("/v1/model/delete", "unrelated_failure"),
+    ("/v1/model/activate", "model_delete_cleanup_pending"),
+    ("/v1/model/activate", "model_delete_status_update_failed"),
+])
+def test_model_agent_generic_failure_mapping_stays_unchanged(monkeypatch, path, code):
+    import routers.models as models_router
+    message = "generic failure"
+    payload = {"error": message, "code": code, "deletionCommitted": True}
+
+    def failure(*_args, **_kwargs):
+        raise models_router.AgentHTTPError(500, message, json.dumps(payload))
+
+    monkeypatch.setattr(models_router, "request_agent_json", failure)
+    with pytest.raises(models_router.HTTPException) as error:
+        models_router._call_agent_model(path, {})
+    assert error.value.status_code == 502
+    assert error.value.detail == "generic failure"
+def test_huggingface_quantization_names_mxfp4_artifacts():
+    import routers.models as models_router
+
+    assert models_router._hf_quantization("gpt-oss-20b-MXFP4.gguf") == "MXFP4"
+    assert models_router._hf_quantization("Qwen3.6-35B-A3B-MXFP4_MOE.gguf") == "MXFP4_MOE"
+    assert models_router._hf_quantization("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf") == "Q4_K_M"
+    assert models_router._hf_quantization("model.gguf") is None
+
+
+def test_download_status_bootstrap_fallback_reports_speed_in_bytes(test_client, monkeypatch, tmp_path):
+    """The Models page hook reads speedBytesPerSec; the bootstrap fallback must emit it."""
+    models_router, _install_dir, data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda *a, **k: {"status": "idle"})
+    monkeypatch.setattr(
+        models_router,
+        "get_bootstrap_status",
+        lambda: BootstrapStatus(
+            active=True,
+            model_name="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            percent=40.0,
+            downloaded_gb=4.0,
+            total_gb=10.0,
+            speed_mbps=12.5,
+            eta_seconds=480,
+        ),
+    )
+
+    resp = test_client.get("/api/models/download-status", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "downloading"
+    assert body["speedBytesPerSec"] == int(12.5 * 1024**2)
+    assert body["eta"] == 480
+
+
+@pytest.mark.parametrize("transition", [
+    {}, {"modelTransactionPending": True},
+    {"lifecycleActive": True, "activeOperation": "remote_provider_apply"},
+])
+def test_api_models_exposes_remote_provider_active_runtime(test_client, monkeypatch, tmp_path, transition):
+    # The remote provider route is live; the Models page must see the actual
+    # remote model and context, not the still-loaded local Qwen engine.
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    fingerprint = "a" * 64
+    agent_status = {
+        "activeRuntime": {
+            "source": "remote-provider",
+            "model": "deepseek-v4.1-flash",
+            "contextLength": 131072,
+            "maxTokens": 8192,
+            "reasoning": True,
+            "routeFingerprint": fingerprint,
+        },
+    }
+    monkeypatch.setattr(models_router, "request_agent_json", lambda *_args, **_kwargs: agent_status)
+    agent_status.update(transition)
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda: agent_status)
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "llama-server")
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda _keys: {"LLM_BACKEND": "llama-server"})
+    _write_model_library(install_dir, [{
+        "id": "qwen3.5-9b-q4", "name": "Qwen 3.5 9B", "gguf_file": "Qwen3.5-9B-Q4_K_M.gguf",
+        "size_mb": 5600, "vram_required_gb": 8, "context_length": 65536, "quantization": "Q4_K_M",
+        "specialty": "General", "description": "Local catalog entry.", "llm_model_name": "qwen3.5-9b",
+    }])
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value="Qwen3.5-9B-Q4_K_M.gguf"))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=65536))
+
+    payload = test_client.get("/api/models", headers=test_client.auth_headers).json()
+
+    expected = {
+        "source": "remote-provider",
+        "model": "deepseek-v4.1-flash",
+        "contextLength": 131072,
+        "maxTokens": 8192,
+        "reasoning": True,
+        "routeFingerprint": fingerprint,
+    }
+    assert payload["activeRuntime"] == (None if transition else expected)
+    # The local engine may still be loaded; it is not the conversation route.
+    assert payload["loadedModel"] == "Qwen3.5-9B-Q4_K_M.gguf"
+    assert payload["llmBackend"] == "llama-server"
+
+
+def test_api_models_omits_active_runtime_when_projection_malformed(test_client, monkeypatch, tmp_path):
+    # A malformed projection must not be claimed active; diagnostics stay in
+    # agent_status but the response field is null.
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    agent_status = {
+        "activeRuntime": {
+            "source": "remote-provider",
+            "model": "deepseek-v4.1-flash",
+            "contextLength": 100,
+            "maxTokens": 8192,
+            "reasoning": True,
+        },
+    }
+    monkeypatch.setattr(models_router, "request_agent_json", lambda *_args, **_kwargs: agent_status)
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda: agent_status)
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "llama-server")
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda _keys: {"LLM_BACKEND": "llama-server"})
+    _write_model_library(install_dir, [])
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+
+    payload = test_client.get("/api/models", headers=test_client.auth_headers).json()
+
+    assert payload["activeRuntime"] is None
+
+
+def test_api_models_omits_active_runtime_when_status_fetch_fails(test_client, monkeypatch, tmp_path):
+    # A failed status fetch must not surface a stale route as active.
+    models_router, install_dir, _data_dir = _patch_model_router_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(models_router, "request_agent_json", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(models_router, "_get_agent_model_status", lambda: None)
+    monkeypatch.setattr(models_router, "LLM_BACKEND", "llama-server")
+    monkeypatch.setattr(models_router, "read_live_env_values", lambda _keys: {"LLM_BACKEND": "llama-server"})
+    _write_model_library(install_dir, [])
+    monkeypatch.setattr(models_router, "get_gpu_info", lambda: _gpu())
+    monkeypatch.setattr(models_router, "get_loaded_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(models_router, "get_llama_metrics", AsyncMock(return_value={}))
+    monkeypatch.setattr(models_router, "get_llama_context_size", AsyncMock(return_value=None))
+
+    payload = test_client.get("/api/models", headers=test_client.auth_headers).json()
+
+    assert payload["activeRuntime"] is None

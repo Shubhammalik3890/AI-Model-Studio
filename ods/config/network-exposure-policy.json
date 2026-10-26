@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "description": "Host-facing or host-networked service exposure policy. Every manifest with an external port or host network entry must be listed here.",
+  "services": {
+    "ape": {
+      "risk": "agent-policy-control-plane",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Policy/audit service for agent tool calls; keep local unless explicitly publishing an agent control surface."
+    },
+    "brave-search": {
+      "risk": "paid-api-proxy",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Bridges to a paid upstream API key; exposure risks quota/key abuse."
+    },
+    "comfyui": {
+      "risk": "gpu-workload-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Optional image-generation UI; should stay localhost/private by default."
+    },
+    "dashboard": {
+      "risk": "operator-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Primary control surface."
+    },
+    "dashboard-api": {
+      "risk": "operator-api",
+      "lan_exposure": "operator-controlled",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Host-agent and setup API surface."
+    },
+    "ods-proxy": {
+      "risk": "lan-entrypoint",
+      "lan_exposure": "explicit",
+      "auth_required": true,
+      "notes": "Optional web gateway for LAN/mDNS routing."
+    },
+    "embeddings": {
+      "risk": "model-inference-api",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Embedding model API; keep private unless a client explicitly needs it."
+    },
+    "hermes": {
+      "risk": "autonomous-agent-internal",
+      "lan_exposure": "none",
+      "auth_required": true,
+      "notes": "Must remain internal-only; users enter through hermes-proxy."
+    },
+    "hermes-proxy": {
+      "risk": "autonomous-agent-gateway",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Direct access is loopback-only. HERMES_REQUIRE_OWNER_CARD can additionally protect the local listener. The ODS LAN proxy always verifies the owner session before forwarding to this service."
+    },
+    "langfuse": {
+      "risk": "observability-data-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. May contain prompts, traces, and evaluation data."
+    },
+    "litellm": {
+      "risk": "llm-api-gateway",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Must enforce LITELLM_MASTER_KEY when used as a gateway."
+    },
+    "llama-server": {
+      "risk": "model-inference-api",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Local OpenAI-compatible inference API."
+    },
+    "model-router": {
+      "risk": "model-routing-internal-api",
+      "lan_exposure": "none",
+      "auth_required": false,
+      "notes": "Internal-only stable model route for ODS services; it must not publish a host port."
+    },
+    "pixel-inference": {
+      "risk": "scoped-model-inference-api",
+      "lan_exposure": "none",
+      "auth_required": true,
+      "notes": "Optional loopback-only inference sharing; per-device expiring revocable keys. Remote clients require an explicitly trusted tunnel or separately secured HTTPS transport. Never grants agent or administration access."
+    },
+    "pixel-model-relay": {
+      "risk": "scoped-model-inference-api",
+      "lan_exposure": "none",
+      "auth_required": true,
+      "notes": "Pixel-only authenticated inference relay bound to host loopback; never expose it on LAN or grant agent or administrative control."
+    },
+    "n8n": {
+      "risk": "workflow-automation-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Workflow automation can call local and external services."
+    },
+    "open-webui": {
+      "risk": "chat-ui",
+      "lan_exposure": "operator-controlled",
+      "auth_required": true,
+      "notes": "Primary chat UI."
+    },
+    "opencode": {
+      "risk": "code-execution-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Browser IDE/coding assistant surface."
+    },
+    "perplexica": {
+      "risk": "research-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Deep research UI backed by search and local inference."
+    },
+    "pixel-edge": {
+      "risk": "autonomous-agent-internal-gateway",
+      "lan_exposure": "none",
+      "auth_required": true,
+      "notes": "Internal-only authenticated OpenAI-compatible bridge to the host Pixel ingress Unix socket; it must not publish a host port."
+    },
+    "privacy-shield": {
+      "risk": "privacy-proxy",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. PII restoration/proxy surface; auth protects re-identification paths."
+    },
+    "qdrant": {
+      "risk": "vector-database-api",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Vector database can contain private embeddings and metadata."
+    },
+    "remote-provider-egress": {
+      "risk": "remote-llm-egress",
+      "lan_exposure": "none",
+      "auth_required": true,
+      "notes": "Internal-only boundary that injects private provider credentials and forwards remote LLM traffic."
+    },
+    "remote-provider-ssh-tunnel": {
+      "risk": "remote-llm-ssh-transport",
+      "lan_exposure": "none",
+      "auth_required": true,
+      "notes": "Internal-only SSH tunnel sidecar for remote LLM transport; binds no host ports and reads SSH custody files from private state."
+    },
+    "searxng": {
+      "risk": "search-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Metasearch service; exposure can leak query history."
+    },
+    "tailscale": {
+      "risk": "remote-network-access",
+      "lan_exposure": "host-network",
+      "auth_required": true,
+      "notes": "Remote access path; host networking is intentional and must stay explicit."
+    },
+    "token-spy": {
+      "risk": "usage-observability-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": true,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Usage/trace data can reveal prompts and model behavior."
+    },
+    "tts": {
+      "risk": "model-inference-api",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Text-to-speech model API."
+    },
+    "whisper": {
+      "risk": "audio-transcription-api",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. Speech-to-text model API; audio may be sensitive."
+    },
+    "fooocus": {
+      "risk": "image-generation-ui",
+      "lan_exposure": "loopback-only",
+      "auth_required": false,
+      "notes": "Host port remains loopback-only, independently of BIND_ADDRESS. NVIDIA-only image generation UI; default loopback binding. No application authentication is provisioned; keep local or place behind an authenticated proxy before changing exposure."
+    }
+  }
+}

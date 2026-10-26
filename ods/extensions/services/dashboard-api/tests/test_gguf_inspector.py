@@ -1,0 +1,469 @@
+"""Unit tests for the GGUF metadata parser in ``gguf_inspector``.
+
+The parser drives model fit/performance reporting in ``performance_oracle`` but
+had no direct coverage — existing suites only write placeholder ``.gguf`` files
+whose magic bytes fail the header check, so the actual metadata-parsing paths
+(scalars, strings, arrays, graceful degradation) were never exercised.
+
+These tests build synthetic-but-spec-accurate GGUF byte streams so the happy
+path and every failure mode are pinned down.
+"""
+
+import struct
+
+import pytest
+
+import gguf_inspector
+from gguf_inspector import inspect_gguf
+
+# GGUF value type ids (see gguf_inspector._GGUF_VALUE_TYPES).
+U8, I8, U16, I16, U32, I32, F32, BOOL, STR, ARR, U64, I64, F64 = range(13)
+
+_SCALAR_FMT = {
+    U8: "<B", I8: "<b", U16: "<H", I16: "<h", U32: "<I",
+    I32: "<i", F32: "<f", BOOL: "<?", U64: "<Q", I64: "<q", F64: "<d",
+}
+
+
+# ── Synthetic GGUF encoder (mirror of the parser's expected layout) ──────────
+
+def _enc_str(s: str) -> bytes:
+    b = s.encode("utf-8")
+    return struct.pack("<Q", len(b)) + b
+
+
+def _enc_value(vtype: int, value) -> bytes:
+    if vtype in _SCALAR_FMT:
+        return struct.pack(_SCALAR_FMT[vtype], value)
+    if vtype == STR:
+        return _enc_str(value)
+    if vtype == ARR:
+        item_type, items = value
+        out = struct.pack("<I", item_type) + struct.pack("<Q", len(items))
+        for item in items:
+            out += _enc_value(item_type, item)
+        return out
+    raise ValueError(f"unencodable type: {vtype}")
+
+
+def build_gguf(kvs, *, tensor_count=0, version=3, magic=b"GGUF") -> bytes:
+    """Encode ``kvs`` (list of ``(key, value_type, value)``) as a GGUF blob."""
+    out = magic + struct.pack("<I", version)
+    out += struct.pack("<Q", tensor_count) + struct.pack("<Q", len(kvs))
+    for key, vtype, value in kvs:
+        out += _enc_str(key) + struct.pack("<I", vtype) + _enc_value(vtype, value)
+    return out
+
+
+def _write(tmp_path, name, data: bytes):
+    p = tmp_path / name
+    p.write_bytes(data)
+    return p
+
+
+def _nested_array(levels: int):
+    """Build a value tuple for ``levels`` nested arrays wrapping a single u8."""
+    value = (U8, [0])
+    for _ in range(levels - 1):
+        value = (ARR, [value])
+    return value
+
+
+# ── Happy path ───────────────────────────────────────────────────────────────
+
+def test_full_metadata_is_normalized(tmp_path):
+    kvs = [
+        ("general.architecture", STR, "llama"),
+        ("general.name", STR, "Test Model 7B"),
+        ("general.file_type", U32, 15),  # Q4_K_M
+        ("llama.context_length", U32, 4096),
+        ("llama.block_count", U32, 32),
+        ("llama.embedding_length", U32, 4096),
+        ("llama.attention.head_count", U32, 32),
+        ("llama.attention.head_count_kv", U32, 8),
+        ("llama.attention.key_length", U32, 128),
+        ("llama.attention.value_length", U32, 96),
+        ("llama.rope.dimension_count", U32, 64),
+    ]
+    path = _write(tmp_path, "model.gguf", build_gguf(kvs, tensor_count=291))
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is True
+    assert result["format"] == "gguf"
+    assert result["version"] == 3
+    assert result["tensor_count"] == 291
+    assert result["metadata_count"] == len(kvs)
+    assert result["architecture"] == "llama"
+    assert result["model_name"] == "Test Model 7B"
+    assert result["file_type"] == 15
+    assert result["quantization"] == "Q4_K_M"
+    assert result["context_length"] == 4096
+    assert result["block_count"] == 32
+    assert result["embedding_length"] == 4096
+    assert result["attention_head_count"] == 32
+    assert result["attention_head_count_kv"] == 8
+    assert result["attention_key_length"] == 128
+    assert result["attention_value_length"] == 96
+    assert result["rope_dimension_count"] == 64
+    assert result["size_bytes"] == path.stat().st_size
+
+
+def test_per_layer_kv_head_counts_are_preserved(tmp_path):
+    path = _write(tmp_path, "hybrid.gguf", build_gguf([
+        ("general.architecture", STR, "qwen35"),
+        ("qwen35.attention.head_count_kv", ARR, (U32, [0, 2, 0, 2])),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["attention_head_count_kv"] == [0, 2, 0, 2]
+
+
+def test_hybrid_layout_keys_are_normalized(tmp_path):
+    path = _write(tmp_path, "qwen35.gguf", build_gguf([
+        ("general.architecture", STR, "qwen35"),
+        ("qwen35.block_count", U32, 32),
+        ("qwen35.attention.head_count_kv", U32, 4),
+        ("qwen35.attention.key_length", U32, 256),
+        ("qwen35.attention.value_length", U32, 256),
+        ("qwen35.full_attention_interval", U32, 4),
+        ("qwen35.ssm.conv_kernel", U32, 4),
+        ("qwen35.ssm.inner_size", U32, 4096),
+        ("qwen35.ssm.state_size", U32, 128),
+        ("qwen35.ssm.group_count", U32, 16),
+        ("qwen35.ssm.time_step_rank", U32, 32),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["full_attention_interval"] == 4
+    assert result["ssm_conv_kernel"] == 4
+    assert result["ssm_inner_size"] == 4096
+    assert result["ssm_state_size"] == 128
+    assert result["ssm_group_count"] == 16
+    assert result["ssm_time_step_rank"] == 32
+
+    # An imported hybrid GGUF is charged KV on its attention layers only.
+    from model_memory import estimated_context_kv_gb, kv_layer_count
+
+    assert kv_layer_count(result) == 8
+    assert estimated_context_kv_gb(result, 65536) == 2.0
+
+
+def test_large_tokenizer_header_preserves_architecture_and_mtp_metadata(tmp_path):
+    # Current vocabularies can exceed the old 8 MiB header limit. Keep the
+    # inspection bounded while reading the structural metadata after the vocab.
+    path = _write(tmp_path, "large-vocabulary.gguf", build_gguf([
+        ("general.architecture", STR, "qwen35"),
+        ("tokenizer.ggml.tokens", ARR, (STR, ["x" * (9 * 1024 * 1024)])),
+        ("qwen35.context_length", U32, 262144),
+        ("qwen35.nextn_predict_layers", U32, 1),
+    ]))
+    result = inspect_gguf(path)
+    assert result["readable"] is True
+    assert result["context_length"] == 262144
+    assert result["metadata"]["qwen35.nextn_predict_layers"] == 1
+    assert inspect_gguf(path, max_metadata_bytes=8 * 1024 * 1024)["readable"] is False
+
+
+def test_expert_count_accepts_alternate_suffix(tmp_path):
+    # Some exporters use ``.expert.count`` instead of ``.expert_count``.
+    path = _write(tmp_path, "moe.gguf", build_gguf([
+        ("general.architecture", STR, "qwen3moe"),
+        ("qwen3moe.expert.count", U32, 128),
+        ("qwen3moe.expert.used_count", U32, 8),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["expert_count"] == 128
+    assert result["expert_used_count"] == 8
+
+
+@pytest.mark.parametrize("vtype,value", [
+    (U8, 200), (I8, -5), (U16, 40000), (I16, -300),
+    (U32, 4096), (I32, -70000), (U64, 2 ** 40), (I64, -(2 ** 40)),
+])
+def test_integer_scalar_types_round_trip(tmp_path, vtype, value):
+    path = _write(tmp_path, "scalars.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("llama.context_length", vtype, value),
+    ]))
+
+    assert inspect_gguf(path)["context_length"] == value
+
+
+def test_float_and_bool_scalars_are_preserved_in_metadata(tmp_path):
+    path = _write(tmp_path, "misc.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("some.f32", F32, 1.5),
+        ("some.f64", F64, 2.25),
+        ("some.flag", BOOL, True),
+    ]))
+
+    meta = inspect_gguf(path)["metadata"]
+
+    assert meta["some.f32"] == pytest.approx(1.5)
+    assert meta["some.f64"] == pytest.approx(2.25)
+    assert meta["some.flag"] is True
+
+
+# ── Arrays ───────────────────────────────────────────────────────────────────
+
+def test_small_array_is_returned_inline(tmp_path):
+    path = _write(tmp_path, "arr.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("small.ints", ARR, (U32, [1, 2, 3])),
+    ]))
+
+    assert inspect_gguf(path)["metadata"]["small.ints"] == [1, 2, 3]
+
+
+def test_large_array_is_sampled_not_fully_materialized(tmp_path):
+    tokens = [f"tok{i}" for i in range(100)]
+    path = _write(tmp_path, "vocab.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("tokenizer.ggml.tokens", ARR, (STR, tokens)),
+    ]))
+
+    entry = inspect_gguf(path)["metadata"]["tokenizer.ggml.tokens"]
+
+    assert entry["type"] == "array"
+    assert entry["item_type"] == "string"
+    assert entry["length"] == 100
+    assert entry["sample"] == tokens[:64]
+
+
+def test_array_boundary_of_sample_limit_stays_inline(tmp_path):
+    # Exactly at the 64-element sample limit → still returned as a plain list.
+    path = _write(tmp_path, "edge.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("edge.ints", ARR, (U8, list(range(64)))),
+    ]))
+
+    assert inspect_gguf(path)["metadata"]["edge.ints"] == list(range(64))
+
+
+def test_shallow_nested_array_still_parses(tmp_path):
+    # Nesting is legal in the GGUF spec; a shallow chain must round-trip.
+    path = _write(tmp_path, "nested.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("nested.arr", ARR, _nested_array(4)),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is True
+    assert result["metadata"]["nested.arr"] == [[[[0]]]]
+
+
+def test_deeply_nested_array_degrades_without_recursion_error(tmp_path):
+    # A pathologically nested array must not crash the parser (RecursionError
+    # escaping the failure contract) — it degrades to a bounded-depth error.
+    path = _write(tmp_path, "deep.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("deep.arr", ARR, _nested_array(500)),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is False
+    assert result["architecture"] == "unknown"
+    assert "too deep" in result["error"]
+
+
+# ── file_type / quantization normalization ──────────────────────────────────
+
+@pytest.mark.parametrize(("file_type", "quantization"), [
+    # llama_ftype / LlamaFileType in llama.cpp/include/llama.h. These IDs differ
+    # from GGML tensor types: a Q8_0 file records 7, not tensor type 8.
+    (7, "Q8_0"), (8, "Q5_0"), (9, "Q5_1"),
+    (15, "Q4_K_M"), (32, "BF16"), (36, "TQ1_0"), (37, "TQ2_0"),
+    # Removed file formats must not be relabelled as unrelated live formats.
+    (6, "6"), (33, "33"), (34, "34"), (35, "35"),
+])
+def test_file_type_uses_model_file_enum_not_tensor_enum(tmp_path, file_type, quantization):
+    path = _write(tmp_path, "model.gguf", build_gguf([
+        ("general.architecture", STR, "qwen3"),
+        ("general.file_type", U32, file_type),
+    ]))
+    result = inspect_gguf(path)
+    assert result["readable"] is True
+    assert result["quantization"] == quantization
+
+
+def test_qwen_q8_metadata_reaches_model_library_badge(tmp_path):
+    from performance_oracle import build_models_payload
+
+    filename = "Qwen3-0.6B-Q8_0.gguf"
+    path = _write(tmp_path, filename, build_gguf([
+        ("general.architecture", STR, "qwen3"),
+        ("general.file_type", U32, 7),
+        ("qwen3.context_length", U32, 40960),
+    ]))
+    model = {
+        "id": "hf-qwen3-0.6b", "name": "Qwen3-0.6B-Q8_0", "gguf_file": filename,
+        "quantization": "Q8_0", "context_length": 40960, "source": "huggingface",
+    }
+    payload = build_models_payload(
+        None, None, 0, tmp_path, tmp_path / "data", catalog=[model], evidence=[],
+        downloaded_files_override={filename: path},
+    )
+    entry = next(item for item in payload["models"] if item["id"] == model["id"])
+    assert entry["status"] == "downloaded"
+    assert entry["quantization"] == "Q8_0"
+
+
+def test_unknown_file_type_falls_back_to_stringified_int(tmp_path):
+    path = _write(tmp_path, "unk.gguf", build_gguf([
+        ("general.architecture", STR, "gpt2"),
+        ("general.file_type", U32, 999),
+    ]))
+
+    assert inspect_gguf(path)["quantization"] == "999"
+
+
+def test_missing_file_type_yields_unknown_quantization(tmp_path):
+    path = _write(tmp_path, "noft.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["file_type"] is None
+    assert result["quantization"] == "unknown"
+
+
+def test_non_string_architecture_degrades_to_unknown(tmp_path):
+    # A malformed export storing architecture as an int must not leak the int.
+    path = _write(tmp_path, "weird.gguf", build_gguf([
+        ("general.architecture", U32, 7),
+    ]))
+
+    assert inspect_gguf(path)["architecture"] == "unknown"
+
+
+def test_invalid_utf8_string_is_replaced_not_raised(tmp_path):
+    blob = bytearray(build_gguf([("general.name", STR, "ok")]))
+    # Corrupt the "ok" bytes (last two) into an invalid UTF-8 sequence.
+    blob[-2:] = b"\xff\xfe"
+    path = _write(tmp_path, "badutf.gguf", bytes(blob))
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is True
+    assert result["model_name"] == "��"
+
+
+# ── Graceful degradation ─────────────────────────────────────────────────────
+
+def test_non_gguf_magic_reports_error(tmp_path):
+    path = _write(tmp_path, "bad.gguf", b"NOPE" + b"\x00" * 32)
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is False
+    assert result["error"] == "not a GGUF file"
+
+
+def test_truncated_metadata_degrades_without_raising(tmp_path):
+    full = build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("llama.context_length", U32, 4096),
+    ])
+    path = _write(tmp_path, "trunc.gguf", full[:20])
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is False
+    assert result["architecture"] == "unknown"
+    assert "error" in result
+
+
+def test_metadata_beyond_read_cap_degrades_gracefully(tmp_path):
+    path = _write(tmp_path, "big.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("blob", ARR, (U8, list(range(64)) + [0] * 4096)),
+    ]))
+
+    # Cap the read well below the array payload so the parser runs out of bytes.
+    result = inspect_gguf(path, max_metadata_bytes=64)
+
+    assert result["readable"] is False
+    assert "error" in result
+
+
+def test_missing_file_reports_not_readable(tmp_path):
+    result = inspect_gguf(tmp_path / "nope.gguf")
+
+    assert result["exists"] is False
+    assert result["readable"] is False
+    assert result["architecture"] == "unknown"
+
+
+def test_directory_path_is_not_treated_as_file(tmp_path):
+    d = tmp_path / "adir.gguf"
+    d.mkdir()
+
+    result = inspect_gguf(d)
+
+    assert result["readable"] is False
+
+
+def test_accepts_str_path_as_well_as_path_object(tmp_path):
+    path = _write(tmp_path, "strpath.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+    ]))
+
+    result = inspect_gguf(str(path))
+
+    assert result["readable"] is True
+    assert result["path"] == str(path)
+
+
+def test_boolean_metadata_value_is_ignored_for_integer_fields(tmp_path):
+    path = _write(tmp_path, "boolmeta.gguf", build_gguf([
+        ("general.architecture", STR, "llama"),
+        ("is_enabled.context_length", BOOL, True),
+    ]))
+
+    result = inspect_gguf(path)
+
+    assert result["readable"] is True
+    assert result["context_length"] is None
+
+
+def tensor_info(name: str, dims: tuple[int, ...], ggml_type: int, offset: int = 0) -> bytes:
+    """One GGUF tensor-info entry: name, dimension count, dimensions, ggml type, offset."""
+    out = _enc_str(name) + struct.pack("<I", len(dims))
+    for dim in dims:
+        out += struct.pack("<Q", dim)
+    return out + struct.pack("<I", ggml_type) + struct.pack("<Q", offset)
+
+
+def _with_tensors(*types: int) -> bytes:
+    kvs = [("general.architecture", STR, "llama"), ("general.file_type", U32, 15)]
+    table = b"".join(tensor_info(f"blk.{index}.weight", (4096, 4096), ggml_type)
+                     for index, ggml_type in enumerate(types))
+    return build_gguf(kvs, tensor_count=len(types)) + table
+
+
+def test_tensor_table_types_are_read_after_the_metadata():
+    parsed = gguf_inspector.parse_gguf_metadata(_with_tensors(12, 14, 0, 12, 42))
+    assert parsed["tensor_types"] == [0, 12, 14, 42]
+    assert parsed["tensor_count"] == 5
+
+
+def test_a_tensor_table_cut_short_leaves_the_types_unknown_but_keeps_the_metadata():
+    blob = _with_tensors(12, 14, 0)
+    parsed = gguf_inspector.parse_gguf_metadata(blob[:-10])
+    assert parsed["tensor_types"] is None
+    assert parsed["architecture"] == "llama"
+
+
+def test_a_tensor_with_absurd_dimensions_is_unreadable():
+    kvs = [("general.architecture", STR, "llama")]
+    bad = _enc_str("t") + struct.pack("<I", 99)
+    with pytest.raises(ValueError, match="dimensions"):
+        gguf_inspector.parse_gguf_metadata(build_gguf(kvs, tensor_count=1) + bad + b"\0" * 1024)

@@ -1,0 +1,37 @@
+# ODS — AMD Multi-GPU Overlay
+# Applied when GPU_COUNT > 1 and GPU_BACKEND = amd, after docker-compose.amd.yml
+# (and docker-compose.amd-rocm.yml when the ROCm image is selected).
+#
+# llama-server reads the split settings from LLAMA_ARG_* like the NVIDIA
+# multi-GPU overlay. Layer split is the default: Vulkan has no row split.
+# LLAMA_SERVER_GPU_INDICES (written by the GPU assignment) limits llama-server
+# to its assigned GPUs: GGML_VK_VISIBLE_DEVICES for the Vulkan image and
+# ROCR_VISIBLE_DEVICES for the ROCm image; each image ignores the other's
+# variable. The indices follow the DRM card order that amd-topo.sh reports,
+# which leaves out an integrated GPU next to discrete ones. NODEVICE_SELECT=1
+# turns off Mesa's device-select layer, which would move the boot VGA device
+# to Vulkan index 0; the Vulkan loader then lists discrete GPUs first, in PCI
+# order (loader_linux.c), the order amdgpu probes them and numbers DRM cards.
+# An empty GGML_VK_VISIBLE_DEVICES would hide every GPU and leave llama.cpp on
+# the CPU, so the assignment is required here.
+# Dashboard-api gets every render node for monitoring. It reads sysfs only, so
+# it does not take /dev/kfd, which Vulkan-only hosts may not have.
+
+services:
+  llama-server:
+    # devices and group_add are inherited from docker-compose.amd.yml.
+    environment:
+      LLAMA_ARG_SPLIT_MODE: "${LLAMA_ARG_SPLIT_MODE:-layer}"
+      # Ratio such as "0.5,0.5"; empty lets llama.cpp split by free memory.
+      LLAMA_ARG_TENSOR_SPLIT: "${LLAMA_ARG_TENSOR_SPLIT:-}"
+      GGML_VK_VISIBLE_DEVICES: "${LLAMA_SERVER_GPU_INDICES:?LLAMA_SERVER_GPU_INDICES must be set for the AMD multi-GPU overlay}"
+      NODEVICE_SELECT: "1"
+      ROCR_VISIBLE_DEVICES: "${LLAMA_SERVER_GPU_INDICES:?LLAMA_SERVER_GPU_INDICES must be set for the AMD multi-GPU overlay}"
+
+  dashboard-api:
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      GPU_COUNT: "${GPU_COUNT:-1}"
+      GPU_ASSIGNMENT_JSON_B64: "${GPU_ASSIGNMENT_JSON_B64:-}"
+    # volumes (sysfs mounts) inherited from docker-compose.amd.yml

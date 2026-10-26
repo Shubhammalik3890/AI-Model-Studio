@@ -1,0 +1,439 @@
+"""Tests for user extension manifest scanner."""
+
+from pathlib import Path
+
+import yaml
+import pytest
+
+from user_extensions import (
+    _reset_cache,
+    get_user_services_cached,
+    scan_user_extension_services,
+)
+
+
+def _write_manifest(ext_dir: Path, manifest: dict) -> None:
+    """Write a manifest.yaml into the given extension directory."""
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    (ext_dir / "manifest.yaml").write_text(yaml.dump(manifest))
+
+
+def _make_manifest(service_id: str, port: int = 8080, health: str = "/health",
+                   name: str | None = None, default_host: str = "badhost") -> dict:
+    """Build a minimal manifest dict."""
+    svc: dict = {"id": service_id, "port": port, "health": health,
+                 "default_host": default_host}
+    if name is not None:
+        svc["name"] = name
+    return {"schema_version": "ods.services.v1", "service": svc}
+
+
+# --- scan_user_extension_services ---
+
+
+class TestScanUserExtensions:
+
+    @pytest.mark.parametrize('url,valid', [
+        ('https://localhost:11146/nifi/', True),
+        ('https://flows.example.test/nifi', True),
+        ('http://127.0.0.1:8080/app', True),
+        ('javascript:alert(1)', False),
+        ('https://user:secret@example.test/', False),
+        ('https://example.test/?token=secret', False),
+        ('https://example.test/#secret', False),
+        ('https://example.test:99999/', False),
+        ('https://example.test:0/', False),
+        ('https://example.test/\\bad', False),
+        ('https://example.test/\nbad', False),
+    ])
+    def test_public_url_is_projected_without_changing_health_target(self, tmp_path, monkeypatch, url, valid):
+        monkeypatch.setattr('user_extensions._read_env_value', lambda key: url)
+        manifest = _make_manifest('my-ext')
+        manifest['service'].update(public_url_env='MY_EXT_PUBLIC_URL', env_vars=[{'key': 'MY_EXT_PUBLIC_URL'}])
+        ext = tmp_path / 'my-ext'
+        _write_manifest(ext, manifest)
+        (ext / 'compose.yaml').write_text('services: {}\n')
+        result = scan_user_extension_services(tmp_path)
+        if valid:
+            assert result['my-ext']['public_url'] == url.rstrip('/')
+            assert result['my-ext']['host'] == 'my-ext'
+            assert result['my-ext']['port'] == 8080
+        else:
+            assert result == {}
+
+    @pytest.mark.parametrize('key,secret', [('DASHBOARD_API_KEY', False), ('MY_EXT_PUBLIC_URL', True)])
+    def test_public_url_cannot_project_unrelated_or_secret_environment(self, tmp_path, monkeypatch, key, secret):
+        def unexpected(_):
+            pytest.fail('invalid declaration must not read environment')
+        monkeypatch.setattr('user_extensions._read_env_value', unexpected)
+        manifest = _make_manifest('my-ext')
+        manifest['service'].update(public_url_env=key, env_vars=[{'key': key, 'secret': secret}])
+        ext = tmp_path / 'my-ext'
+        _write_manifest(ext, manifest)
+        (ext / 'compose.yaml').write_text('services: {}\n')
+        assert scan_user_extension_services(tmp_path) == {}
+
+    def test_public_url_uses_declared_default_when_owner_has_not_overridden_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr('user_extensions._read_env_value', lambda key: '')
+        manifest = _make_manifest('my-ext')
+        manifest['service'].update(public_url_env='MY_EXT_PUBLIC_URL', env_vars=[{
+            'key': 'MY_EXT_PUBLIC_URL', 'default': 'https://localhost:11146/nifi/',
+        }])
+        ext = tmp_path / 'my-ext'
+        _write_manifest(ext, manifest)
+        (ext / 'compose.yaml').write_text('services: {}\n')
+        assert scan_user_extension_services(tmp_path)['my-ext']['public_url'] == 'https://localhost:11146/nifi'
+
+    @pytest.mark.parametrize('key,declared,valid', [
+        ('my-ext', True, False),
+        ('MY_EXT_API_KEY', True, True),
+        ('MY_EXT_API_KEY', False, False),
+        ('LITELLM_KEY', True, False),
+        ('MY_EXT_API_KEY\n', True, False),
+    ])
+    def test_health_auth_requires_owned_declared_secret(self, tmp_path, key, declared, valid):
+        manifest = _make_manifest('my-ext')
+        manifest['service'].update(health_auth_env=key, env_vars=[{'key': key, 'secret': declared}])
+        ext = tmp_path / 'my-ext'
+        _write_manifest(ext, manifest)
+        (ext / 'compose.yaml').write_text('services: {}\n')
+        result = scan_user_extension_services(tmp_path)
+        if valid:
+            assert result['my-ext']['health_auth_env'] == key
+        else:
+            assert result == {}
+
+    @pytest.mark.parametrize("field", ["port", "external_port_default", "health_port"])
+    @pytest.mark.parametrize("value", [-1, 65536, True, 8080.5, float("inf"), None, "broken"])
+    def test_bad_port_field_cannot_change_probe_target(self, tmp_path, field, value):
+        manifest = _make_manifest("bad-port")
+        manifest["service"][field] = value
+        ext = tmp_path / "bad-port"
+        _write_manifest(ext, manifest)
+        (ext / "compose.yaml").write_text("services: {}\n")
+        assert scan_user_extension_services(tmp_path) == {}
+
+    def test_valid_health_port_and_unpublished_external_port(self, tmp_path):
+        manifest = _make_manifest("internal")
+        manifest["service"].update(health_port="9091", external_port_default=0)
+        ext = tmp_path / "internal"
+        _write_manifest(ext, manifest)
+        (ext / "compose.yaml").write_text("services: {}\n")
+        result = scan_user_extension_services(tmp_path)["internal"]
+        assert result["port"] == 8080
+        assert result["health_port"] == 9091
+        assert result["external_port"] == 0
+
+    def test_scan_empty_dir(self, tmp_path):
+        """Empty directory returns empty dict."""
+        d = tmp_path / "user"
+        d.mkdir()
+        assert scan_user_extension_services(d) == {}
+
+    def test_scan_nonexistent_dir(self, tmp_path):
+        """Non-existent directory returns empty dict."""
+        assert scan_user_extension_services(tmp_path / "nope") == {}
+
+    def test_scan_enabled_extension(self, tmp_path):
+        """Extension with compose.yaml + manifest returns correct config."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext", port=9090,
+                                                 health="/api/health",
+                                                 name="My Extension"))
+        (ext_dir / "compose.yaml").write_text("services:\n  my-ext:\n    image: test\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert "my-ext" in result
+        cfg = result["my-ext"]
+        assert cfg["host"] == "my-ext"
+        assert cfg["port"] == 9090
+        assert cfg["health"] == "/api/health"
+        assert cfg["name"] == "My Extension"
+
+    def test_scan_disabled_extension_skipped(self, tmp_path):
+        """Extension with compose.yaml.disabled only is skipped."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml.disabled").write_text("services: {}\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert result == {}
+
+    def test_scan_missing_manifest_skipped(self, tmp_path):
+        """Extension without manifest.yaml is skipped."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        ext_dir.mkdir(parents=True)
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert result == {}
+
+    def test_scan_no_health_endpoint_included_with_empty_health(self, tmp_path):
+        """Extension without health field is included with empty health."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        ext_dir.mkdir(parents=True)
+        manifest = {"schema_version": "ods.services.v1",
+                     "service": {"id": "my-ext", "port": 8080}}
+        (ext_dir / "manifest.yaml").write_text(yaml.dump(manifest))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert "my-ext" in result
+        assert result["my-ext"]["health"] == ""
+        assert result["my-ext"]["port"] == 8080
+
+    def test_scan_health_path_validation(self, tmp_path):
+        """Reject paths with .., @, ?, #, and scheme prefixes."""
+        user_dir = tmp_path / "user"
+        bad_paths = [
+            "/health/../etc/passwd",
+            "/health@evil.com",
+            "/health?cmd=exec",
+            "/health#fragment",
+            "http://evil.com/health",
+            "https://evil.com/health",
+        ]
+        for i, bad_path in enumerate(bad_paths):
+            ext_id = f"ext-{i}"
+            ext_dir = user_dir / ext_id
+            _write_manifest(ext_dir, _make_manifest(ext_id, health=bad_path))
+            (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert result == {}, f"Expected all bad paths rejected, got: {list(result.keys())}"
+
+    def test_scan_host_is_service_id(self, tmp_path):
+        """Returned host must be the directory name, not manifest default_host."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext",
+                                                 default_host="evil.attacker.com"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert result["my-ext"]["host"] == "my-ext"
+
+    def test_scan_name_fallback(self, tmp_path):
+        """Extension without name in manifest falls back to service_id."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        # Manifest with no name field
+        manifest = {"schema_version": "ods.services.v1",
+                     "service": {"id": "my-ext", "port": 8080, "health": "/health"}}
+        (ext_dir).mkdir(parents=True)
+        (ext_dir / "manifest.yaml").write_text(yaml.dump(manifest))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert result["my-ext"]["name"] == "my-ext"
+
+    def test_scan_out_of_range_port_skipped(self, tmp_path):
+        """Manifests with ports <= 0 or > 65535 are skipped."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "bad-port"
+        _write_manifest(ext_dir, _make_manifest("bad-port", port=-1))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+        assert scan_user_extension_services(user_dir) == {}
+
+        _write_manifest(ext_dir, _make_manifest("bad-port", port=70000))
+        assert scan_user_extension_services(user_dir) == {}
+
+    def test_scan_symlink_skipped(self, tmp_path):
+        """Symlinked directories in user-extensions are skipped."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "real-ext"
+        _write_manifest(ext_dir, _make_manifest("real-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        (user_dir / "link-ext").symlink_to(ext_dir)
+
+        result = scan_user_extension_services(user_dir)
+        assert "real-ext" in result
+        assert "link-ext" not in result
+
+    def test_scan_invalid_service_id_skipped(self, tmp_path):
+        """Directories with invalid service_id format are skipped."""
+        user_dir = tmp_path / "user"
+        for bad_name in ["UPPER", "-bad", "has spaces"]:
+            ext_dir = user_dir / bad_name
+            _write_manifest(ext_dir, _make_manifest("x", health="/health"))
+            (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        result = scan_user_extension_services(user_dir)
+        assert result == {}
+
+
+# --- Caching ---
+
+
+class TestCaching:
+
+    def setup_method(self):
+        _reset_cache()
+
+    def teardown_method(self):
+        _reset_cache()
+
+    def test_cache_returns_same_result(self, tmp_path, monkeypatch):
+        """Second call within TTL on unchanged directories does not rescan."""
+        import user_extensions
+
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        scans = []
+        real_scan = user_extensions.scan_user_extension_services
+        monkeypatch.setattr(user_extensions, "scan_user_extension_services",
+                            lambda directory: scans.append(directory) or real_scan(directory))
+
+        r1 = get_user_services_cached(user_dir, ttl=60.0)
+        r2 = get_user_services_cached(user_dir, ttl=60.0)
+        assert "my-ext" in r1
+        assert r2 == r1
+        assert len(scans) == 1
+
+    def test_install_is_visible_before_ttl(self, tmp_path):
+        """A scan taken just before an install must not hide the new
+        extension from the catalog health probe for the rest of the TTL."""
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        assert get_user_services_cached(user_dir, ttl=300.0) == {}
+
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        assert "my-ext" in get_user_services_cached(user_dir, ttl=300.0)
+
+    def test_disable_enable_are_visible_before_ttl(self, tmp_path):
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        compose = ext_dir / "compose.yaml"
+        compose.write_text("services: {}\n")
+        assert "my-ext" in get_user_services_cached(user_dir, ttl=300.0)
+
+        compose.rename(ext_dir / "compose.yaml.disabled")
+        assert get_user_services_cached(user_dir, ttl=300.0) == {}
+
+        (ext_dir / "compose.yaml.disabled").rename(compose)
+        assert "my-ext" in get_user_services_cached(user_dir, ttl=300.0)
+
+    def test_removal_is_visible_before_ttl(self, tmp_path):
+        import shutil
+
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+        assert "my-ext" in get_user_services_cached(user_dir, ttl=300.0)
+
+        shutil.rmtree(ext_dir)
+        assert get_user_services_cached(user_dir, ttl=300.0) == {}
+
+    def test_manifest_replacement_is_visible_before_ttl(self, tmp_path):
+        """An update swaps in a new manifest; its health path must be used."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext", health="/health"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+        assert get_user_services_cached(user_dir, ttl=300.0)["my-ext"]["health"] == "/health"
+
+        replacement = tmp_path / "manifest.new"
+        replacement.write_text(yaml.dump(_make_manifest("my-ext", health="/api/ready")))
+        replacement.replace(ext_dir / "manifest.yaml")
+        assert get_user_services_cached(user_dir, ttl=300.0)["my-ext"]["health"] == "/api/ready"
+
+    def test_missing_directory_is_cached_until_it_appears(self, tmp_path):
+        user_dir = tmp_path / "user"
+        assert get_user_services_cached(user_dir, ttl=300.0) == {}
+
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+        assert "my-ext" in get_user_services_cached(user_dir, ttl=300.0)
+
+    def test_unrelated_entries_do_not_force_rescans(self, tmp_path, monkeypatch):
+        """Staging/backup directories and stray files are not scanned, so
+        they must not defeat the cache either."""
+        import user_extensions
+
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        scans = []
+        real_scan = user_extensions.scan_user_extension_services
+        monkeypatch.setattr(user_extensions, "scan_user_extension_services",
+                            lambda directory: scans.append(directory) or real_scan(directory))
+
+        get_user_services_cached(user_dir, ttl=300.0)
+        (user_dir / ".backups" / "my-ext").mkdir(parents=True)
+        (user_dir / "README.txt").write_text("notes\n")
+        (ext_dir / "data").mkdir()
+        get_user_services_cached(user_dir, ttl=300.0)
+        assert len(scans) == 1
+
+    def test_cache_ttl_expires(self, tmp_path, monkeypatch):
+        """After TTL, cache rescans the directory."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        r1 = get_user_services_cached(user_dir, ttl=0.0)
+        assert "my-ext" in r1
+
+        # Remove and call with ttl=0 (always expired)
+        import shutil
+        shutil.rmtree(ext_dir)
+
+        r2 = get_user_services_cached(user_dir, ttl=0.0)
+        assert r2 == {}
+
+    def test_reset_cache(self, tmp_path):
+        """_reset_cache() clears cached data."""
+        user_dir = tmp_path / "user"
+        ext_dir = user_dir / "my-ext"
+        _write_manifest(ext_dir, _make_manifest("my-ext"))
+        (ext_dir / "compose.yaml").write_text("services: {}\n")
+
+        r1 = get_user_services_cached(user_dir, ttl=300.0)
+        assert "my-ext" in r1
+
+        _reset_cache()
+
+        # Remove the extension
+        import shutil
+        shutil.rmtree(ext_dir)
+
+        r2 = get_user_services_cached(user_dir, ttl=300.0)
+        assert r2 == {}
+
+    def test_cache_keys_by_directory_path(self, tmp_path):
+        """Caching isolates entries per directory path."""
+        dir1 = tmp_path / "user1"
+        dir2 = tmp_path / "user2"
+
+        ext1 = dir1 / "ext1"
+        _write_manifest(ext1, _make_manifest("ext1"))
+        (ext1 / "compose.yaml").write_text("services: {}\n")
+
+        ext2 = dir2 / "ext2"
+        _write_manifest(ext2, _make_manifest("ext2"))
+        (ext2 / "compose.yaml").write_text("services: {}\n")
+
+        r1 = get_user_services_cached(dir1, ttl=300.0)
+        assert "ext1" in r1
+        assert "ext2" not in r1
+
+        r2 = get_user_services_cached(dir2, ttl=300.0)
+        assert "ext2" in r2
+        assert "ext1" not in r2

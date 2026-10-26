@@ -1,0 +1,66 @@
+# ODS Root Installer (Windows)
+# Recommended Portal installation: Ubuntu/WSL2 with Pixel, never a native/Hermes fallback.
+
+param(
+    [string]$Distro = "",  # empty: reuse the single existing Ubuntu, else Ubuntu-24.04
+    [switch]$DryRun,
+    [switch]$Force,
+    [switch]$NonInteractive,
+    [string]$Tier = "",
+    [switch]$Voice,
+    [switch]$Workflows,
+    [switch]$Rag,
+    [switch]$Recommended,
+    [switch]$NoRecommended,
+    [switch]$Hermes,
+    [switch]$NoHermes,
+    # Ignored: the legacy OpenClaw extension was removed. Still accepted so
+    # existing commands keep working; the Portal setup prints a notice.
+    [switch]$OpenClaw,
+    [switch]$All,
+    [switch]$Cloud,
+    [switch]$Comfyui,
+    [switch]$NoComfyui,
+    [switch]$Langfuse,
+    [switch]$NoLangfuse,
+    [switch]$NoBootstrap,
+    [switch]$Lan,
+    [string]$InstallDir = "",
+    [string]$SummaryJsonPath = "",
+    [string]$StateRoot = "",
+    # API mode: an OpenAI-compatible server (or Ollama / LM Studio) serves the
+    # model instead of a model on this computer. The key file stays on Windows;
+    # setup passes the key to Ubuntu in an environment variable, never argv.
+    [string]$ExternalLlmUrl = "",
+    [string]$ExternalLlmModel = "",
+    [string]$ExternalLlmProvider = "",
+    [string]$ExternalLlmKeyFile = "",
+    # Leave API mode: the model runs on this computer again.
+    [switch]$NoExternalLlm
+)
+
+$ErrorActionPreference = "Stop"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Delegate to Windows installer
+$ODSInstaller = Join-Path (Join-Path $ScriptDir "ods") "installers/windows-portal.ps1"
+if (-not (Test-Path $ODSInstaller)) {
+    Write-Host "Error: Windows installer not found" -ForegroundColor Red
+    Write-Host "Expected: $ODSInstaller" -ForegroundColor Red
+    exit 1
+}
+
+# Forward all bound parameters to the real installer.
+# A successful PowerShell script can leave a stale $LASTEXITCODE from a handled
+# native command, so only use $LASTEXITCODE when the delegated installer fails.
+$global:LASTEXITCODE = 0
+& $ODSInstaller @PSBoundParameters
+$installerSucceeded = $?
+$installerExit = if ($null -ne $global:LASTEXITCODE) { [int]$global:LASTEXITCODE } else { 0 }
+if ($installerExit -ne 0) {
+    exit $installerExit
+}
+if ($installerSucceeded) {
+    exit 0
+}
+exit 1

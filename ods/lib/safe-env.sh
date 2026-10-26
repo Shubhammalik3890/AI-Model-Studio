@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# ============================================================================
+# ODS — Safe environment loading (no eval)
+# ============================================================================
+# Scripts that need to load .env should use load_env_file from this script.
+# Do not use eval or "export $(grep ... .env | xargs)" — they allow injection.
+#
+# - load_env_file <path>  — parse a .env file and export vars (safe keys, no eval)
+# - load_env_from_output  — parse KEY="value" lines from stdin (for script output)
+# ============================================================================
+
+# Load a .env file safely: comments and empty lines skipped; key names must be
+# valid identifiers; values may be unquoted or quoted; no eval or word-splitting.
+# A quoted value followed by whitespace and '#': group 1 is the quoted part.
+_SAFE_ENV_DQ_COMMENT_RE='^("(\\.|[^"\\])*")[[:space:]]+#'
+_SAFE_ENV_SQ_COMMENT_RE="^('[^']*')[[:space:]]+#"
+
+load_env_file() {
+    local path="$1"
+    [[ -f "$path" ]] || return 0
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip a trailing CR so CRLF .env files (Windows editors, the Windows
+        # installer) don't leave carriage returns on every value — which would
+        # otherwise corrupt ports/paths (e.g. 8080\r) and leave the closing
+        # quote unstripped on quoted values. Matches load_env_from_output.
+        line="${line%$'\r'}"
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        # Lines without '=' are not valid KEY=VALUE pairs
+        [[ "$line" == *=* ]] || continue
+        # Split on first '=' only, preserve '=' in values (e.g. base64 padding)
+        key="${line%%=*}"
+        value="${line#*=}"
+        # Trim whitespace from key
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ -z "$key" ]] && continue
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        # Bash exposes UID as a readonly shell variable. A .env line such as
+        # UID=1000 is valid for Docker Compose, but exporting it here aborts
+        # lifecycle commands under set -e before they can reach compose.
+        [[ "$key" == "UID" ]] && continue
+        _safe_env_decode_value "$value"
+        export "$key=$_SAFE_ENV_VALUE"
+    done < "$path"
+}
+
+# Decode one raw .env value (the text after the first '=') into its literal
+# value and store it in _SAFE_ENV_VALUE. The result is returned in a variable,
+# not printed, so load_env_file does not fork a subshell for every line.
+_safe_env_decode_value() {
+    local value="${1%$'\r'}"
+    # Apply Docker Compose's value grammar before looking at quotes: these
+    # values are exported into the environment Compose interpolates, and
+    # Compose gives the environment precedence over .env. Surrounding
+    # whitespace is trimmed; an unquoted value ends at the first " #"; a
+    # quoted value may carry a comment after its closing quote.
+    # KEY=VAL#x and KEY="a # b" keep their '#'.
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$value" in
+        \"*) [[ "$value" =~ $_SAFE_ENV_DQ_COMMENT_RE ]] && value="${BASH_REMATCH[1]}" ;;
+        \'*) [[ "$value" =~ $_SAFE_ENV_SQ_COMMENT_RE ]] && value="${BASH_REMATCH[1]}" ;;
+        *)
+            # Cut at the first " #" of the already-trimmed value, then trim
+            # the exposed trailing whitespace. Compose trims leading
+            # whitespace before this cut, so "KEY=  # x" becomes "# x"
+            # (the "#" is no longer preceded by a space) and stays literal.
+            value="${value%% #*}"
+            value="${value%"${value##*[![:space:]]}"}"
+            ;;
+    esac
+    # Then strip a single matching pair of surrounding quotes. Only strip
+    # when both ends carry the SAME quote character — stripping each quote
+    # type independently corrupts values whose content legitimately begins
+    # or ends with the other quote (e.g. a double-quoted "'literal'" would
+    # otherwise lose its inner single quotes, and KEY="'" would collapse
+    # to empty).
+    if [[ "$value" == '"'*'"' ]]; then
+        value="${value#\"}"
+        value="${value%\"}"
+        value="$(_safe_env_unescape_double_quoted "$value")"
+    elif [[ "$value" == "'"*"'" ]]; then
+        value="${value#\'}"
+        value="${value%\'}"
+    fi
+    _SAFE_ENV_VALUE="$value"
+}
+
+# Print the literal value of one raw .env value, decoded exactly as
+# load_env_file decodes it. Use this when a single existing value is read and
+# written back, so quoting and inline comments survive the round trip.
+safe_env_decode_value() {
+    _safe_env_decode_value "$1"
+    printf '%s' "$_SAFE_ENV_VALUE"
+}
+
+_safe_env_unescape_double_quoted() {
+    local value="$1"
+    # Decode the small shell-compatible escape set emitted by repository
+    # helper scripts. This is parsing, not eval: no command substitution,
+    # expansion, globbing, or word splitting is performed.
+    value="${value//\\\"/\"}"
+    value="${value//\\\$/\$}"
+    value="${value//\\\`/\`}"
+    value="${value//\\\\/\\}"
+    printf '%s' "$value"
+}
+
+_safe_env_key_allowed() {
+    local key="$1"
+    shift || true
+    local allowed
+    for allowed in "$@"; do
+        [[ "$key" == "$allowed" ]] && return 0
+    done
+    return 1
+}
+
+load_env_from_output() {
+    local line key value
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=\"(.*)\"$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="$(_safe_env_unescape_double_quoted "${BASH_REMATCH[2]}")"
+            export "$key=$value"
+        fi
+    done
+}
+
+load_env_from_output_allowlist() {
+    local line key value
+    [[ "$#" -gt 0 ]] || return 0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=\"(.*)\"$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            _safe_env_key_allowed "$key" "$@" || continue
+            value="$(_safe_env_unescape_double_quoted "${BASH_REMATCH[2]}")"
+            export "$key=$value"
+        fi
+    done
+}
+
+# Model contracts from scripts/select-model.py and scripts/preserve-active-model.py.
+# Only the preserved contract of the same active model carries the last three
+# keys (its vision projector and fixed chat template; model activation owns them).
+load_model_selector_env_from_output() {
+    load_env_from_output_allowlist \
+        LLM_MODEL \
+        GGUF_FILE \
+        GGUF_URL \
+        GGUF_SHA256 \
+        MAX_CONTEXT \
+        LLM_MODEL_SIZE_MB \
+        MODEL_RECOMMENDATION_SOURCE \
+        MODEL_RECOMMENDATION_POLICY \
+        MODEL_RECOMMENDATION_CONFIDENCE \
+        MODEL_RECOMMENDATION_REASON \
+        MODEL_RECOMMENDED_ALTERNATIVES \
+        MODEL_RUNTIME_PROFILE \
+        MODEL_RUNTIME_PROFILE_LABEL \
+        MODEL_RUNTIME_PROFILE_SOURCE \
+        MODEL_SELECTION_SOURCE \
+        PIXEL_AGENT_MODEL_READY \
+        ODS_ACTIVE_MODEL_STORE \
+        LLAMA_SERVER_IMAGE \
+        LLAMA_SERVER_MEMORY_LIMIT \
+        LLAMA_CPP_RELEASE_TAG_OVERRIDE \
+        LLAMA_CPP_SERVER_BINARY \
+        LLAMA_ARG_FLASH_ATTN \
+        LLAMA_ARG_CACHE_TYPE_K \
+        LLAMA_ARG_CACHE_TYPE_V \
+        LLAMA_ARG_N_CPU_MOE \
+        LLAMA_ARG_NO_CACHE_PROMPT \
+        LLAMA_ARG_CHECKPOINT_EVERY_NT \
+        LLAMA_ARG_CTX_CHECKPOINTS \
+        LLAMA_ARG_CACHE_RAM \
+        LLAMA_ARG_SPEC_TYPE \
+        LLAMA_ARG_SPEC_DRAFT_N_MAX \
+        LLAMA_ARG_SPEC_DRAFT_TYPE_K \
+        LLAMA_ARG_SPEC_DRAFT_TYPE_V \
+        LLAMA_ARG_SPLIT_MODE \
+        LLAMA_ARG_TENSOR_SPLIT \
+        LLAMA_ARG_MMPROJ \
+        MODEL_CHAT_TEMPLATE_OVERRIDE \
+        LLAMA_ARG_CHAT_TEMPLATE_FILE
+}

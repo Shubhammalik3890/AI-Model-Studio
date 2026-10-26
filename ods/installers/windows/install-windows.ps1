@@ -1,0 +1,2107 @@
+# ============================================================================
+# ODS Windows Installer -- Main Orchestrator
+# ============================================================================
+# Standalone Windows installer. Does not modify any Linux installer files.
+#
+# NVIDIA:           Docker Desktop handles GPU passthrough via WSL2.
+#                   docker-compose.base.yml + docker-compose.nvidia.yml used unchanged.
+#
+# AMD:              ggml-org llama-server.exe (llama.cpp, Vulkan) runs
+#                   natively on Windows; WSL2 cannot drive an AMD GPU.
+#                   Everything else runs in Docker. Containers reach the host
+#                   via host.docker.internal with the LLAMA_SERVER_API_KEY.
+#
+# Architecture:
+#   This file is the orchestrator only. It sources lib/ helpers, sets phase
+#   context variables, then dot-sources each numbered phase from phases/:
+#
+#     phases/01-preflight.ps1    -- admin, PS version, Docker, disk, Ollama
+#     phases/02-detection.ps1    -- GPU, RAM, tier selection, driver check
+#     phases/03-features.ps1     -- interactive feature selection menu
+#     phases/04-requirements.ps1 -- tier RAM/disk minimums, port conflicts
+#     phases/05-docker.ps1       -- Docker daemon health, Compose detection
+#     phases/06-directories.ps1  -- dirs, robocopy, .env, SearXNG
+#     phases/07-devtools.ps1     -- OpenCode, Claude Code, Codex CLI
+#
+#   Phases 08 (LAUNCH) and 09 (VERIFY) remain inline here pending extraction.
+#
+# Usage:
+#   .\install-windows.ps1                  # Interactive install
+#   .\install-windows.ps1 --Tier 3         # Force tier 3
+#   .\install-windows.ps1 --Cloud          # Cloud-only (no local GPU)
+#   .\install-windows.ps1 --DryRun         # Validate without installing
+#   .\install-windows.ps1 --All            # Enable all optional services
+#   .\install-windows.ps1 --Hermes         # Enable Hermes Agent
+#   .\install-windows.ps1 -NoHermes        # Disable Hermes Agent
+#   .\install-windows.ps1 -NoBootstrap     # Wait for full model before launch
+#   .\install-windows.ps1 -InstallDir <path>
+#   .\install-windows.ps1 --NonInteractive # Headless install (defaults)
+#
+# ============================================================================
+
+[CmdletBinding()]
+param(
+    [switch]$DryRun,
+    [switch]$Force,
+    [switch]$NonInteractive,
+    [string]$Tier = "",
+    [switch]$Voice,
+    [switch]$Workflows,
+    [switch]$Rag,
+    [switch]$Recommended,
+    [switch]$NoRecommended,
+    [switch]$Hermes,
+    [switch]$NoHermes,
+    # Ignored: the legacy OpenClaw extension was removed. Still accepted so
+    # existing commands keep working; the installer prints a notice.
+    [switch]$OpenClaw,
+    [switch]$All,
+    [switch]$Cloud,
+    [switch]$Comfyui,
+    [switch]$NoComfyui,
+    [switch]$Lan,
+    [switch]$Langfuse,
+    [switch]$NoLangfuse,
+    [switch]$NoBootstrap,
+    [string]$InstallDir = "",
+    [string]$SummaryJsonPath = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+# ── Locate directories ────────────────────────────────────────────────────────
+$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
+# NOTE: Nested Join-Path required -- PS 5.1 only accepts 2 arguments
+$SourceRoot = (Resolve-Path (Join-Path (Join-Path $ScriptDir "..") "..")).Path
+
+if (-not [string]::IsNullOrWhiteSpace($InstallDir)) {
+    $env:ODS_HOME = [System.IO.Path]::GetFullPath($InstallDir)
+}
+
+# ── Source libraries ──────────────────────────────────────────────────────────
+$LibDir = Join-Path $ScriptDir "lib"
+. (Join-Path $LibDir "constants.ps1")
+. (Join-Path $LibDir "ui.ps1")
+. (Join-Path $LibDir "compose-diagnostics.ps1")
+. (Join-Path $LibDir "backend-contract.ps1")
+. (Join-Path $LibDir "tier-map.ps1")
+. (Join-Path $LibDir "detection.ps1")
+. (Join-Path $LibDir "env-generator.ps1")
+. (Join-Path $LibDir "installed-footprint.ps1")
+. (Join-Path $LibDir "llm-endpoint.ps1")
+. (Join-Path $LibDir "native-llama-args.ps1")
+. (Join-Path $LibDir "native-llama-runtime.ps1")
+. (Join-Path $LibDir "native-llama-legacy.ps1")
+. (Join-Path $LibDir "native-lemonade-retire.ps1")
+. (Join-Path $LibDir "opencode-config.ps1")
+. (Join-Path $LibDir "readiness-summary.ps1")
+. (Join-Path $LibDir "service-plan.ps1")
+. (Join-Path $LibDir "retained-extensions.ps1")
+
+# Preserve the caller's Docker client configuration before any installer phase
+# changes location. Docker accepts relative DOCKER_CONFIG values, whose meaning
+# must remain anchored to the directory from which the installer was launched.
+$script:ODSWindowsOriginalDockerConfigDefined = (
+    (Test-Path Env:DOCKER_CONFIG) -and
+    -not [string]::IsNullOrWhiteSpace($env:DOCKER_CONFIG)
+)
+$script:ODSWindowsOriginalDockerConfig = if ($script:ODSWindowsOriginalDockerConfigDefined) {
+    Get-ODSUserDockerConfigDir -DockerConfigOverride $env:DOCKER_CONFIG
+} else {
+    ""
+}
+
+# ── Phase context variables ───────────────────────────────────────────────────
+# These are plain (non-$script:) variables set in the orchestrator scope.
+# Because phases are dot-sourced, they run in this same scope and can both
+# read these inputs and write back their own output variables.
+$dryRun         = $DryRun.IsPresent
+$force          = $Force.IsPresent
+$nonInteractive = $NonInteractive.IsPresent
+$cloudMode      = $Cloud.IsPresent
+$tierOverride   = $Tier
+$voiceFlag      = $Voice.IsPresent
+$workflowsFlag  = $Workflows.IsPresent
+$ragFlag        = $Rag.IsPresent
+$recommendedFlag = $Recommended.IsPresent
+$noRecommendedFlag = $NoRecommended.IsPresent
+$hermesFlag     = $Hermes.IsPresent
+$noHermesFlag   = $NoHermes.IsPresent
+$allFlag        = $All.IsPresent
+$comfyuiFlag    = $Comfyui.IsPresent
+$noComfyuiFlag  = $NoComfyui.IsPresent
+$lanFlag        = $Lan.IsPresent
+$langfuseFlag   = $Langfuse.IsPresent
+$noLangfuseFlag = $NoLangfuse.IsPresent
+$noBootstrapFlag = $NoBootstrap.IsPresent
+$installDir     = $script:ODS_INSTALL_DIR
+$sourceRoot     = $SourceRoot
+
+# ── Phase dispatcher ──────────────────────────────────────────────────────────
+function Get-UsableWindowsBash {
+    <#
+    .SYNOPSIS
+        Prefer a Git Bash-style shell for bootstrap-upgrade.sh on Windows.
+    #>
+    param(
+        [string]$InstallPath = $installDir
+    )
+
+    $probeCommand = "command -v bash >/dev/null 2>&1"
+    if ($InstallPath -match "^([A-Za-z]):") {
+        $probeCommand += " && test -d /$($Matches[1].ToLower())"
+    }
+
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+
+    $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+    if ($gitCmd -and $gitCmd.Source) {
+        $gitRoot = Split-Path (Split-Path $gitCmd.Source -Parent) -Parent
+        $gitBash = Join-Path $gitRoot "bin\bash.exe"
+        if (Test-Path $gitBash) {
+            [void]$candidates.Add($gitBash)
+        }
+    }
+
+    $programFilesBash = Join-Path $env:ProgramFiles "Git\bin\bash.exe"
+    if (Test-Path $programFilesBash) {
+        [void]$candidates.Add($programFilesBash)
+    }
+
+    if (${env:ProgramFiles(x86)} -and $env:ProgramFiles -ne ${env:ProgramFiles(x86)}) {
+        $programFilesX86Bash = Join-Path ${env:ProgramFiles(x86)} "Git\bin\bash.exe"
+        if (Test-Path $programFilesX86Bash) {
+            [void]$candidates.Add($programFilesX86Bash)
+        }
+    }
+
+    $bashCmd = Get-Command bash -ErrorAction SilentlyContinue
+    if ($bashCmd -and $bashCmd.Source) {
+        [void]$candidates.Add($bashCmd.Source)
+    }
+
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if ($seen.ContainsKey($candidate)) { continue }
+        $seen[$candidate] = $true
+
+        try {
+            & $candidate -lc $probeCommand *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $candidate
+            }
+        } catch { }
+    }
+
+    return $null
+}
+
+$PhasesDir = Join-Path $ScriptDir "phases"
+
+Write-ODSBanner
+
+if ($OpenClaw.IsPresent) {
+    Write-AIWarn "The legacy OpenClaw extension was removed; -OpenClaw is ignored. Portal (Pixel) and Hermes are the supported agents."
+}
+
+# Variables produced by each phase and consumed by downstream phases:
+#
+#  Phase 01 → $preflight_docker (hashtable)
+#  Phase 02 → $gpuInfo, $systemRamGB, $selectedTier, $tierConfig, $llamaServerImage
+#  Phase 03 → $enableVoice, $enableWorkflows, $enableRag, $enableHermes
+#  Phase 04 → $requirementsMet
+#  Phase 05 → $dockerComposeCmd
+#  Phase 06 → $envResult (SearxngSecret)
+#  Phase 07 → (no output -- tools installed to $env:USERPROFILE)
+
+# Phases signal a fatal, already-explained failure by throwing the
+# ODS_INSTALL_ABORTED sentinel. `exit 1` inside a dot-sourced file does NOT
+# stop this orchestrator (PowerShell resumes at the next statement), which
+# previously let later phases run against half-initialized state.
+try {
+. (Join-Path $PhasesDir "01-preflight.ps1")
+. (Join-Path $PhasesDir "02-detection.ps1")
+. (Join-Path $PhasesDir "03-features.ps1")
+. (Join-Path $PhasesDir "04-requirements.ps1")
+. (Join-Path $PhasesDir "05-docker.ps1")
+$nativeLlamaStage = $null
+if ($gpuInfo.Backend -eq "amd" -and -not $cloudMode) {
+    # The persisted AMD_INFERENCE_PORT is kept; new installs use 8080.
+    $script:NATIVE_LLM_PORT = Resolve-WindowsLlmPreflightPort `
+        -GpuBackend "amd" `
+        -NativeDefaultPort ([int]$script:NATIVE_LLM_PORT) `
+        -InstallDir $installDir
+    if ($dryRun) {
+        Write-AI "[DRY RUN] Would stage and qualify llama.cpp (Vulkan) for $($gpuInfo.Name)"
+    } else {
+        # Stage and qualify before .env or any runtime changes: a failed
+        # download, hash, Visual C++ runtime, policy block or driver leaves
+        # this PC as it was.
+        $_existingAmdEnv = Get-WindowsODSEnvMap -InstallDir $installDir
+        try {
+            $nativeLlamaStage = Initialize-ODSNativeLlamaLegacyRuntime -SourceRoot $SourceRoot `
+                -AdapterName ([string]$gpuInfo.Name) `
+                -HasExistingRuntime ([string]$_existingAmdEnv["AMD_INFERENCE_LOCATION"] -eq "host")
+        } catch {
+            Write-AIError "llama.cpp could not be prepared: $($_.Exception.Message)"
+            Write-AI "  Nothing was changed. Fix the cause above and rerun the installer, or install with -Cloud."
+            throw "ODS_INSTALL_ABORTED"
+        }
+    }
+}
+. (Join-Path $PhasesDir "06-directories.ps1")
+. (Join-Path $PhasesDir "07-devtools.ps1")
+} catch {
+    if ($_.FullyQualifiedErrorId -eq "ODS_INSTALL_ABORTED") { Exit-ODSInstallFailure }
+    throw
+}
+
+function Set-ODSWindowsHermesRuntimeModel {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModelId
+    )
+
+    if (-not $enableHermes) { return $true }
+
+    $runtimeEnv = Get-WindowsODSEnvMap -InstallDir $installDir
+    $switchboardMode = Get-WindowsODSEnvValue `
+        -EnvMap $runtimeEnv -Keys @("ODS_MODEL_SWITCHBOARD") `
+        -Default "observe"
+    $switchboardEnabled = ($switchboardMode.Trim().ToLowerInvariant() -eq "enabled")
+    if ($switchboardEnabled) {
+        $ModelId = "ods/current"
+    }
+    $hermesBaseUrl = Get-WindowsODSEnvValue `
+        -EnvMap $runtimeEnv -Keys @("HERMES_LLM_BASE_URL") `
+        -Default $(if ($cloudMode) {
+            "http://litellm:4000/v1"
+        } elseif ($switchboardEnabled) {
+            "http://model-router:9099/v1"
+        } elseif ($gpuInfo.Backend -eq "amd") {
+            "http://litellm:4000/v1"
+        } else {
+            "http://llama-server:8080/v1"
+        })
+    $hermesApiKey = Get-WindowsODSEnvValue `
+        -EnvMap $runtimeEnv -Keys @("HERMES_LLM_API_KEY") `
+        -Default $(if ($switchboardEnabled -and -not $cloudMode) {
+            "no-key"
+        } elseif ($cloudMode -or $gpuInfo.Backend -eq "amd") {
+            Get-WindowsODSEnvValue -EnvMap $runtimeEnv -Keys @("LITELLM_KEY") -Default ""
+        } else {
+            "sk-ods-hermes-local"
+        })
+    $hermesTemplate = Join-Path (Join-Path (Join-Path $installDir "extensions") "services\hermes") "cli-config.yaml.template"
+    $hermesLive = Join-Path (Join-Path $installDir "data\hermes") "config.yaml"
+    $hermesRequestTimeout = $(if ($cloudMode -and -not $switchboardEnabled) { 180 } else { 900 })
+    $templateUpdated = Update-HermesConfigFile -Path $hermesTemplate -Model $ModelId -BaseUrl $hermesBaseUrl -ApiKey $hermesApiKey -ContextLength ([int]$tierConfig.MaxContext) `
+        -RequestTimeoutSeconds $hermesRequestTimeout `
+        -CompactToolset:($gpuInfo.Backend -eq "amd")
+    $liveUpdated = Update-HermesConfigFile `
+        -Path $hermesLive -Model $ModelId -BaseUrl $hermesBaseUrl -ApiKey $hermesApiKey `
+        -ContextLength ([int]$tierConfig.MaxContext) `
+        -RequestTimeoutSeconds $hermesRequestTimeout `
+        -CompactToolset:($gpuInfo.Backend -eq "amd")
+    return ($templateUpdated -and $liveUpdated)
+}
+
+# ============================================================================
+# PHASE 8 -- LAUNCH (download model, start Docker services)
+# ============================================================================
+Write-Phase -Phase 8 -Total 13 -Name "LAUNCH" -Estimate "2-30 minutes (model download)"
+
+if ($dryRun) {
+    if ($tierConfig.GgufUrl) {
+        Write-AI "[DRY RUN] Would download: $($tierConfig.GgufFile)"
+    }
+    if ($gpuInfo.Backend -eq "amd" -and -not $cloudMode) {
+        Write-AI "[DRY RUN] Would publish llama-server.exe to $($script:LLAMA_SERVER_DIR) and register the ODSNativeLlamaRuntime logon task"
+        Write-AI "[DRY RUN] Would start the native llama-server on 127.0.0.1:$($script:NATIVE_LLM_PORT) and prove its model"
+    }
+    Write-AI "[DRY RUN] Would run: docker compose up -d --remove-orphans --no-build --pull never"
+} else {
+    Push-Location $installDir
+    # Sync .NET CWD so in-process .NET API calls using relative paths (e.g., Test-Path
+    # internals, [IO.File] methods) resolve against $installDir, not the launch directory.
+    # PowerShell's Push-Location does not update [Environment]::CurrentDirectory.
+    $_previousCwd = [Environment]::CurrentDirectory
+    [Environment]::CurrentDirectory = $installDir
+
+    try {
+        # ── Bootstrap fast-start ──────────────────────────────────────────────
+        $bootstrapActive = $false
+        $fullTierConfig = $null
+
+        if (Should-UseBootstrap -Tier $selectedTier -InstallDir $installDir `
+                -GgufFile $tierConfig.GgufFile -CloudMode $cloudMode `
+                -NoBootstrap $noBootstrapFlag) {
+            $bootstrapActive = $true
+            $fullTierConfig = @{}
+            foreach ($k in $tierConfig.Keys) { $fullTierConfig[$k] = $tierConfig[$k] }
+            $tierConfig.GgufFile   = $script:BOOTSTRAP_GGUF_FILE
+            $tierConfig.GgufUrl    = $script:BOOTSTRAP_GGUF_URL
+            $tierConfig.GgufSha256 = $script:BOOTSTRAP_GGUF_SHA256
+            $tierConfig.LlmModel   = $script:BOOTSTRAP_LLM_MODEL
+            $tierConfig.MaxContext  = $script:BOOTSTRAP_MAX_CONTEXT
+            Write-AI "Fast-start mode: downloading bootstrap model (~1.5GB) for instant chat."
+            Write-AI "Your full model ($($fullTierConfig.LlmModel)) will download in the background."
+        }
+
+        # ── Download GGUF model ───────────────────────────────────────────────
+        if ($tierConfig.GgufUrl -and -not $cloudMode) {
+            $modelPath    = Join-Path (Join-Path $installDir "data\models") $tierConfig.GgufFile
+            $needsDownload = -not (Test-Path $modelPath)
+
+            if ((Test-Path $modelPath) -and $tierConfig.GgufSha256) {
+                Write-AI "Verifying model integrity (SHA256)..."
+                $integrity = Test-ModelIntegrity -Path $modelPath -ExpectedHash $tierConfig.GgufSha256
+                if ($integrity.Valid) {
+                    Write-AISuccess "Model verified: $($tierConfig.GgufFile)"
+                } else {
+                    Write-AIWarn "Model file is corrupt (hash mismatch). Removing and re-downloading..."
+                    Remove-Item $modelPath -Force
+                    $needsDownload = $true
+                }
+            } elseif (Test-Path $modelPath) {
+                Write-AISuccess "Model already present: $($tierConfig.GgufFile)"
+            }
+
+            if ($needsDownload) {
+                $handoffWait = Get-ODSPositiveIntEnv -Name "ODS_BOOTSTRAP_HANDOFF_WAIT_SECONDS" -Default 7200
+                $handoff = Wait-ODSBootstrapDownloadHandoff `
+                    -InstallDir $installDir `
+                    -ModelFile $tierConfig.GgufFile `
+                    -Destination $modelPath `
+                    -WaitSeconds $handoffWait
+                if ($handoff.TimedOut) {
+                    Write-AIError "Refusing to race the active bootstrap downloader. Re-run the installer after it finishes."
+                    Exit-ODSInstallFailure
+                }
+                $needsDownload = -not (Test-Path -LiteralPath $modelPath -PathType Leaf)
+            }
+
+            if ($needsDownload) {
+                $dlOk = Invoke-DownloadWithRetry -Url $tierConfig.GgufUrl `
+                    -Destination $modelPath -Label "Downloading $($tierConfig.GgufFile)" -MaxRetries 4
+                if (-not $dlOk) {
+                    Write-AIError "Model download failed. Re-run the installer to resume."
+                    Exit-ODSInstallFailure
+                }
+                if ($tierConfig.GgufSha256) {
+                    Write-AI "Verifying download integrity (SHA256)..."
+                    $integrity = Test-ModelIntegrity -Path $modelPath -ExpectedHash $tierConfig.GgufSha256
+                    if ($integrity.Valid) {
+                        Write-AISuccess "Download verified OK"
+                    } else {
+                        Write-AIError "Downloaded file is corrupt (SHA256 mismatch)."
+                        Write-AI "  Expected: $($integrity.ExpectedHash)"
+                        Write-AI "  Got:      $($integrity.ActualHash)"
+                        Remove-Item $modelPath -Force
+                        Write-AIError "Re-run the installer to download again."
+                        Exit-ODSInstallFailure
+                    }
+                }
+            }
+        }
+
+        # ── Patch .env for bootstrap model ────────────────────────────────────
+        if ($bootstrapActive) {
+            $envPath = Join-Path $installDir ".env"
+            if (Test-Path $envPath) {
+                $envContent = Get-Content -LiteralPath $envPath -Raw -Encoding UTF8
+                # Same .NET group-substitution hazard as Update-HermesConfigFile:
+                # '$' in a replacement string is a token, not a literal.
+                $ggufReplacement = "$($tierConfig.GgufFile)".Replace('$', '$$')
+                $llmModelReplacement = "$($tierConfig.LlmModel)".Replace('$', '$$')
+                $envContent = $envContent -replace "(?m)^GGUF_FILE=.*$", "GGUF_FILE=$ggufReplacement"
+                $envContent = $envContent -replace "(?m)^LLM_MODEL=.*$", "LLM_MODEL=$llmModelReplacement"
+                $envContent = $envContent -replace "(?m)^MAX_CONTEXT=.*$", "MAX_CONTEXT=$($tierConfig.MaxContext)"
+                $envContent = $envContent -replace "(?m)^CTX_SIZE=.*$", "CTX_SIZE=$($tierConfig.MaxContext)"
+                [System.IO.File]::WriteAllText($envPath, $envContent, (New-Object System.Text.UTF8Encoding($false)))
+                Write-AISuccess "Patched .env for bootstrap model ($($tierConfig.GgufFile))"
+            }
+
+            if ($enableHermes) {
+                $hermesModel = $(if ($tierConfig.GgufFile) { $tierConfig.GgufFile } else { $tierConfig.LlmModel })
+                if (-not (Set-ODSWindowsHermesRuntimeModel -ModelId $hermesModel)) {
+                    Write-AIError "Failed to patch Hermes config for Windows runtime (model=$hermesModel)"
+                    Exit-ODSInstallFailure
+                }
+                Write-AISuccess "Patched Hermes config for bootstrap model (model=$hermesModel, context=$($tierConfig.MaxContext))"
+            }
+        }
+
+        # ── AMD: native llama-server (ggml-org llama.cpp, Vulkan) ──
+        # .env, LiteLLM and the model router were rendered for it in phase 06.
+        if ($gpuInfo.Backend -eq "amd" -and -not $cloudMode) {
+            Write-Chapter "AMD INFERENCE BACKEND"
+            try {
+                $nativeLlamaReady = Invoke-ODSNativeLlamaLegacyCutover -InstallDir $installDir -Stage $nativeLlamaStage `
+                    -Port ([int]$script:NATIVE_LLM_PORT) -PidFile $script:INFERENCE_PID_FILE
+            } catch {
+                Write-AIError "The native llama-server could not start: $($_.Exception.Message)"
+                Write-AI "  llama-server log: $(Join-Path (Get-ODSNativeRuntimeDir) 'llama-server.log')"
+                Write-AI "  Fix the cause above, then rerun the installer."
+                Exit-ODSInstallFailure
+            }
+            Write-AISuccess "Native llama-server ready on 127.0.0.1:$($script:NATIVE_LLM_PORT) (PID $($nativeLlamaReady.ProcessId)): $($nativeLlamaReady.ModelId), $($nativeLlamaReady.ContextLength) tokens of context"
+        } elseif (Remove-ODSNativeLlamaLegacyRuntime -InstallDir $installDir -PidFile $script:INFERENCE_PID_FILE -Port ([int]$script:NATIVE_LLM_PORT)) {
+            Write-AI "Stopped the native llama-server and removed its logon task; this installation does not run a local AMD model."
+        }
+
+        # ── Assemble Docker Compose flags ─────────────────────────────────────
+        # NOTE: Blackwell GPUs (sm_120) work with the standard server-cuda image
+        # via PTX JIT compilation. No special image override is needed.
+        #
+        # --env-file is explicit: Docker Compose V2 on Windows may not auto-discover
+        # .env from the project directory when multiple -f flags are used. Explicitly
+        # passing --env-file removes ambiguity in .env resolution.
+        $composeFlags = @("--env-file", ".env", "-f", "docker-compose.base.yml")
+
+        if ($cloudMode) {
+            $composeFlags += @("-f", "installers/windows/docker-compose.windows-amd.yml")
+        } elseif ($gpuInfo.Backend -eq "nvidia") {
+            if ($script:gpuPassthroughFailed) {
+                Write-AIWarn "NVIDIA GPU passthrough unavailable -- falling back to CPU-only inference."
+                Write-AI "  Inference will be slower but functional. To fix GPU passthrough:"
+                Write-AI "  1. Restart Docker Desktop and WSL: wsl --shutdown"
+                Write-AI "  2. Verify: docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi"
+                $composeFlags += @("-f", "docker-compose.cpu.yml")
+            } else {
+                $composeFlags += @("-f", "docker-compose.nvidia.yml")
+            }
+        } elseif ($gpuInfo.Backend -eq "amd") {
+            $composeFlags += @("-f", "installers/windows/docker-compose.windows-amd.yml")
+            # Local-LLM readiness sidecar: gates open-webui on the native
+            # llama-server.exe becoming healthy. Only added
+            # when a native server actually runs (AMD non-cloud); cloud mode loads
+            # the windows-amd.yml overlay too but starts no native server, so the
+            # sidecar would block open-webui forever there.
+            $composeFlags += @("-f", "installers/windows/docker-compose.windows-amd.local.yml")
+        } else {
+            # No supported GPU detected (Intel integrated, etc.) -- use CPU-only overlay
+            Write-AIWarn "No supported GPU detected. Using CPU-only inference (slower)."
+            $composeFlags += @("-f", "docker-compose.cpu.yml")
+        }
+
+        # Discover enabled extension compose fragments via manifests
+        # Mirrors resolve-compose-stack.sh: reads manifest.yaml, checks schema_version
+        # and gpu_backends before including a service's compose file.
+        $extDir        = Join-Path (Join-Path $installDir "extensions") "services"
+        $currentBackend = $(if ($cloudMode) { "none" } else { $gpuInfo.Backend })
+        $servicePlan = New-ODSWindowsServicePlan `
+            -EnableRecommended $enableRecommended `
+            -EnableVoice $enableVoice `
+            -EnableWorkflows $enableWorkflows `
+            -EnableRag $enableRag `
+            -EnableHermes $enableHermes `
+            -EnableComfyui $enableComfyui `
+            -EnableDeepResearch $enableDeepResearch `
+            -EnablePrivacyShield $enablePrivacyShield `
+            -EnableBraveSearch $enableBraveSearch `
+            -EnableODSProxy $enableODSProxy `
+            -EnableRemoteAccess $enableRemoteAccess
+        $enabledExtensionServices = @()
+        $skippedExtensionServices = @()
+
+        if (Test-Path $extDir) {
+            $extServices = Get-ChildItem -Path $extDir -Directory | Sort-Object Name
+            foreach ($svcDir in $extServices) {
+                $manifestPath = Join-Path $svcDir.FullName "manifest.yaml"
+                if (-not (Test-Path $manifestPath)) {
+                    $manifestPath = Join-Path $svcDir.FullName "manifest.yml"
+                }
+                if (-not (Test-Path $manifestPath)) { continue }
+
+                $manifestLines = Get-Content $manifestPath -ErrorAction SilentlyContinue
+                if (-not $manifestLines) { continue }
+
+                $hasSchema = $manifestLines | Where-Object { $_ -match "schema_version:\s*ods\.services\.v1" }
+                if (-not $hasSchema) { continue }
+
+                $category = ""
+                $categoryLine = $manifestLines | Where-Object { $_ -match "^\s*category:" } | Select-Object -First 1
+                if ($categoryLine) {
+                    $category = (($categoryLine -split "category:")[1]).Trim().Trim('"').Trim("'")
+                }
+
+                $backendsLine = $manifestLines | Where-Object { $_ -match "gpu_backends:" }
+                if ($backendsLine -and $currentBackend -ne "none") {
+                    $backendsStr = ($backendsLine -split "gpu_backends:")[1]
+                    if ($backendsStr -notmatch $currentBackend -and $backendsStr -notmatch "all") {
+                        continue
+                    }
+                }
+
+                $composeFile    = "compose.yaml"
+                $composeRefLine = $manifestLines | Where-Object { $_ -match "compose_file:" }
+                if ($composeRefLine) {
+                    $composeFile = (($composeRefLine -split "compose_file:")[1]).Trim().Trim('"').Trim("'")
+                }
+
+                $composePath = Join-Path $svcDir.FullName $composeFile
+                $disabledComposePath = "$composePath.disabled"
+                if (-not (Test-Path -LiteralPath $composePath) -and
+                    -not (Test-Path -LiteralPath $disabledComposePath)) { continue }
+
+                $svcName = $svcDir.Name
+                $decision = Get-ODSWindowsServicePlanDecision `
+                    -ServiceId $svcName `
+                    -Category $category `
+                    -Plan $servicePlan `
+                    -EnableRecommended $enableRecommended
+                $composeEnabled = Set-ODSWindowsExtensionComposeState `
+                    -ComposePath $composePath `
+                    -Enabled $decision.Enabled
+                if (-not $decision.Enabled) {
+                    $skippedExtensionServices += "$svcName ($($decision.DisabledReason))"
+                    continue
+                }
+                if (-not $composeEnabled) {
+                    Write-AIWarn "Skipping $svcName because its compose fragment is unavailable."
+                    continue
+                }
+
+                $relPath = $composePath.Substring($installDir.Length + 1) -replace "\\", "/"
+                $composeFlags += @("-f", $relPath)
+                $enabledExtensionServices += $svcName
+
+                if ($currentBackend -eq "nvidia" -and -not $script:gpuPassthroughFailed) {
+                    $gpuOverlay = Join-Path $svcDir.FullName "compose.nvidia.yaml"
+                    if (Test-Path $gpuOverlay) {
+                        $useGpuOverlay = $true
+                        if ($svcName -eq "whisper" -and -not (Test-ODSWindowsWhisperCudaSupported -GpuInfo $gpuInfo)) {
+                            $useGpuOverlay = $false
+                            Write-AIWarn "Whisper CUDA image requires NVIDIA driver $($script:MIN_WINDOWS_WHISPER_CUDA_DRIVER)+; detected $($gpuInfo.DriverVersion). Using CPU Whisper."
+                        }
+                        if ($useGpuOverlay) {
+                            $relOverlay = $gpuOverlay.Substring($installDir.Length + 1) -replace "\\", "/"
+                            $composeFlags += @("-f", $relOverlay)
+                        }
+                    }
+                } elseif ($currentBackend -eq "amd") {
+                    $gpuOverlay = Join-Path $svcDir.FullName "compose.amd.yaml"
+                    if (Test-Path $gpuOverlay) {
+                        $relOverlay = $gpuOverlay.Substring($installDir.Length + 1) -replace "\\", "/"
+                        $composeFlags += @("-f", $relOverlay)
+                    }
+                }
+            }
+        }
+
+        if ($enabledExtensionServices.Count -gt 0) {
+            Write-AI "Extension service plan: $($enabledExtensionServices -join ', ')"
+        } else {
+            Write-AI "Extension service plan: core services only"
+        }
+        if ($skippedExtensionServices.Count -gt 0) {
+            Write-AI "Skipped extension services: $($skippedExtensionServices.Count)"
+        }
+
+        # Preserve active dashboard-installed recipes before saving the stack or
+        # running up --remove-orphans. User recipes keep their own enabled state.
+        $retainedBackend = $(if ($currentBackend -eq "nvidia" -and $script:gpuPassthroughFailed) { "cpu" } else { $currentBackend })
+        $composeFlags = @(Add-ODSWindowsRetainedExtensions -InstallDir $installDir `
+            -ComposeFlags $composeFlags -Tier $selectedTier -GpuBackend $retainedBackend `
+            -GpuCount ([Math]::Max(1, [int]$gpuInfo.Count)) `
+            -OdsMode $(if ($cloudMode) { "cloud" } else { "local" }))
+
+        # Tier 0 memory overlay
+        if ($selectedTier -eq "0" -and (Test-Path (Join-Path $installDir "docker-compose.tier0.yml"))) {
+            $composeFlags += @("-f", "docker-compose.tier0.yml")
+            Write-AI "Applying lightweight memory limits for Tier 0"
+        }
+
+        # User override
+        if (Test-Path (Join-Path $installDir "docker-compose.override.yml")) {
+            $composeFlags += @("-f", "docker-compose.override.yml")
+        }
+
+        # Validate compose files exist before launching
+        for ($fi = 0; $fi -lt $composeFlags.Count; $fi++) {
+            if ($composeFlags[$fi] -eq "-f" -and ($fi + 1) -lt $composeFlags.Count) {
+                $cf = $composeFlags[$fi + 1]
+                $cfPath = $cf
+                if (-not [System.IO.Path]::IsPathRooted($cfPath)) {
+                    $cfPath = Join-Path $installDir $cfPath
+                }
+                if (-not (Test-Path $cfPath)) {
+                    Write-AIError "Compose file not found: $cf"
+                    Write-AI "  Expected path: $cfPath"
+                    Write-AI "  Re-run with --Force or check that $installDir is intact."
+                    Exit-ODSInstallFailure
+                }
+            }
+        }
+
+        # Save compose flags before build/up so ods.ps1 and diagnostics have
+        # the exact selected stack even after a partial install failure.
+        $flagsFile = Join-Path $installDir ".compose-flags"
+        Write-Utf8NoBom -Path $flagsFile -Content ($composeFlags -join " ")
+
+        function Assert-ODSWindowsComposeCwd {
+            param([string]$InstallDir)
+
+            $expected = (Resolve-Path -LiteralPath $InstallDir).Path
+            $locationPath = (Get-Location).ProviderPath
+            $dotnetPath = [Environment]::CurrentDirectory
+
+            if ($locationPath -ne $expected -or $dotnetPath -ne $expected) {
+                Write-AIError "Internal installer error: Docker Compose is not running from the install directory."
+                Write-AI "  Install dir: $expected"
+                Write-AI "  PowerShell location: $locationPath"
+                Write-AI "  .NET current directory: $dotnetPath"
+                Write-AI "  This prevents Compose from accidentally reading .env or compose files from the source checkout."
+                Exit-ODSInstallFailure
+            }
+        }
+
+        function Initialize-ODSWindowsDockerClientConfig {
+            param([string]$InstallDir)
+
+            $userDockerConfigDir = if ($script:ODSWindowsOriginalDockerConfigDefined -and
+                -not [string]::IsNullOrWhiteSpace($script:ODSWindowsOriginalDockerConfig)) {
+                $script:ODSWindowsOriginalDockerConfig
+            } else {
+                Get-ODSUserDockerConfigDir -DockerConfigOverride ""
+            }
+            $dockerConfigDir = Initialize-ODSComposeDockerClientConfig `
+                -InstallDir $InstallDir -UserDockerConfigDir $userDockerConfigDir
+            $env:DOCKER_CONFIG = $dockerConfigDir
+            Write-AI "Using install-scoped Docker client config: $dockerConfigDir"
+        }
+
+        function Get-ODSWindowsUserDockerClientArgs {
+            <#
+            .SYNOPSIS
+                Return the Docker client configuration that existed before ODS
+                created its installer-scoped config.
+
+            .DESCRIPTION
+                A user may intentionally set DOCKER_CONFIG for a private registry
+                or an enterprise credential helper. Keep that exact setting for
+                recovery instead of silently replacing it with an empty/default
+                profile after the installer-scoped config fails.
+            #>
+            if ($script:ODSWindowsOriginalDockerConfigDefined -and
+                -not [string]::IsNullOrWhiteSpace($script:ODSWindowsOriginalDockerConfig)) {
+                return @("--config", $script:ODSWindowsOriginalDockerConfig)
+            }
+
+            $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+            if ([string]::IsNullOrWhiteSpace($userProfile)) { return @() }
+            return @("--config", (Join-Path $userProfile ".docker"))
+        }
+
+        function Use-ODSWindowsUserDockerConfig {
+            param([string]$Reason = "Docker recovery")
+
+            if ($script:ODSWindowsDockerConfigMode -eq "user") { return }
+
+            $script:ODSWindowsDockerClientArgs = @($script:ODSWindowsUserDockerClientArgs)
+            $script:ODSWindowsDockerConfigMode = "user"
+            if ($script:ODSWindowsOriginalDockerConfigDefined) {
+                $env:DOCKER_CONFIG = $script:ODSWindowsOriginalDockerConfig
+            } else {
+                Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
+            }
+
+            $source = if ($script:ODSWindowsOriginalDockerConfigDefined -and
+                -not [string]::IsNullOrWhiteSpace($script:ODSWindowsOriginalDockerConfig)) {
+                "the user's original DOCKER_CONFIG"
+            } else {
+                "the user's default Docker config"
+            }
+            Write-AIWarn "Using $source for $Reason."
+        }
+
+        function Write-ODSWindowsComposeLaunchRecord {
+            param(
+                [string]$InstallDir,
+                [string[]]$ComposeFlags,
+                [string[]]$ComposeArgs,
+                [string[]]$DockerClientArgs
+            )
+
+            $logDir = Join-Path $InstallDir "logs"
+            if (-not (Test-Path $logDir)) {
+                New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            }
+            $recordPath = Join-Path $logDir "compose-launch.txt"
+            $dockerConfig = "default"
+            $dockerPrefix = "docker"
+            if ($DockerClientArgs.Count -ge 2 -and $DockerClientArgs[0] -eq "--config") {
+                $dockerConfig = $DockerClientArgs[1]
+                $dockerPrefix = "docker --config `"$dockerConfig`""
+            }
+            $composeCommand = ("$dockerPrefix compose " + (($ComposeFlags + $ComposeArgs) -join " ")).Trim()
+            $composeFiles = New-Object System.Collections.Generic.List[string]
+            for ($i = 0; $i -lt $ComposeFlags.Count; $i++) {
+                if ($ComposeFlags[$i] -eq "-f" -and ($i + 1) -lt $ComposeFlags.Count) {
+                    [void]$composeFiles.Add($ComposeFlags[$i + 1])
+                }
+            }
+
+            $lines = @(
+                "timestamp=$((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))",
+                "cwd=$((Get-Location).ProviderPath)",
+                "dotnet_cwd=$([Environment]::CurrentDirectory)",
+                "install_dir=$InstallDir",
+                "docker_config=$dockerConfig",
+                "compose_command=$composeCommand",
+                "compose_flags=$($ComposeFlags -join ' ')",
+                "compose_flags_file=$InstallDir\.compose-flags",
+                "compose_ps_command=cd '$InstallDir'; $dockerPrefix compose $($ComposeFlags -join ' ') ps -a",
+                "compose_logs_command=cd '$InstallDir'; $dockerPrefix compose $($ComposeFlags -join ' ') logs --tail 200",
+                "compose_files="
+            )
+            foreach ($file in $composeFiles) {
+                $lines += "  - $file"
+            }
+            [System.IO.File]::WriteAllText($recordPath, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+            Write-AI "Saved compose launch record to $recordPath"
+        }
+
+        function Assert-ODSWindowsManagedContainers {
+            param(
+                [string]$InstallDir,
+                [string[]]$ComposeFlags,
+                [string[]]$RequiredServices,
+                [switch]$RetriedWithUserDockerConfig
+            )
+
+            Push-Location $InstallDir
+            try {
+                $managedIds = @(& docker @script:ODSWindowsDockerClientArgs compose @ComposeFlags ps -q 2>$null |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                if ($managedIds.Count -eq 0) {
+                    if (-not $RetriedWithUserDockerConfig -and $script:ODSWindowsDockerConfigMode -eq "install-scoped") {
+                        Write-AIWarn "Managed-container inspection failed with the install-scoped Docker config; retrying with the user's Docker config."
+                        Use-ODSWindowsUserDockerConfig -Reason "managed-container inspection"
+                        return Assert-ODSWindowsManagedContainers -InstallDir $InstallDir -ComposeFlags $ComposeFlags `
+                            -RequiredServices $RequiredServices -RetriedWithUserDockerConfig
+                    }
+                    Write-AIError "Docker Compose did not create any managed Windows containers."
+                    Write-AI "  Native inference may be healthy, but ODS also needs the dashboard/chat container stack."
+                    Write-AI "  Inspect with: docker compose $($ComposeFlags -join ' ') ps -a"
+                    return $false
+                }
+
+                $missingServices = New-Object System.Collections.Generic.List[string]
+                foreach ($service in $RequiredServices) {
+                    $serviceIds = @(& docker @script:ODSWindowsDockerClientArgs compose @ComposeFlags ps -q $service 2>$null |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    if ($serviceIds.Count -eq 0) {
+                        [void]$missingServices.Add($service)
+                    }
+                }
+
+                if ($missingServices.Count -gt 0) {
+                    if (-not $RetriedWithUserDockerConfig -and $script:ODSWindowsDockerConfigMode -eq "install-scoped") {
+                        Write-AIWarn "Managed-container inspection failed with the install-scoped Docker config; retrying with the user's Docker config."
+                        Use-ODSWindowsUserDockerConfig -Reason "managed-container inspection"
+                        return Assert-ODSWindowsManagedContainers -InstallDir $InstallDir -ComposeFlags $ComposeFlags `
+                            -RequiredServices $RequiredServices -RetriedWithUserDockerConfig
+                    }
+                    Write-AIError "Docker Compose did not start required Windows service(s): $($missingServices -join ', ')"
+                    Write-AI "  Native inference may be healthy, but ODS is not ready without these containers."
+                    Write-AI "  Inspect with: docker compose $($ComposeFlags -join ' ') ps -a"
+                    return $false
+                }
+
+                Write-AISuccess "Compose-managed Windows stack running ($($managedIds.Count) container(s))"
+                return $true
+            }
+            finally {
+                Pop-Location
+            }
+        }
+
+        # ── Start Docker services ─────────────────────────────────────────────
+        Write-Chapter "STARTING SERVICES"
+
+        # Pre-flight: verify .env is readable from CWD before compose up
+        $_envCheck = Join-Path $installDir ".env"
+        if (-not (Test-Path $_envCheck)) {
+            Write-AIError ".env file not found at $_envCheck -- cannot start services."
+            Write-AI "  Re-run the installer to regenerate the .env file."
+            Exit-ODSInstallFailure
+        }
+
+        Initialize-ODSWindowsDockerClientConfig -InstallDir $installDir
+        $script:ODSWindowsDockerClientArgs = @("--config", $env:DOCKER_CONFIG)
+        $script:ODSWindowsUserDockerClientArgs = @(Get-ODSWindowsUserDockerClientArgs)
+        $script:ODSWindowsDockerConfigMode = "install-scoped"
+
+        function Test-ODSDockerImageAvailable {
+            param(
+                [string]$Image,
+                [string[]]$DockerClientArgs = $script:ODSWindowsDockerClientArgs
+            )
+            if ([string]::IsNullOrWhiteSpace($Image)) { return $false }
+
+            $prevEAP = $ErrorActionPreference
+            $ErrorActionPreference = "SilentlyContinue"
+            try {
+                & docker @DockerClientArgs image inspect $Image *> $null
+                if ($LASTEXITCODE -eq 0) { return $true }
+
+                & docker @DockerClientArgs manifest inspect $Image *> $null
+                return ($LASTEXITCODE -eq 0)
+            } finally {
+                $ErrorActionPreference = $prevEAP
+            }
+        }
+
+        function Test-ODSWindowsDockerCredentialHelperFailure {
+            param([string]$LogPath)
+
+            if (-not (Test-Path -LiteralPath $LogPath)) { return $false }
+
+            try {
+                $text = Get-Content -LiteralPath $LogPath -Raw -ErrorAction Stop
+            } catch {
+                try {
+                    $text = (Get-Content -LiteralPath $LogPath -Tail 200 -ErrorAction Stop) -join "`n"
+                } catch {
+                    return $false
+                }
+            }
+            $text = $text.Replace([string][char]0, "")
+
+            return (
+                $text -match "error getting credentials" -or
+                $text -match "specified logon session does not exist"
+            )
+        }
+
+        function Invoke-ODSWindowsComposeBuildService {
+            param(
+                [Parameter(Mandatory = $true)][string]$Service,
+                [AllowEmptyCollection()]
+                [Parameter(Mandatory = $true)][string[]]$DockerClientArgs,
+                [Parameter(Mandatory = $true)][string[]]$ComposeFlags,
+                [Parameter(Mandatory = $true)][string]$BuildLog,
+                [switch]$UseLegacyBuilder
+            )
+
+            $hadBuildKit = Test-Path Env:DOCKER_BUILDKIT
+            $previousBuildKit = $env:DOCKER_BUILDKIT
+            try {
+                if ($UseLegacyBuilder) {
+                    $env:DOCKER_BUILDKIT = "0"
+                }
+
+                & docker @DockerClientArgs compose @ComposeFlags build $Service *>> $BuildLog
+                return $LASTEXITCODE
+            } finally {
+                if ($UseLegacyBuilder) {
+                    if ($hadBuildKit) {
+                        $env:DOCKER_BUILDKIT = $previousBuildKit
+                    } else {
+                        Remove-Item Env:DOCKER_BUILDKIT -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+
+        function Invoke-ODSWindowsPlainDockerBuildService {
+            param(
+                [Parameter(Mandatory = $true)][string]$Service,
+                [AllowEmptyCollection()]
+                [Parameter(Mandatory = $true)][string[]]$DockerClientArgs,
+                [Parameter(Mandatory = $true)][string[]]$ComposeFlags,
+                [Parameter(Mandatory = $true)][string]$BuildLog
+            )
+
+            $configJson = & docker @DockerClientArgs compose @ComposeFlags config --format json 2>$null
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($configJson)) {
+                Add-Content -LiteralPath $BuildLog -Value "plain docker fallback could not read compose config for $Service"
+                return 1
+            }
+
+            try {
+                $composeConfig = $configJson | ConvertFrom-Json
+            } catch {
+                Add-Content -LiteralPath $BuildLog -Value "plain docker fallback could not parse compose config for ${Service}: $($_.Exception.Message)"
+                return 1
+            }
+
+            $serviceProperty = $composeConfig.services.PSObject.Properties[$Service]
+            if (-not $serviceProperty) {
+                Add-Content -LiteralPath $BuildLog -Value "plain docker fallback found no compose service named $Service"
+                return 1
+            }
+
+            $serviceConfig = $serviceProperty.Value
+            if (-not $serviceConfig.build) {
+                Add-Content -LiteralPath $BuildLog -Value "plain docker fallback found no build config for $Service"
+                return 1
+            }
+
+            $contextPath = [string]$serviceConfig.build.context
+            $dockerfileName = [string]$serviceConfig.build.dockerfile
+            if ([string]::IsNullOrWhiteSpace($dockerfileName)) {
+                $dockerfileName = "Dockerfile"
+            }
+            if ([string]::IsNullOrWhiteSpace($contextPath)) {
+                Add-Content -LiteralPath $BuildLog -Value "plain docker fallback found no build context for $Service"
+                return 1
+            }
+
+            $dockerfilePath = $dockerfileName
+            if (-not [System.IO.Path]::IsPathRooted($dockerfilePath)) {
+                $dockerfilePath = Join-Path $contextPath $dockerfileName
+            }
+
+            $imageTag = [string]$serviceConfig.image
+            if ([string]::IsNullOrWhiteSpace($imageTag)) {
+                $imageTag = "ods-${Service}:latest"
+            }
+
+            $buildArgs = @()
+            if ($serviceConfig.build.args) {
+                foreach ($arg in $serviceConfig.build.args.PSObject.Properties) {
+                    $buildArgs += @("--build-arg", "$($arg.Name)=$($arg.Value)")
+                }
+            }
+
+            $hadBuildKit = Test-Path Env:DOCKER_BUILDKIT
+            $previousBuildKit = $env:DOCKER_BUILDKIT
+
+            try {
+                $env:DOCKER_BUILDKIT = "0"
+                Add-Content -LiteralPath $BuildLog -Value "plain docker fallback building $Service as $imageTag from $contextPath"
+                & docker @DockerClientArgs build -t $imageTag -f $dockerfilePath @buildArgs $contextPath *>> $BuildLog
+                return $LASTEXITCODE
+            } finally {
+                if ($hadBuildKit) {
+                    $env:DOCKER_BUILDKIT = $previousBuildKit
+                } else {
+                    Remove-Item Env:DOCKER_BUILDKIT -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        function Resolve-ODSDockerImageOrFallback {
+            param(
+                [string]$Image,
+                [string]$Label,
+                [string]$FallbackImage = "",
+                [string]$ImageEnvName = "LLAMA_SERVER_IMAGE",
+                [string]$FallbackEnvName = "LLAMA_SERVER_IMAGE_FALLBACK"
+            )
+
+            if (Test-ODSDockerImageAvailable -Image $Image) {
+                Write-AISuccess "$Label image available: $Image"
+                return $Image
+            }
+
+            if ($script:ODSWindowsDockerConfigMode -eq "install-scoped") {
+                Write-AIWarn "$Label image validation failed with the install-scoped Docker config; retrying with the user's Docker config."
+                if (Test-ODSDockerImageAvailable -Image $Image -DockerClientArgs $script:ODSWindowsUserDockerClientArgs) {
+                    Use-ODSWindowsUserDockerConfig -Reason "$Label image validation"
+                    Write-AISuccess "$Label image available: $Image"
+                    return $Image
+                }
+            }
+
+            $fallback = $FallbackImage
+            if ([string]::IsNullOrWhiteSpace($fallback)) {
+                $fallback = [Environment]::GetEnvironmentVariable($FallbackEnvName)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($fallback)) {
+                Write-AIWarn "$Label image unavailable: $Image"
+                Write-AIWarn "Trying explicit fallback from ${FallbackEnvName}: $fallback"
+                if (Test-ODSDockerImageAvailable -Image $fallback) {
+                    Write-AISuccess "$Label fallback image available: $fallback"
+                    return $fallback
+                }
+                if ($script:ODSWindowsDockerConfigMode -eq "install-scoped" -and
+                    (Test-ODSDockerImageAvailable -Image $fallback -DockerClientArgs $script:ODSWindowsUserDockerClientArgs)) {
+                    Use-ODSWindowsUserDockerConfig -Reason "$Label fallback image validation"
+                    Write-AISuccess "$Label fallback image available: $fallback"
+                    return $fallback
+                }
+                Write-AIError "$Label fallback image is also unavailable: $fallback"
+            } else {
+                Write-AIError "$Label image is unavailable: $Image"
+            }
+
+            Write-AI "  Docker cannot resolve this image tag before service startup."
+            Write-AI "  Check the tag, registry access, and Docker Desktop network."
+            Write-AI "  To override intentionally, set $ImageEnvName to a valid image."
+            Write-AI "  To permit an explicit fallback, set $FallbackEnvName to a valid image."
+            return $null
+        }
+
+        function Get-ODSEnvValueFromFile {
+            param(
+                [Parameter(Mandatory = $true)][string]$Path,
+                [Parameter(Mandatory = $true)][string]$Key
+            )
+            if (-not (Test-Path $Path)) { return "" }
+            foreach ($line in Get-Content $Path) {
+                if ($line -match "^$([regex]::Escape($Key))=(.+)$") {
+                    return $Matches[1].Trim().Trim('"').Trim("'")
+                }
+            }
+            return ""
+        }
+
+        function Test-ODSWindowsLocalImageTag {
+            param([string]$Image)
+
+            if ([string]::IsNullOrWhiteSpace($Image)) { return $true }
+            return (
+                $Image -match '^ods-' -or
+                $Image -match '^docker\.io/library/ods-' -or
+                $Image -match '^localhost[/:]' -or
+                $Image -match '^127\.0\.0\.1:'
+            )
+        }
+
+        function Get-ODSWindowsComposeExternalImages {
+            param(
+                [AllowEmptyCollection()]
+                [Parameter(Mandatory = $true)][string[]]$DockerClientArgs,
+                [Parameter(Mandatory = $true)][string[]]$ComposeFlags
+            )
+
+            $images = New-Object System.Collections.Generic.List[string]
+            $seen = @{}
+            $configJson = & docker @DockerClientArgs compose @ComposeFlags config --format json 2>$null
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($configJson)) {
+                try {
+                    $composeConfig = ($configJson -join "`n") | ConvertFrom-Json
+                    foreach ($serviceProperty in $composeConfig.services.PSObject.Properties) {
+                        $service = $serviceProperty.Value
+                        $hasBuild = $false
+                        if ($service.PSObject.Properties["build"] -and $null -ne $service.build) {
+                            $hasBuild = $true
+                        }
+                        if ($hasBuild) { continue }
+
+                        $image = [string]$service.image
+                        if ([string]::IsNullOrWhiteSpace($image)) { continue }
+                        if (Test-ODSWindowsLocalImageTag -Image $image) { continue }
+                        if (-not $seen.ContainsKey($image)) {
+                            $seen[$image] = $true
+                            [void]$images.Add($image)
+                        }
+                    }
+                    return @($images)
+                } catch {
+                    Write-AIWarn "Could not parse Docker Compose JSON image list: $($_.Exception.Message)"
+                }
+            }
+
+            $imageLines = @(& docker @DockerClientArgs compose @ComposeFlags config --images 2>$null |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($LASTEXITCODE -ne 0) {
+                throw "docker compose config --images failed"
+            }
+
+            foreach ($image in $imageLines) {
+                $image = [string]$image
+                if (Test-ODSWindowsLocalImageTag -Image $image) { continue }
+                if (-not $seen.ContainsKey($image)) {
+                    $seen[$image] = $true
+                    [void]$images.Add($image)
+                }
+            }
+            return @($images)
+        }
+
+        function Invoke-ODSWindowsDockerPullWithRetry {
+            param(
+                [Parameter(Mandatory = $true)][string]$Image,
+                [AllowEmptyCollection()]
+                [Parameter(Mandatory = $true)][string[]]$DockerClientArgs,
+                [Parameter(Mandatory = $true)][string]$LogPath,
+                [int]$MaxAttempts = 4
+            )
+
+            $prevEAP = $ErrorActionPreference
+            $ErrorActionPreference = "SilentlyContinue"
+            try {
+                & docker @DockerClientArgs image inspect $Image *> $null
+                if ($LASTEXITCODE -eq 0) {
+                    Add-Content -LiteralPath $LogPath -Value "Compose image already cached: $Image"
+                    return $true
+                }
+            } finally {
+                $ErrorActionPreference = $prevEAP
+            }
+
+            $delays = @(5, 15, 30)
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+                Write-AI "Pulling Compose image ($attempt/$MaxAttempts): $Image"
+                $pullExitCode = 1
+                $logWriteError = $null
+                $pullEAP = $ErrorActionPreference
+                try {
+                    # Windows PowerShell 5.1 promotes redirected native stderr
+                    # to NativeCommandError when ErrorActionPreference is Stop.
+                    # Continue keeps Docker's progress stream readable; explicit
+                    # Add-Content error handling still makes log failures visible.
+                    $ErrorActionPreference = "Continue"
+                    & docker @DockerClientArgs pull $Image 2>&1 | ForEach-Object {
+                        $line = [string]$_
+                        Write-Host $line
+                        if (-not $logWriteError) {
+                            try {
+                                Add-Content -LiteralPath $LogPath -Value $line -ErrorAction Stop
+                            } catch {
+                                $logWriteError = $_
+                            }
+                        }
+                    }
+                    $pullExitCode = $LASTEXITCODE
+                } finally {
+                    $ErrorActionPreference = $pullEAP
+                }
+
+                if ($logWriteError) {
+                    Write-AIError "Could not append Docker pull progress to ${LogPath}: $($logWriteError.Exception.Message)"
+                    return $false
+                }
+                if ($pullExitCode -eq 0) {
+                    Write-AISuccess "Pulled $Image"
+                    return $true
+                }
+                if ($attempt -lt $MaxAttempts) {
+                    $delay = $delays[[Math]::Min($attempt - 1, $delays.Count - 1)]
+                    Write-AIWarn "Pull failed for $Image; retrying in ${delay}s"
+                    Start-Sleep -Seconds $delay
+                }
+            }
+
+            Write-AIError "Failed to pull Compose image after retries: $Image"
+            return $false
+        }
+
+        function Invoke-ODSWindowsComposeImagePreflight {
+            param(
+                [AllowEmptyCollection()]
+                [Parameter(Mandatory = $true)][string[]]$DockerClientArgs,
+                [Parameter(Mandatory = $true)][string[]]$ComposeFlags,
+                [Parameter(Mandatory = $true)][string]$LogPath
+            )
+
+            try {
+                $images = @(Get-ODSWindowsComposeExternalImages -DockerClientArgs $DockerClientArgs -ComposeFlags $ComposeFlags)
+            } catch {
+                Write-AIError "Could not resolve Windows Docker Compose images before service launch."
+                Write-AI "  Inspect compose config with: docker compose $($ComposeFlags -join ' ') config --images"
+                Add-Content -LiteralPath $LogPath -Value "compose image preflight failed: $($_.Exception.Message)"
+                return $false
+            }
+
+            if ($images.Count -eq 0) { return $true }
+
+            Write-AI "Verifying Compose image cache before launch..."
+            $failed = New-Object System.Collections.Generic.List[string]
+            foreach ($image in $images) {
+                if (-not (Invoke-ODSWindowsDockerPullWithRetry -Image $image -DockerClientArgs $DockerClientArgs -LogPath $LogPath)) {
+                    [void]$failed.Add($image)
+                }
+            }
+
+            if ($failed.Count -eq 0) {
+                Write-AISuccess "Compose image cache ready"
+                return $true
+            }
+
+            Write-AIError "$($failed.Count) Compose image(s) could not be pulled before launch."
+            Write-AI "Windows installer will not allow Docker Compose to pull images implicitly."
+            Write-AI "Fix Docker registry/network/disk access, then re-run .\install-windows.ps1."
+            return $false
+        }
+
+        if (-not $cloudMode -and $currentBackend -ne "amd") {
+            $envLlamaImage = ""
+            $envFallbackImage = ""
+            foreach ($line in Get-Content -LiteralPath $_envCheck -Encoding UTF8) {
+                if ($line -match '^LLAMA_SERVER_IMAGE=(.+)$') {
+                    $envLlamaImage = $Matches[1].Trim().Trim('"').Trim("'")
+                } elseif ($line -match '^LLAMA_SERVER_IMAGE_FALLBACK=(.+)$') {
+                    $envFallbackImage = $Matches[1].Trim().Trim('"').Trim("'")
+                }
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($envLlamaImage)) {
+                Write-AI "Validating llama-server image tag before startup..."
+                $validatedImage = Resolve-ODSDockerImageOrFallback `
+                    -Image $envLlamaImage `
+                    -Label "llama-server" `
+                    -FallbackImage $envFallbackImage `
+                    -ImageEnvName "LLAMA_SERVER_IMAGE" `
+                    -FallbackEnvName "LLAMA_SERVER_IMAGE_FALLBACK"
+                if ([string]::IsNullOrWhiteSpace($validatedImage)) { Exit-ODSInstallFailure }
+
+                if ($validatedImage -ne $envLlamaImage) {
+                    $envLines = Get-Content -LiteralPath $_envCheck -Encoding UTF8
+                    $envLines = $envLines | ForEach-Object {
+                        if ($_ -match '^LLAMA_SERVER_IMAGE=') { "LLAMA_SERVER_IMAGE=$validatedImage" } else { $_ }
+                    }
+                    Write-Utf8NoBom -Path $_envCheck -Content ($envLines -join "`n")
+                }
+            }
+        }
+
+        if ($enableHermes) {
+            $envHermesImage = Get-ODSEnvValueFromFile -Path $_envCheck -Key "HERMES_AGENT_IMAGE"
+            $hasHermesImageOverride = -not [string]::IsNullOrWhiteSpace($envHermesImage)
+            $envHermesFallbackImage = Get-ODSEnvValueFromFile -Path $_envCheck -Key "HERMES_AGENT_IMAGE_FALLBACK"
+            if ([string]::IsNullOrWhiteSpace($envHermesImage)) {
+                $envHermesImage = "nousresearch/hermes-agent:v2026.9.24@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7"
+            }
+
+            Write-AI "Validating Hermes Agent image tag before startup..."
+            $validatedHermesImage = Resolve-ODSDockerImageOrFallback `
+                -Image $envHermesImage `
+                -Label "Hermes Agent" `
+                -FallbackImage $envHermesFallbackImage `
+                -ImageEnvName "HERMES_AGENT_IMAGE" `
+                -FallbackEnvName "HERMES_AGENT_IMAGE_FALLBACK"
+            if ([string]::IsNullOrWhiteSpace($validatedHermesImage)) { Exit-ODSInstallFailure }
+
+            if ($validatedHermesImage -ne $envHermesImage) {
+                $envLines = Get-Content -LiteralPath $_envCheck -Encoding UTF8
+                $updatedHermesImage = $false
+                $envLines = $envLines | ForEach-Object {
+                    if ($_ -match '^HERMES_AGENT_IMAGE=') {
+                        $updatedHermesImage = $true
+                        "HERMES_AGENT_IMAGE=$validatedHermesImage"
+                    } else {
+                        $_
+                    }
+                }
+                if (-not $updatedHermesImage -and -not $hasHermesImageOverride) {
+                    $envLines += "HERMES_AGENT_IMAGE=$validatedHermesImage"
+                }
+                Write-Utf8NoBom -Path $_envCheck -Content ($envLines -join "`n")
+            }
+        }
+
+        Assert-ODSWindowsComposeCwd -InstallDir $installDir
+        $composeUpArgs = @("up", "-d", "--remove-orphans", "--no-build", "--pull", "never")
+        # PS 5.1 treats ANY stderr output from native commands as NativeCommandError.
+        # Silence stderr-as-error so $LASTEXITCODE reflects the real compose exit code.
+        # Write output to log file to avoid ForEach-Object pipeline hang on failure.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "SilentlyContinue"
+        $_composeLogDir = Join-Path $installDir "logs"
+        if (-not (Test-Path $_composeLogDir)) { New-Item -ItemType Directory -Path $_composeLogDir -Force | Out-Null }
+        $_composeLog = Join-Path $_composeLogDir "compose-up.log"
+
+        # ── Rebuild local-built images ─────────────────────────────────────
+        # Mirrors phases/11-services.sh on Linux: local Dockerfiles can drift
+        # from the baked images, so we always rebuild without cache before
+        # `up -d`. On AMD, llama-server runs natively on Windows (Vulkan
+        # binary), so it is not built here. ComfyUI is only locally built on
+        # NVIDIA; the Windows AMD stack uses a prebuilt image overlay.
+        $_buildServices = @("dashboard", "dashboard-api", "model-router", "remote-provider-egress", "remote-provider-ssh-tunnel", "pixel-inference", "langfuse-minio", "langfuse-minio-init")
+        if (Test-ODSWindowsServiceEnabled -ServiceId "ape" -Plan $servicePlan) {
+            $_buildServices += "ape"
+        }
+        if (Test-ODSWindowsServiceEnabled -ServiceId "token-spy" -Plan $servicePlan) {
+            $_buildServices += "token-spy"
+        }
+        if (Test-ODSWindowsServiceEnabled -ServiceId "privacy-shield" -Plan $servicePlan) {
+            $_buildServices += "privacy-shield"
+        }
+        if (Test-ODSWindowsServiceEnabled -ServiceId "brave-search" -Plan $servicePlan) {
+            $_buildServices += "brave-search"
+        }
+        if ($enableComfyui -and $currentBackend -eq "nvidia" -and -not $script:gpuPassthroughFailed) {
+            $_buildServices += "comfyui"
+        }
+        $_buildLog = Join-Path $_composeLogDir "compose-build.log"
+        "" | Out-File -FilePath $_buildLog -Encoding ascii
+
+        Push-Location $installDir
+        try {
+            $_composeServicesDockerArgs = @($script:ODSWindowsDockerClientArgs)
+            $_enabledComposeServices = @(
+                & docker @_composeServicesDockerArgs compose @composeFlags config --services 2>> $_buildLog
+            )
+            if ($LASTEXITCODE -ne 0) {
+                Write-AIError "Could not resolve Windows compose services before local image rebuilds."
+                Write-AI "Inspect compose config with: cd '$installDir'; docker compose $($composeFlags -join ' ') config --services"
+                Exit-ODSInstallFailure
+            }
+            $_enabledComposeServices = @(
+                $_enabledComposeServices |
+                    ForEach-Object { ([string]$_).Trim() } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+            $_selectedBuildServices = @()
+            foreach ($_svc in $_buildServices) {
+                if ($_enabledComposeServices -contains $_svc) {
+                    $_selectedBuildServices += $_svc
+                } else {
+                    Write-AI "Skipping local image build for disabled service: $_svc"
+                }
+            }
+            $_buildServices = $_selectedBuildServices
+
+            Write-AI "Building local images (reusing unchanged layers)..."
+            $_failedBuildServices = @()
+            $_legacyBuilderServices = @()
+            $_defaultDockerConfigServices = @()
+            foreach ($_svc in $_buildServices) {
+                Write-AI "  building $_svc ..."
+                $_buildExit = Invoke-ODSWindowsComposeBuildService `
+                    -Service $_svc `
+                    -DockerClientArgs $script:ODSWindowsDockerClientArgs `
+                    -ComposeFlags $composeFlags `
+                    -BuildLog $_buildLog
+
+                if ($_buildExit -ne 0 -and (Test-ODSWindowsDockerCredentialHelperFailure -LogPath $_buildLog)) {
+                    Write-AIWarn "  Docker Desktop credential helper failed for $_svc; retrying with plain docker build and DOCKER_BUILDKIT=0."
+                    Add-Content -LiteralPath $_buildLog -Value "`n--- retrying $_svc with plain docker build and DOCKER_BUILDKIT=0 after Docker credential-helper failure ---"
+                    $_buildExit = Invoke-ODSWindowsPlainDockerBuildService `
+                        -Service $_svc `
+                        -DockerClientArgs $script:ODSWindowsDockerClientArgs `
+                        -ComposeFlags $composeFlags `
+                        -BuildLog $_buildLog
+                    if ($_buildExit -eq 0) {
+                        $_legacyBuilderServices += $_svc
+                    }
+                }
+
+                if ($_buildExit -ne 0) {
+                    Write-AIWarn "  $_svc build failed with the install-scoped Docker config; retrying with the user's Docker config."
+                    Add-Content -LiteralPath $_buildLog -Value "`n--- retrying $_svc with user's Docker config after install-scoped Docker config failure ---"
+                    $_buildExit = Invoke-ODSWindowsComposeBuildService `
+                        -Service $_svc `
+                        -DockerClientArgs $script:ODSWindowsUserDockerClientArgs `
+                        -ComposeFlags $composeFlags `
+                        -BuildLog $_buildLog
+                    if ($_buildExit -eq 0) {
+                        $_defaultDockerConfigServices += $_svc
+                    }
+                }
+
+                if ($_buildExit -ne 0) {
+                    $_failedBuildServices += $_svc
+                    Write-AIError "$_svc build failed (see $_buildLog)"
+                }
+            }
+            if ($_legacyBuilderServices.Count -gt 0) {
+                Write-AIWarn "Used Docker legacy builder fallback for: $($_legacyBuilderServices -join ', ')"
+            }
+            if ($_defaultDockerConfigServices.Count -gt 0) {
+                Use-ODSWindowsUserDockerConfig -Reason "local image builds: $($_defaultDockerConfigServices -join ', ')"
+                Write-AIWarn "Continuing Compose preflight and service launch with the user's Docker config."
+            }
+            if ($_failedBuildServices.Count -gt 0) {
+                Write-Host ""
+                Write-AIError "Local image build failed: $($_failedBuildServices -join ', ')"
+                Write-AI "Compose up will not be attempted because --no-build would otherwise use stale or missing images."
+                if (Test-Path $_buildLog) {
+                    Write-Host "  --- docker compose build log tail ---" -ForegroundColor DarkGray
+                    Get-Content $_buildLog -Tail 60 | ForEach-Object { Write-Host "  $_" }
+                }
+                Write-ODSComposeDiagnostics -InstallDir $installDir -ComposeFlags $composeFlags `
+                    -ComposeArgs (@("build") + $_failedBuildServices) `
+                    -ComposeLogPath $_buildLog `
+                    -Phase "install-windows.ps1 local image build" `
+                    -NextStep "Fix the local Dockerfile/build error shown above, then re-run .\install-windows.ps1." `
+                    -SaveReport
+                Exit-ODSInstallFailure
+            }
+            Write-AISuccess "Local images rebuilt"
+
+            $composePreflightOk = Invoke-ODSWindowsComposeImagePreflight -DockerClientArgs $script:ODSWindowsDockerClientArgs -ComposeFlags $composeFlags -LogPath $_composeLog
+            if (-not $composePreflightOk -and $script:ODSWindowsDockerConfigMode -eq "install-scoped") {
+                Write-AIWarn "Compose image preflight failed with the install-scoped Docker config; retrying with the user's Docker config."
+                Add-Content -LiteralPath $_composeLog -Value "`n--- retrying Compose image preflight with user's Docker config after install-scoped config failure ---"
+                Use-ODSWindowsUserDockerConfig -Reason "Compose image preflight"
+                $composePreflightOk = Invoke-ODSWindowsComposeImagePreflight -DockerClientArgs $script:ODSWindowsDockerClientArgs -ComposeFlags $composeFlags -LogPath $_composeLog
+                if ($composePreflightOk) {
+                    Write-AIWarn "Continuing Compose service launch with the user's Docker config."
+                }
+            }
+
+            Write-ODSWindowsComposeLaunchRecord -InstallDir $installDir -ComposeFlags $composeFlags `
+                -ComposeArgs $composeUpArgs -DockerClientArgs $script:ODSWindowsDockerClientArgs
+            $dockerLaunchLabel = if ($script:ODSWindowsDockerClientArgs.Count -eq 0) { "docker" } else { "docker $($script:ODSWindowsDockerClientArgs -join ' ')" }
+            Write-AI "Running: $dockerLaunchLabel compose $($composeFlags -join ' ') $($composeUpArgs -join ' ')"
+            Write-AI "Compose working directory: $installDir"
+
+            if (-not $composePreflightOk) {
+                Write-ODSComposeDiagnostics -InstallDir $installDir -ComposeFlags $composeFlags `
+                    -ComposeArgs $composeUpArgs `
+                    -ComposeLogPath $_composeLog `
+                    -Phase "install-windows.ps1 compose image preflight" `
+                    -NextStep "A required Compose image did not download during the retry-protected preflight. Fix Docker registry/network/disk access, then re-run .\install-windows.ps1." `
+                    -SaveReport
+                Exit-ODSInstallFailure
+            }
+
+            Write-AI "Starting services... this may take several minutes."
+            & docker @script:ODSWindowsDockerClientArgs compose @composeFlags @composeUpArgs *> $_composeLog
+            $composeExit = $LASTEXITCODE
+            if ($composeExit -ne 0 -and $script:ODSWindowsDockerConfigMode -eq "install-scoped") {
+                Write-AIWarn "Compose service launch failed with the install-scoped Docker config; retrying with the user's Docker config."
+                Add-Content -LiteralPath $_composeLog -Value "`n--- retrying Compose service launch with user's Docker config after install-scoped config failure ---"
+                Use-ODSWindowsUserDockerConfig -Reason "Compose service launch"
+                Write-ODSWindowsComposeLaunchRecord -InstallDir $installDir -ComposeFlags $composeFlags `
+                    -ComposeArgs $composeUpArgs -DockerClientArgs $script:ODSWindowsDockerClientArgs
+                & docker @script:ODSWindowsDockerClientArgs compose @composeFlags @composeUpArgs *>> $_composeLog
+                $composeExit = $LASTEXITCODE
+            }
+        }
+        finally {
+            Pop-Location
+            $ErrorActionPreference = $prevEAP
+        }
+        # Show tail of compose output for immediate feedback
+        if (Test-Path $_composeLog) {
+            Get-Content $_composeLog -Tail 20 | ForEach-Object { Write-Host "  $_" }
+        }
+        if ($composeExit -ne 0) {
+            Write-AIError "docker compose up failed (exit code: $composeExit)"
+            Write-ODSComposeDiagnostics -InstallDir $installDir -ComposeFlags $composeFlags `
+                -ComposeArgs $composeUpArgs `
+                -ComposeLogPath $_composeLog `
+                -Phase "install-windows.ps1 docker compose up -d" `
+                -SaveReport
+            Exit-ODSInstallFailure
+        }
+        Write-AISuccess "Docker services started"
+        if (-not (Assert-ODSWindowsManagedContainers -InstallDir $installDir -ComposeFlags $composeFlags `
+                    -RequiredServices @("dashboard", "dashboard-api", "open-webui"))) {
+            Write-ODSComposeDiagnostics -InstallDir $installDir -ComposeFlags $composeFlags `
+                -ComposeArgs @("ps", "-a") `
+                -ComposeLogPath $_composeLog `
+                -Phase "install-windows.ps1 managed container assertion" `
+                -NextStep "Fix the missing Windows container stack shown above, then re-run .\install-windows.ps1." `
+                -SaveReport
+            Exit-ODSInstallFailure
+        }
+
+        if ($enableHermes -and (Get-Command Invoke-HermesSoulRefresh -ErrorAction SilentlyContinue)) {
+            Invoke-HermesSoulRefresh -InstallRoot $installDir -SyncContainer
+        }
+
+        # ── Launch background model upgrade ──────────────────────────────────
+        if ($bootstrapActive -and $fullTierConfig) {
+            Write-AI "Launching background download for $($fullTierConfig.LlmModel)..."
+            $logDir = Join-Path $installDir "logs"
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            $upgradeLog = Join-Path $logDir "model-upgrade.log"
+            $upgradeErrLog = Join-Path $logDir "model-upgrade-err.log"
+            $upgradeScript = Join-Path $installDir "scripts\bootstrap-upgrade.sh"
+
+            if (Test-Path $upgradeScript) {
+                # Convert Windows path to Git Bash Unix-style
+                $bashInstallDir = ($installDir -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+                $bashScript = ($upgradeScript -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+                $bashUpgradeLog = ($upgradeLog -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+                $bashUpgradeErrLog = ($upgradeErrLog -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+                $upgradePidFile = Join-Path $logDir "model-upgrade.pid"
+                $upgradeLaunchLog = Join-Path $logDir "model-upgrade-launch.log"
+                $upgradeLaunchErrLog = Join-Path $logDir "model-upgrade-launch-err.log"
+                $upgradeTaskName = "ODSModelUpgrade"
+                $bashUpgradePidFile = ($upgradePidFile -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+
+                # Write a temp wrapper script to avoid Windows/PowerShell quoting
+                # issues. Empty arguments (e.g., SHA256 for some tiers) get lost
+                # during command-line parsing. The Scheduled Task owns the long
+                # upgrade process directly; Start-ScheduledTask returns immediately,
+                # while the task state/result keep reflecting the real download.
+                $wrapperScript = Join-Path $logDir "bootstrap-run.sh"
+                $wrapperContent = @"
+#!/bin/bash
+set -uo pipefail
+mkdir -p "`$(dirname "$bashUpgradeLog")"
+echo "`$`$" > "$bashUpgradePidFile"
+exec bash "$bashScript" "$bashInstallDir" "$($fullTierConfig.GgufFile)" "$($fullTierConfig.GgufUrl)" "$($fullTierConfig.GgufSha256)" "$($fullTierConfig.LlmModel)" "$($fullTierConfig.MaxContext)" "$($script:BOOTSTRAP_GGUF_FILE)" > "$bashUpgradeLog" 2> "$bashUpgradeErrLog" < /dev/null
+"@
+                [System.IO.File]::WriteAllText($wrapperScript, $wrapperContent.Replace("`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+                $bashPath = Get-UsableWindowsBash -InstallPath $installDir
+                if ($bashPath) {
+                    Remove-Item -LiteralPath $upgradePidFile, $upgradeLaunchLog, $upgradeLaunchErrLog -ErrorAction SilentlyContinue
+
+                    $scheduled = $false
+                    try {
+                        try { Stop-ScheduledTask -TaskName $upgradeTaskName -ErrorAction SilentlyContinue } catch { }
+                        try { Unregister-ScheduledTask -TaskName $upgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+
+                        $upgradeAction = New-ScheduledTaskAction -Execute $bashPath -Argument ('"{0}"' -f $wrapperScript)
+                        $upgradeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+                        $upgradeRestartInterval = New-TimeSpan -Minutes 2
+                        $upgradeSettings = New-ScheduledTaskSettingsSet `
+                            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                            -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                            -RestartCount 5 -RestartInterval $upgradeRestartInterval
+                        # The upgrade owns the native llama-server hot-swap. It
+                        # must run at the same limited integrity level as the
+                        # host agent so later UI model swaps can stop the child.
+                        $upgradePrincipal = New-ODSInteractiveScheduledTaskPrincipal -RunLevel Limited
+                        Register-ScheduledTask -TaskName $upgradeTaskName `
+                            -Action $upgradeAction `
+                            -Trigger $upgradeTrigger `
+                            -Settings $upgradeSettings `
+                            -Principal $upgradePrincipal `
+                            -Description "ODS background model upgrade" `
+                            -Force | Out-Null
+                        Start-ScheduledTask -TaskName $upgradeTaskName -ErrorAction Stop
+                        $scheduled = $true
+                    } catch {
+                        Write-AIWarn "Could not register background upgrade task through Task Scheduler: $($_.Exception.Message)"
+                        Write-AI "Starting background upgrade task directly..."
+                        try {
+                            Start-Process -FilePath $bashPath -ArgumentList ('"{0}"' -f $wrapperScript) -WindowStyle Hidden | Out-Null
+                            $scheduled = $true
+                        } catch {
+                            Write-AIError "Failed to start background upgrade task directly: $_"
+                        }
+                    }
+
+                    $pidDeadline = (Get-Date).AddSeconds(10)
+                    while ($scheduled -and -not (Test-Path -LiteralPath $upgradePidFile) -and (Get-Date) -lt $pidDeadline) {
+                        Start-Sleep -Milliseconds 250
+                    }
+
+                    if (Test-Path -LiteralPath $upgradePidFile) {
+                        Write-AI "Full model ($($fullTierConfig.LlmModel)) downloading in background."
+                        Write-AI "Check progress: Get-Content '$upgradeLog' -Tail 10"
+                    } else {
+                        if ($scheduled) {
+                            try {
+                                $taskState = (Get-ScheduledTask -TaskName $upgradeTaskName -ErrorAction Stop).State
+                                Write-AIWarn "Background full-model download task did not write a PID file before continuing (task state: $taskState)."
+                            } catch {
+                                Write-AIWarn "Background full-model download task did not write a PID file before continuing."
+                            }
+                        }
+                        Write-AI "  Retry manually with: & '$bashPath' '$wrapperScript'"
+                        Write-AI "  Launcher log: $upgradeLaunchLog"
+                        Write-AI "  Launcher error log: $upgradeLaunchErrLog"
+                    }
+                } else {
+                    Write-AIWarn "No Git Bash-compatible shell was found for bootstrap-upgrade.sh."
+                    Write-AI "  Install Git for Windows or run the upgrade script manually after adding bash.exe to PATH."
+                }
+            } else {
+                Write-AIWarn "bootstrap-upgrade.sh not found at $upgradeScript"
+                Write-AIWarn "Download the full model manually or re-run the installer."
+            }
+        }
+
+    } finally {
+        Pop-Location
+        [Environment]::CurrentDirectory = $_previousCwd
+    }
+}
+
+# ============================================================================
+# PHASE 9 -- VERIFY (health checks, Perplexica config, shortcuts, summary)
+# ============================================================================
+Write-Phase -Phase 9 -Total 13 -Name "VERIFICATION" -Estimate "~30 seconds"
+
+if ($dryRun) {
+    $_dryRunServicePlan = New-ODSWindowsServicePlan `
+        -EnableRecommended $enableRecommended `
+        -EnableVoice $enableVoice `
+        -EnableWorkflows $enableWorkflows `
+        -EnableRag $enableRag `
+        -EnableHermes $enableHermes `
+        -EnableComfyui $enableComfyui `
+        -EnableDeepResearch $enableDeepResearch `
+        -EnablePrivacyShield $enablePrivacyShield `
+        -EnableBraveSearch $enableBraveSearch `
+        -EnableODSProxy $enableODSProxy `
+        -EnableRemoteAccess $enableRemoteAccess
+    Write-AI "[DRY RUN] Would health-check selected services"
+    if (Test-ODSWindowsServiceEnabled -ServiceId "perplexica" -Plan $_dryRunServicePlan) {
+        Write-AI "[DRY RUN] Would auto-configure Perplexica for $($tierConfig.LlmModel)"
+    }
+    Write-AI "[DRY RUN] Install validation complete"
+    Write-AISuccess "Dry run finished -- no changes made"
+    exit 0
+}
+
+# ── Service health checks ─────────────────────────────────────────────────────
+$opencodeSync = Sync-WindowsOpenCodeConfigFromEnv -InstallDir $installDir `
+    -GpuBackend $gpuInfo.Backend -CloudMode:$cloudMode `
+    -DefaultModelId $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel `
+    -DefaultContextLimit ([int]$tierConfig.MaxContext) -SkipIfUnavailable
+switch ($opencodeSync.Status) {
+    "created" {
+        Write-AISuccess "OpenCode config synced to active model (model: $($opencodeSync.ModelName))"
+    }
+    "updated" {
+        Write-AISuccess "OpenCode config synced to active model (model: $($opencodeSync.ModelName))"
+    }
+    "regenerated" {
+        Write-AISuccess "OpenCode config regenerated for active model (model: $($opencodeSync.ModelName))"
+    }
+}
+
+$windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
+$llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $installDir `
+    -EnvMap $windowsEnvMap `
+    -GpuBackend $gpuInfo.Backend -CloudMode:$cloudMode
+function Get-WindowsActiveModelSelection {
+    param(
+        [Parameter(Mandatory=$true)][hashtable]$EnvMap,
+        [string]$DefaultGgufFile = "",
+        [string]$DefaultModelName = ""
+    )
+
+    $activeGgufFile = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("GGUF_FILE") -Default $DefaultGgufFile
+    $activeModelName = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LLM_MODEL") -Default $DefaultModelName
+    if ([string]::IsNullOrWhiteSpace($activeGgufFile)) { $activeGgufFile = $DefaultGgufFile }
+    if ([string]::IsNullOrWhiteSpace($activeModelName)) { $activeModelName = $DefaultModelName }
+    return @{
+        GgufFile = $activeGgufFile
+        LlmModel = $activeModelName
+    }
+}
+$activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+    -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
+$webuiHealthPort = Get-WindowsODSEnvPort -EnvMap $windowsEnvMap `
+    -Name "WEBUI_PORT" -DefaultPort 3000
+$healthChecks = @(
+    @{ Name = $llmEndpoint.Name; Url = $llmEndpoint.HealthUrl }
+    @{ Name = "Chat UI (Open WebUI)"; Url = "http://localhost:$webuiHealthPort" }
+)
+if ($enableVoice)     {
+    $healthWhisperPort = if ($windowsEnvMap.ContainsKey("WHISPER_PORT") -and -not [string]::IsNullOrWhiteSpace($windowsEnvMap["WHISPER_PORT"])) { $windowsEnvMap["WHISPER_PORT"] } else { "9000" }
+    $healthChecks += @{ Name = "Whisper (STT)"; Url = "http://localhost:$healthWhisperPort/health" }
+}
+if ($enableWorkflows) {
+    $healthN8nPort = Get-WindowsODSEnvPort -EnvMap $windowsEnvMap -Name "N8N_PORT" -DefaultPort 5678
+    $healthChecks += @{ Name = "n8n (Workflows)"; Url = "http://localhost:$healthN8nPort/healthz" }
+}
+
+Write-AI "Running health checks..."
+$maxAttempts = 60; $allHealthy = $true
+
+foreach ($check in $healthChecks) {
+    $healthy = $false
+    for ($i = 1; $i -le $maxAttempts; $i++) {
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($check.Url)
+            $req.Timeout = 3000; $req.Method = "GET"
+            $resp = $req.GetResponse(); $code = [int]$resp.StatusCode; $resp.Close()
+            if ($code -ge 200 -and $code -lt 400) { $healthy = $true; break }
+        } catch [System.Net.WebException] {
+            # 401/403 means the service IS up (auth-protected) -- treat as healthy
+            $webResp = $_.Exception.Response
+            if ($webResp) {
+                $code = [int]$webResp.StatusCode
+                if ($code -eq 401 -or $code -eq 403) { $healthy = $true; break }
+            }
+        } catch { }
+        if ($i -le 3 -or $i % 5 -eq 0) {
+            Write-AI "  Waiting for $($check.Name)... ($i/$maxAttempts)"
+        }
+        Start-Sleep -Seconds 2
+    }
+    if ($healthy) {
+        Write-AISuccess "$($check.Name): healthy"
+    } else {
+        Write-AIWarn "$($check.Name): not responding after $maxAttempts attempts"
+        $allHealthy = $false
+    }
+}
+
+# ── LLM model-serving gate ───────────────────────────────────────────────────
+# A healthy LLM process is NOT proof the model can serve: if the GGUF backing file
+# was never placed on disk, /v1/models still lists it but every completion 500s.
+# Prove the file exists AND a minimal completion succeeds before this install may
+# report healthy — otherwise fail loud instead of a "health says yes, chat says no"
+# green install.
+$llmModelReady = $true
+if (-not $cloudMode) {
+    Write-AI "Verifying the LLM can actually serve a completion..."
+    $windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
+    $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $installDir `
+        -EnvMap $windowsEnvMap `
+        -GpuBackend $gpuInfo.Backend -CloudMode:$cloudMode
+    $activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+        -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
+    if (-not [string]::IsNullOrWhiteSpace($activeModel.GgufFile) -and $activeModel.GgufFile -ne $tierConfig.GgufFile) {
+        Write-AI "  Active model changed during install; verifying $($activeModel.GgufFile)."
+    }
+    $llmReady = Test-WindowsLlmModelReadiness -Endpoint $llmEndpoint -InstallDir $installDir `
+        -GgufFile $activeModel.GgufFile -TimeoutSec 120
+    if ($llmReady.Ok) {
+        $routeReady = Test-WindowsSwitchboardReadiness -EnvMap (Get-WindowsODSEnvMap -InstallDir $installDir)
+        if (-not $routeReady.Ok) {
+            $llmReady.Ok = $false
+            $llmReady.Detail = $routeReady.Detail
+        }
+    }
+    if ($llmReady.Ok) {
+        Write-AISuccess "LLM serving verified (model: $($llmReady.ModelId))"
+    } else {
+        $allHealthy = $false
+        $llmModelReady = $false
+        Write-AIError "LLM not serving: $($llmReady.Detail)"
+        if (-not $llmReady.FileExists) {
+            Write-Host "    Model file missing: $($llmReady.ModelFile)" -ForegroundColor DarkGray
+            Write-Host "    Re-run the installer to (re)download it: .\ods\installers\windows\install-windows.ps1" -ForegroundColor DarkGray
+        }
+    }
+}
+
+# ── Pre-download the Whisper STT model ───────────────────────────────────────
+# Speaches does NOT auto-download on transcription requests — it returns 404.
+# Trigger the download explicitly, verify it completed, surface recovery
+# instructions on failure. Mirrors Linux Phase 12 and macOS install-macos.sh.
+function Test-WindowsSttModelCached {
+    param([Parameter(Mandatory=$true)][string]$ModelUrl)
+
+    try {
+        $check = Invoke-WebRequest -Uri $ModelUrl -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+        return ($check.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-WindowsSttModelDownloadTrigger {
+    param([Parameter(Mandatory=$true)][string]$ModelUrl)
+
+    # Speaches keeps downloading after the request is accepted. Use a bounded
+    # client so a slow Hugging Face transfer cannot take down the installer host.
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        & $curl.Source --fail --silent --show-error --max-time 30 -X POST $ModelUrl | Out-Null
+        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 28) { return $true }
+        Write-AIWarn "STT model download trigger returned curl exit $LASTEXITCODE; verifying cache before failing."
+        return $false
+    }
+
+    try {
+        Invoke-WebRequest -Method POST -Uri $ModelUrl -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-AIWarn "STT model download trigger failed; verifying cache before failing."
+        return $false
+    }
+}
+
+function Wait-WindowsSttModelCached {
+    param(
+        [Parameter(Mandatory=$true)][string]$ModelUrl,
+        [int]$TimeoutSeconds = 900
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-WindowsSttModelCached -ModelUrl $ModelUrl) { return $true }
+        Start-Sleep -Seconds 5
+    }
+    return (Test-WindowsSttModelCached -ModelUrl $ModelUrl)
+}
+
+$sttModelReady = (-not $enableVoice)
+$sttModelNameForReadiness = ""
+$sttModelCacheUrl = ""
+$sttRecoveryCmd = ""
+if ($enableVoice) {
+    # Read AUDIO_STT_MODEL and WHISPER_PORT from .env (written by env-generator.ps1).
+    # Use ReadAllText with explicit UTF8NoBom encoding so legacy BOM-prefixed
+    # .env files (written by old Set-Content -Encoding UTF8) don't break the
+    # regex on the first line.
+    $sttModel = "Systran/faster-whisper-base"  # safe fallback
+    $whisperPort = "9000"  # safe fallback
+    $envPath = Join-Path $installDir ".env"
+    if (Test-Path $envPath) {
+        try {
+            $envText = [System.IO.File]::ReadAllText($envPath, (New-Object System.Text.UTF8Encoding($false)))
+            # Strip any leading BOM defensively in case the file was written
+            # with a different encoding.
+            if ($envText.Length -gt 0 -and [int]$envText[0] -eq 0xFEFF) {
+                $envText = $envText.Substring(1)
+            }
+            foreach ($line in ($envText -split "`r?`n")) {
+                if ($line -match "^AUDIO_STT_MODEL=(.*)$") {
+                    $val = $Matches[1].Trim('"').Trim()
+                    if ($val) { $sttModel = $val }
+                } elseif ($line -match "^WHISPER_PORT=(.*)$") {
+                    $val = $Matches[1].Trim('"').Trim()
+                    if ($val) { $whisperPort = $val }
+                }
+            }
+        } catch {
+            # Fall through to defaults on any read failure.
+        }
+    }
+    $sttModelEncoded = $sttModel -replace "/", "%2F"
+    $whisperUrl = "http://localhost:$whisperPort"
+    $sttRecoveryCmd = "curl.exe --max-time 30 -X POST '$whisperUrl/v1/models/$sttModelEncoded'"
+    $sttModelNameForReadiness = $sttModel
+    $sttModelCacheUrl = "$whisperUrl/v1/models/$sttModelEncoded"
+
+    # Step 1: wait briefly for the models API to be ready (max 15s).
+    $sttApiReady = $false
+    for ($i = 1; $i -le 15; $i++) {
+        try {
+            $probe = Invoke-WebRequest -Uri "$whisperUrl/v1/models" -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+            if ($probe.StatusCode -eq 200) { $sttApiReady = $true; break }
+        } catch { }
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not $sttApiReady) {
+        $sttModelReady = $false
+        $allHealthy = $false
+        Write-AIWarn "STT models API not ready -- download manually:"
+        Write-Host "    $sttRecoveryCmd" -ForegroundColor DarkGray
+    } else {
+        # Step 2: skip if already cached.
+        $alreadyCached = Test-WindowsSttModelCached -ModelUrl $sttModelCacheUrl
+
+        if ($alreadyCached) {
+            $sttModelReady = $true
+            Write-AISuccess "STT model already cached ($sttModel)"
+        } else {
+            # Step 3: POST to trigger download.
+            Write-AI "Downloading STT model ($sttModel)..."
+            Invoke-WindowsSttModelDownloadTrigger -ModelUrl $sttModelCacheUrl | Out-Null
+
+            # Step 4: verify the model is actually cached.
+            $verified = Wait-WindowsSttModelCached -ModelUrl $sttModelCacheUrl -TimeoutSeconds 900
+
+            if ($verified) {
+                $sttModelReady = $true
+                Write-AISuccess "STT model cached ($sttModel)"
+            } else {
+                $sttModelReady = $false
+                $allHealthy = $false
+                Write-AIWarn "STT model download failed -- run manually:"
+                Write-Host "    $sttRecoveryCmd" -ForegroundColor DarkGray
+            }
+        }
+    }
+}
+
+# ── Auto-configure Perplexica ─────────────────────────────────────────────────
+if (Test-ODSWindowsServiceEnabled -ServiceId "perplexica" -Plan $servicePlan) {
+    Write-AI "Configuring Perplexica..."
+    $windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
+    $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $installDir `
+        -EnvMap $windowsEnvMap `
+        -GpuBackend $gpuInfo.Backend -CloudMode:$cloudMode
+    $activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+        -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
+    $switchboardMode = ""
+    if ($windowsEnvMap.ContainsKey("ODS_MODEL_SWITCHBOARD")) {
+        $switchboardMode = [string]$windowsEnvMap["ODS_MODEL_SWITCHBOARD"]
+    }
+    $switchboardMode = $switchboardMode.Trim().ToLowerInvariant()
+    $perplexicaModel = $(if ($activeModel.GgufFile) { $activeModel.GgufFile } else { $activeModel.LlmModel })
+    if ($switchboardMode -eq "enabled") {
+        $perplexicaModel = "ods/current"
+    }
+    # The native Windows llama-server requires its key; Perplexica reaches it
+    # through LiteLLM, which holds that key.
+    $perplexicaUsesLiteLlm = ($cloudMode -or [string]$llmEndpoint["Backend"] -eq "native-llama-server")
+    $perplexicaBaseUrl = $(if ($perplexicaUsesLiteLlm) {
+        "http://litellm:4000/v1"
+    } else {
+        "http://llama-server:8080/v1"
+    })
+    if ($switchboardMode -eq "enabled") {
+        $perplexicaBaseUrl = "http://litellm:4000/v1"
+    }
+    $perplexicaApiKey = "no-key"
+    if (($perplexicaUsesLiteLlm -or $switchboardMode -eq "enabled") -and $windowsEnvMap.ContainsKey("LITELLM_KEY") -and -not [string]::IsNullOrWhiteSpace($windowsEnvMap["LITELLM_KEY"])) {
+        $perplexicaApiKey = $windowsEnvMap["LITELLM_KEY"]
+    }
+    $perplexicaPort = Get-WindowsODSEnvPort -EnvMap $windowsEnvMap -Name "PERPLEXICA_PORT" -DefaultPort 3004
+    $perplexicaOk = Set-PerplexicaConfig -PerplexicaPort $perplexicaPort -LlmModel $perplexicaModel -LlmBaseUrl $perplexicaBaseUrl -ApiKey $perplexicaApiKey
+    if ($perplexicaOk) {
+        Write-AISuccess "Perplexica configured (model: $perplexicaModel)"
+    } else {
+        Write-AIWarn "Perplexica auto-config skipped -- complete setup at http://localhost:$perplexicaPort"
+    }
+}
+
+$readinessEnv = Get-WindowsODSEnvMap -InstallDir $installDir
+function Get-ReadinessPort {
+    param([string]$Name, [string]$Default)
+    if ($readinessEnv.ContainsKey($Name) -and -not [string]::IsNullOrWhiteSpace($readinessEnv[$Name])) {
+        return $readinessEnv[$Name]
+    }
+    return $Default
+}
+
+$dashboardPort = Get-ReadinessPort -Name "DASHBOARD_PORT" -Default "3001"
+$webuiPort = Get-ReadinessPort -Name "WEBUI_PORT" -Default "3000"
+$dashboardApiPort = Get-ReadinessPort -Name "DASHBOARD_API_PORT" -Default "3002"
+$llmContainer = if ($cloudMode -or $gpuInfo.Backend -eq "amd") { "" } else { "ods-llama-server" }
+$readinessChecks = @(
+    @{ Name = "Dashboard"; Url = "http://localhost:$dashboardPort"; Container = "ods-dashboard"; OpenUrl = "http://localhost:$dashboardPort" }
+    @{ Name = "Chat UI (Open WebUI)"; Url = "http://localhost:$webuiPort"; Container = "ods-webui"; OpenUrl = "http://localhost:$webuiPort" }
+    @{ Name = $llmEndpoint.Name; Url = $llmEndpoint.HealthUrl; Container = $llmContainer; OpenUrl = $llmEndpoint.BaseUrl }
+    @{ Name = "Dashboard API"; Url = "http://localhost:$dashboardApiPort/health"; Container = "ods-dashboard-api"; OpenUrl = "http://localhost:$dashboardApiPort" }
+)
+if (Test-ODSWindowsServiceEnabled -ServiceId "litellm" -Plan $servicePlan) {
+    $litellmPort = Get-ReadinessPort -Name "LITELLM_PORT" -Default "4000"
+    $readinessChecks += @{ Name = "LiteLLM"; Url = "http://localhost:$litellmPort/health/readiness"; Container = "ods-litellm"; OpenUrl = "http://localhost:$litellmPort" }
+}
+if (Test-ODSWindowsServiceEnabled -ServiceId "searxng" -Plan $servicePlan) {
+    $searxngPort = Get-ReadinessPort -Name "SEARXNG_PORT" -Default "8888"
+    $readinessChecks += @{ Name = "SearXNG"; Url = "http://localhost:$searxngPort/healthz"; Container = "ods-searxng"; OpenUrl = "http://localhost:$searxngPort" }
+}
+if (Test-ODSWindowsServiceEnabled -ServiceId "token-spy" -Plan $servicePlan) {
+    $tokenSpyPort = Get-ReadinessPort -Name "TOKEN_SPY_PORT" -Default "3005"
+    $readinessChecks += @{ Name = "Token Spy"; Url = "http://localhost:$tokenSpyPort/health"; Container = "ods-token-spy"; OpenUrl = "http://localhost:$tokenSpyPort" }
+}
+if ($enableVoice) {
+    $whisperPort = Get-ReadinessPort -Name "WHISPER_PORT" -Default "9000"
+    $ttsPort = Get-ReadinessPort -Name "TTS_PORT" -Default "8880"
+    $readinessChecks += @{ Name = "Whisper (STT)"; Url = "http://localhost:$whisperPort/health"; Container = "ods-whisper"; OpenUrl = "http://localhost:$whisperPort" }
+    if ($sttModelCacheUrl) {
+        $readinessChecks += @{ Name = "Whisper STT model cache"; Url = $sttModelCacheUrl; Container = "ods-whisper"; OpenUrl = $sttModelNameForReadiness; Hint = "Run: $sttRecoveryCmd" }
+    }
+    $readinessChecks += @{ Name = "Kokoro (TTS)"; Url = "http://localhost:$ttsPort/health"; Container = "ods-tts"; OpenUrl = "http://localhost:$ttsPort" }
+}
+if ($enableWorkflows) {
+    $n8nPort = Get-ReadinessPort -Name "N8N_PORT" -Default "5678"
+    $readinessChecks += @{ Name = "n8n"; Url = "http://localhost:$n8nPort/healthz"; Container = "ods-n8n"; OpenUrl = "http://localhost:$n8nPort" }
+}
+if ($enableRag) {
+    $qdrantPort = Get-ReadinessPort -Name "QDRANT_PORT" -Default "6333"
+    $readinessChecks += @{ Name = "Qdrant"; Url = "http://localhost:$qdrantPort"; Container = "ods-qdrant"; OpenUrl = "http://localhost:$qdrantPort" }
+}
+if (Test-ODSWindowsServiceEnabled -ServiceId "hermes-proxy" -Plan $servicePlan) {
+    $hermesProxyPort = Get-ReadinessPort -Name "HERMES_PROXY_PORT" -Default "9120"
+    $readinessChecks += @{ Name = "Hermes Proxy"; Url = "http://localhost:$hermesProxyPort/health"; Container = "ods-hermes-proxy"; OpenUrl = "http://localhost:$hermesProxyPort" }
+}
+if ($enableComfyui) {
+    $comfyPort = Get-ReadinessPort -Name "COMFYUI_PORT" -Default "8188"
+    $readinessChecks += @{ Name = "ComfyUI"; Url = "http://localhost:$comfyPort"; Container = "ods-comfyui"; OpenUrl = "http://localhost:$comfyPort" }
+}
+if (Test-ODSWindowsServiceEnabled -ServiceId "perplexica" -Plan $servicePlan) {
+    $perplexicaPort = Get-ReadinessPort -Name "PERPLEXICA_PORT" -Default "3004"
+    $readinessChecks += @{ Name = "Perplexica"; Url = "http://localhost:$perplexicaPort"; Container = "ods-perplexica"; OpenUrl = "http://localhost:$perplexicaPort" }
+}
+if (Test-ODSWindowsServiceEnabled -ServiceId "privacy-shield" -Plan $servicePlan) {
+    $privacyPort = Get-ReadinessPort -Name "SHIELD_PORT" -Default "8085"
+    $readinessChecks += @{ Name = "Privacy Shield"; Url = "http://localhost:$privacyPort/health"; Container = "ods-privacy-shield"; OpenUrl = "http://localhost:$privacyPort" }
+}
+$installReadiness = Write-ODSInstallReadinessSummary -Checks $readinessChecks `
+    -StatusCommand ".\ods.ps1 status" `
+    -LogPath (Join-Path $installDir "logs\install.log") `
+    -DashboardUrl "http://localhost:$dashboardPort" `
+    -PassThru
+
+# The first post-compose persona render happens as soon as the required core
+# containers exist. Optional extension containers can still be entering the
+# running set at that point, which previously left Windows Hermes claiming
+# that no extensions were active. Refresh again after readiness has observed
+# the final stack and sync the authoritative service inventory into Hermes.
+if ($enableHermes -and (Get-Command Invoke-HermesSoulRefresh -ErrorAction SilentlyContinue)) {
+    Invoke-HermesSoulRefresh -InstallRoot $installDir -SyncContainer
+}
+
+if ($installReadiness -and $installReadiness.AllReady -and $llmModelReady -and $sttModelReady) {
+    $allHealthy = $true
+}
+
+# ── Desktop & Start Menu shortcuts ───────────────────────────────────────────
+try {
+    $dashboardUrl  = "http://localhost:$dashboardPort"
+    $shortcutName  = "ODS"
+    $iconPath      = Join-Path $installDir "extensions\services\dashboard\public\osmantic-os.ico"
+    $iconContent   = if (Test-Path -LiteralPath $iconPath) { "IconFile=$iconPath`nIconIndex=0" } else { "IconIndex=0" }
+    $urlContent    = "[InternetShortcut]`nURL=$dashboardUrl`n$iconContent`n"
+
+    $desktopDir    = [Environment]::GetFolderPath("Desktop")
+    Write-Utf8NoBom -Path (Join-Path $desktopDir   "$shortcutName.url") -Content $urlContent
+
+    $startMenuDir  = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+    Write-Utf8NoBom -Path (Join-Path $startMenuDir "$shortcutName.url") -Content $urlContent
+
+    # Attempt taskbar pin via Shell COM verb (silent no-op on builds that block it)
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $folder = $shell.Namespace($desktopDir)
+        $item = $folder.ParseName("$shortcutName.url")
+        if ($item) {
+            $item.Verbs() | Where-Object { $_.Name -match "pin.*taskbar|Taskbar" } |
+                ForEach-Object { $_.DoIt() }
+        }
+    } catch { }
+
+    Write-AISuccess "Added ODS shortcut to Desktop and Start Menu"
+} catch {
+    Write-AIWarn "Could not create shortcuts: $_"
+}
+
+# ── Success card ──────────────────────────────────────────────────────────────
+if ($allHealthy) {
+    Write-SuccessCard -WebUIPort $webuiPort -DashboardPort $dashboardPort
+} else {
+    Write-Host ""
+    Write-AIWarn "Install finished, but one or more services are not ready yet. Check status with:"
+    Write-Host "  .\ods.ps1 status" -ForegroundColor Cyan
+    Write-AIWarn "ODS is not being marked fully healthy until readiness recovers."
+    Write-Host ""
+}
+
+# ── Pre-mark setup wizard complete ────────────────────────────────────────────
+# The dashboard-api reads ${INSTALL_DIR}/data/config/setup-complete.json
+# (mounted at /data/config/setup-complete.json inside the container) to decide
+# first_run state. Writing this here prevents the wizard from reappearing on
+# every visit after a fresh install. Non-fatal.
+try {
+    $setupConfigDir = Join-Path $installDir "data\config"
+    $setupCompleteFile = Join-Path $setupConfigDir "setup-complete.json"
+    New-Item -Path $setupConfigDir -ItemType Directory -Force | Out-Null
+    $completedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $payload = @{ completed_at = $completedAt; version = "1.0.0" } | ConvertTo-Json -Compress
+    Set-Content -Path $setupCompleteFile -Value $payload -Encoding UTF8
+    Write-AISuccess "Setup wizard pre-marked complete"
+} catch {
+    Write-AIWarn "Could not write setup-complete.json (non-fatal): $_"
+}
+
+# ── Summary JSON (for CI / automation) ───────────────────────────────────────
+if ($SummaryJsonPath) {
+    $windowsEnvMap = Get-WindowsODSEnvMap -InstallDir $installDir
+    $activeModel = Get-WindowsActiveModelSelection -EnvMap $windowsEnvMap `
+        -DefaultGgufFile $tierConfig.GgufFile -DefaultModelName $tierConfig.LlmModel
+    $summary = @{
+        version    = $script:ODS_VERSION
+        tier       = $selectedTier
+        tierName   = $tierConfig.TierName
+        model      = $activeModel.LlmModel
+        gpuBackend = $gpuInfo.Backend
+        gpuName    = $gpuInfo.Name
+        installDir = $installDir
+        sttModelCached = $sttModelReady
+        features   = @{
+            voice        = $enableVoice
+            workflows    = $enableWorkflows
+            rag          = $enableRag
+            recommended  = $enableRecommended
+            hermes       = $enableHermes
+            comfyui      = $enableComfyui
+            deepResearch = $enableDeepResearch
+            privacyShield = $enablePrivacyShield
+        }
+        healthy    = $allHealthy
+        timestamp  = (Get-Date -Format "o")
+    }
+    Write-Utf8NoBom -Path $SummaryJsonPath -Content ($summary | ConvertTo-Json -Depth 3)
+    Write-AI "Summary written to $SummaryJsonPath"
+}
+
+$global:LASTEXITCODE = 0
+exit 0

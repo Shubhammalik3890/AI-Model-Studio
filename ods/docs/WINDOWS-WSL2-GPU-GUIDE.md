@@ -1,0 +1,304 @@
+# Windows WSL2 GPU Guide for ODS
+
+`install.ps1` installs ODS and Pixel/Portal inside Ubuntu/WSL2. NVIDIA inference
+uses GPU passthrough through Docker Desktop. AMD inference uses llama.cpp's
+`llama-server.exe` (Vulkan) on Windows through the ODS scheduled task; it does
+not require ROCm inside WSL.
+
+For AMD, follow the [Windows Quickstart](WINDOWS-QUICKSTART.md#gpu-placement).
+The installer binds its Windows task and model store to one WSL distribution
+and ODS runtime directory. After ownership is verified, the Models page can
+download compatible catalog or Hugging Face GGUFs, activate them, change
+context, and unload/resume the runtime. Installs whose task ran Lemonade Server
+move to llama.cpp when you rerun the current Windows installer for the same
+installation; see [AMD GPUs now run on llama.cpp](MIGRATION-LEMONADE-TO-LLAMACPP.md).
+A model server that this installation does not manage stays external; a
+reachable endpoint does not grant control of it.
+
+The checks and troubleshooting below apply to **NVIDIA passthrough**. For AMD,
+verify the Windows runtime and Portal route using the Quickstart instead of
+expecting `nvidia-smi` to succeed. Linux and macOS keep their existing inference
+and model-management paths.
+
+Before the Linux installer starts, `install.ps1` stops with instructions when
+Windows has an NVIDIA driver but it is older than 570, Ubuntu cannot see the
+GPU (`/usr/lib/wsl/lib/nvidia-smi -L`), or Docker Desktop does not expose its
+`nvidia` runtime (`docker info --format '{{json .Runtimes}}'`).
+
+## Quick Verification
+
+After installation, verify GPU is accessible:
+
+```powershell
+# In PowerShell (Windows side)
+wsl nvidia-smi
+
+# In WSL Ubuntu
+wsl
+nvidia-smi
+
+# In Docker container
+docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+```
+
+All three should show your GPU. If any fail, see troubleshooting below.
+
+---
+
+## Prerequisites
+
+### Required
+- Windows 10 version 2004+ (build 19041) or Windows 11
+- WSL2 enabled
+- Docker Desktop with WSL2 backend
+- NVIDIA GPU with 8GB+ VRAM
+- Latest NVIDIA drivers (Game Ready or Studio)
+
+### Not Required (Common Mistake)
+- **Do NOT install NVIDIA drivers inside WSL2** — Windows drivers provide GPU access to WSL2
+- **Do NOT install CUDA toolkit in WSL2** — containers include their own CUDA
+
+---
+
+## Installation Steps
+
+### Step 1: Enable WSL2
+
+```powershell
+# Run as Administrator in PowerShell
+wsl --install
+```
+
+Restart when prompted. This installs WSL2 and Ubuntu by default.
+
+**Verify:**
+```powershell
+wsl --status
+# Should show: Default Version: 2
+```
+
+### Step 2: Install Docker Desktop
+
+1. Download from https://docker.com/products/docker-desktop
+2. During install, **check "Use WSL2 instead of Hyper-V"**
+3. After install, verify WSL2 backend:
+   - Open Docker Desktop → Settings → General
+   - Confirm "Use the WSL2 based engine" is checked
+
+### Step 3: Install NVIDIA Drivers
+
+Download latest drivers from https://www.nvidia.com/drivers
+
+**Verify the driver version:**
+```powershell
+# ODS's CUDA runtime requires driver 570 or newer.
+# Game Ready and Studio drivers both work for compute.
+nvidia-smi --query-gpu=driver_version --format=csv,noheader
+```
+
+After updating the driver, run `wsl --shutdown` so Ubuntu picks it up.
+
+### Step 4: Run ODS Installer
+
+```powershell
+git clone https://github.com/Osmantic/ODS.git
+cd ODS
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\install.ps1
+```
+
+---
+
+## Common Issues
+
+### Issue: "nvidia-smi not found" in WSL2
+
+**Cause:** WSL2 doesn't have GPU support enabled or NVIDIA driver missing.
+
+**Fix:**
+```powershell
+# On Windows side — check driver
+nvidia-smi
+# If this fails, install NVIDIA drivers on Windows
+
+# Verify WSL2 has GPU support (the driver is provided by Windows)
+wsl /usr/lib/wsl/lib/nvidia-smi -L
+# Should list your GPU. If it does not, run: wsl --update; wsl --shutdown
+```
+
+### Issue: GPU works in WSL2 but not in Docker
+
+**Symptoms:**
+- `wsl nvidia-smi` shows GPU ✓
+- `docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi` fails ✗
+
+**Cause:** Docker Desktop not using WSL2 backend.
+
+**Fix:**
+1. Open Docker Desktop
+2. Settings → General → Check "Use the WSL2 based engine"
+3. Settings → Resources → WSL Integration → Enable integration with your distro
+4. Click "Apply & Restart"
+
+**Verify:**
+```powershell
+docker info | findstr WSL
+# Should show: WSL2: true
+```
+
+### Issue: "GPU access blocked by the operating system"
+
+**Symptoms:**
+```
+docker: Error response from daemon: OCI runtime create failed: 
+container_linux.go:380: starting container process caused: 
+process_linux.go:545: container init caused: Running hook #0:: 
+error running hook: exit status 1, stderr: nvidia-container-cli: 
+initialization error: driver rpc error: failed to process request
+```
+
+**Cause:** Windows Defender or other security software blocking GPU access.
+
+**Fix:**
+1. Add Docker Desktop to Windows Defender exclusions:
+   - Windows Security → Virus & threat protection → Manage settings
+   - Add or remove exclusions → Add an exclusion → Folder
+   - Add `C:\Program Files\Docker`
+
+2. If using third-party antivirus, temporarily disable or add similar exclusion.
+
+3. Restart Docker Desktop.
+
+### Issue: CUDA version mismatch errors
+
+**Symptoms:**
+```
+nvidia-container-cli: requirement error: unsatisfied condition: cuda>=11.6
+```
+
+**Cause:** Windows NVIDIA driver is too old for the container's CUDA version.
+
+**Fix:** Update NVIDIA drivers on Windows side. The driver in WSL2 comes from Windows — you don't install CUDA drivers in WSL2.
+
+### Issue: Out of memory errors
+
+**Cause:** WSL2 defaults to using 50% of available RAM.
+
+**Fix:** Create `.wslconfig` to increase memory:
+
+```powershell
+# In PowerShell (Windows side)
+notepad "$env:USERPROFILE\.wslconfig"
+```
+
+Add:
+```ini
+[wsl2]
+memory=24GB
+processors=8
+swap=4GB
+```
+
+Save, then:
+```powershell
+wsl --shutdown
+# Restart WSL2
+```
+
+### Issue: PowerShell execution policy blocks script
+
+**Symptoms:**
+```
+.\install.ps1 : File cannot be loaded because running scripts is disabled on this system.
+```
+
+**Fix (temporary, per-session):** run the installer through a one-shot bypass:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+---
+
+## Performance Tuning
+
+### Optimal `.wslconfig` for ODS
+
+Create `%USERPROFILE%\.wslconfig`:
+
+```ini
+[wsl2]
+# Memory: Leave 4-8GB for Windows, rest for WSL2
+memory=20GB
+processors=8
+swap=4GB
+swapFile=C:\temp\wsl-swap.vhdx
+localhostForwarding=true
+# Keep Windows interoperability enabled for the AMD llama-server control path.
+```
+
+After editing:
+```powershell
+wsl --shutdown
+# WSL2 will restart with new settings
+```
+
+### Docker Desktop Resource Limits
+
+1. Open Docker Desktop
+2. Settings → Resources → Advanced
+3. Set:
+   - CPUs: 75% of available cores
+   - Memory: 75% of available RAM
+   - Swap: 2GB
+
+---
+
+## Verification Checklist
+
+Before reporting issues, verify:
+
+- [ ] Windows 10 build 19041+ or Windows 11
+- [ ] `wsl --status` shows Default Version: 2
+- [ ] `wsl nvidia-smi` shows GPU info
+- [ ] Docker Desktop is running
+- [ ] Docker Desktop uses WSL2 backend (Settings → General)
+- [ ] WSL integration enabled for Ubuntu (Settings → Resources → WSL Integration)
+- [ ] `docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi` shows GPU
+
+---
+
+## Quick Commands Reference
+
+```powershell
+# Restart WSL2 (fixes many issues)
+wsl --shutdown
+
+# Check WSL2 distros
+wsl -l -v
+
+# Set WSL2 as default
+wsl --set-default-version 2
+
+# Check Docker WSL2 backend
+docker info | findstr WSL
+
+# View WSL2 logs (for debugging)
+Get-Content "$env:LOCALAPPDATA\Packages\CanonicalGroupLimited.UbuntuonWindows_79rhkp1fndgsc\LocalState\ext4.vhdx"
+```
+
+---
+
+## Getting Help
+
+If you've verified the checklist and still have issues:
+
+1. After install, run diagnostics: `cd $env:USERPROFILE\ods; .\ods.ps1 report`
+2. Check WSL2 GPU issues: https://github.com/microsoft/WSL/issues?q=label%3Agpu
+3. ODS Discord: https://discord.gg/4ntNp9MAwC
+
+**When reporting issues, include:**
+- Output of `wsl nvidia-smi`
+- Output of `docker info | findstr WSL`
+- Windows build number: `winver`
+- Docker Desktop version

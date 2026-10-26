@@ -1,0 +1,1116 @@
+"""ODS Talk mobile portal API.
+
+These endpoints are intentionally cookie-authenticated only. The dashboard
+nginx injects the admin API key for same-origin /api requests, but ODS Talk
+is a consumer surface opened from an owner QR. Holding the admin API key alone
+must not grant access here.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import json
+import logging
+import os
+from typing import Any, AsyncIterator
+
+import httpx
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
+
+import hermes_bridge
+import session_signer
+from config import (
+    EXTENSIONS_DIR,
+    GPU_BACKEND,
+    INSTALL_DIR,
+    LIBRARY_MANAGEABLE_BUILTINS,
+    SERVICES,
+    load_extension_manifests,
+    read_live_env_value,
+)
+from helpers import check_service_health, get_llama_context_size, get_llama_vision_support, get_loaded_model
+from host_agent_client import AgentClientError, async_request_json as request_agent_json
+from performance_oracle import (
+    find_catalog_model,
+    load_model_catalog,
+    model_app_compatibility,
+    model_compatibility_runtime_context,
+    read_env_file_value,
+    read_env_value,
+)
+from setup_chat_route import resolve_chat_route
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["talk"])
+
+SESSION_COOKIE_NAME = "ods-session"
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+MAX_MESSAGE_CHARS = 8000
+
+# Attachment limits — chat surface, not document-ingestion. Pick conservative
+# ceilings that still let a phone photo + a short doc through.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024   # 10 MB raw — base64 inflates to ~13 MB on the wire
+MAX_DOC_BYTES = 5 * 1024 * 1024      # 5 MB extracted text limit, generous
+MAX_DOC_CHARS = 80_000               # post-extraction character cap so a megabyte
+                                     # log doesn't blow past the model's context
+
+# MIME types we accept on the attach surface. Anything else → 415.
+_IMAGE_MIME_PREFIXES = ("image/",)
+_IMAGE_EXTENSION_MIMES = {
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+_TEXT_LIKE_MIMES = {
+    "text/plain", "text/markdown", "text/csv", "text/x-markdown",
+    "application/json", "application/xml", "text/xml",
+    "application/x-yaml", "text/yaml", "text/x-yaml",
+}
+_TEXT_LIKE_EXTENSIONS = {  # browsers sometimes upload these as application/octet-stream
+    ".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml",
+    ".log", ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".sh",
+}
+_TALK_BLOCKING_COMPATIBILITY_STATUSES = {
+    "blocked",
+    "incompatible",
+    "not_recommended",
+    "not_supported",
+    "unsupported",
+    "unsupported_until_revalidated",
+    "not_agent_viable",
+}
+
+
+def _configured_context_length() -> int | None:
+    """The context llama-server was launched with (CTX_SIZE, else MAX_CONTEXT)."""
+    for key in ("CTX_SIZE", "MAX_CONTEXT"):
+        for reader in (read_env_file_value, read_env_value):
+            try:
+                value = int(str(reader(key, INSTALL_DIR) or "").strip())
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    return None
+
+
+async def _active_model_profile_tools() -> bool | None:
+    """The active model's measured tool-call result, with profiles enabled only.
+
+    The host reports it in ``activeModelProfile``; it feeds an advisory, never
+    a block (no probe result locks an owner out of chat).
+    """
+    if read_live_env_value("ODS_MODEL_PROFILES").strip().lower() != "enabled":
+        return None
+    try:
+        status = await request_agent_json("GET", "/v1/model/status", timeout=2.0)
+    except AgentClientError:
+        return None
+    profile = status.get("activeModelProfile") if isinstance(status, dict) else None
+    tools = profile.get("tools") if isinstance(profile, dict) else None
+    return tools if isinstance(tools, bool) else None
+
+
+async def _active_model_app_compatibility() -> dict[str, Any]:
+    catalog = load_model_catalog(INSTALL_DIR)
+    loaded_model = await get_loaded_model()
+    if loaded_model:
+        model_name = loaded_model
+        gguf = loaded_model
+    else:
+        model_name = read_env_file_value("LLM_MODEL", INSTALL_DIR) or read_env_value("LLM_MODEL", INSTALL_DIR)
+        gguf = read_env_file_value("GGUF_FILE", INSTALL_DIR) or read_env_value("GGUF_FILE", INSTALL_DIR)
+    entry = find_catalog_model(catalog, model_name, gguf)
+    runtime_context = model_compatibility_runtime_context(INSTALL_DIR)
+    # The served context decides ODS Talk before Hermes does: below the
+    # Hermes floor Hermes answers every turn with an HTTP 502, so report the
+    # block (with the reason) here instead. The live llama-server n_ctx is
+    # what Hermes sees, so it wins; the launch configuration is the fallback
+    # for catalog models while the runtime cannot answer. A model outside the
+    # catalog is judged on the live value only (a cloud or external backend
+    # has no local launch context to go by).
+    served_context = await get_llama_context_size(model_hint=loaded_model) if loaded_model else None
+    if served_context is None and entry:
+        served_context = _configured_context_length()
+    compatibility = model_app_compatibility(
+        entry or {},
+        runtime_context=runtime_context,
+        context_length=served_context,
+        profile_tools=await _active_model_profile_tools(),
+    )
+    compatibility["activeModel"] = {
+        "id": entry.get("id") if entry else None,
+        "model": model_name or None,
+        "gguf": gguf or None,
+    }
+    compatibility["recommendedModel"] = _talk_recommended_model(catalog, entry, runtime_context)
+    return compatibility
+
+
+def _talk_recommended_model(
+    catalog: list[dict[str, Any]],
+    active_entry: dict[str, Any] | None,
+    runtime_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Installer-recommended model to suggest when the active one can't run Talk.
+
+    Only offered when it differs from the active model and is not itself
+    blocked for ODS Talk on this runtime.
+    """
+    model_name = (
+        read_env_file_value("MODEL_RECOMMENDED_MODEL", INSTALL_DIR)
+        or read_env_value("MODEL_RECOMMENDED_MODEL", INSTALL_DIR)
+    )
+    gguf = (
+        read_env_file_value("MODEL_RECOMMENDED_GGUF", INSTALL_DIR)
+        or read_env_value("MODEL_RECOMMENDED_GGUF", INSTALL_DIR)
+    )
+    recommended = find_catalog_model(catalog, model_name, gguf)
+    if not recommended or not recommended.get("id"):
+        return None
+    if active_entry and active_entry.get("id") == recommended.get("id"):
+        return None
+    if _hermes_talk_block_reason(model_app_compatibility(recommended, runtime_context=runtime_context)):
+        return None
+    return {
+        "id": recommended["id"],
+        "name": str(recommended.get("name") or recommended["id"]),
+    }
+
+
+# Shown when the active model is blocked for ODS Talk. The catalog ``reason``
+# on each compatibility entry is an internal fleet-QA note (run IDs, harness
+# vocabulary) and must never be returned to Talk users; only ``userMessage``
+# or this copy is.
+TALK_MODEL_NOT_SUPPORTED_MESSAGE = (
+    "This model isn't supported in ODS Talk yet. Switch to a recommended model to use ODS Talk."
+)
+TALK_MODEL_NOT_SUPPORTED_CODE = "model_not_supported"
+
+
+def _compatibility_status(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return "unknown"
+    return str(entry.get("status") or "unknown").strip().lower()
+
+
+def _hermes_talk_block_reason(compatibility: dict[str, Any]) -> str | None:
+    """Return user-facing copy when the active model blocks ODS Talk, else None.
+
+    Blocking is unchanged: either ``agentViability`` or ``hermesTalk`` in a
+    blocking status disables Talk.
+    """
+    if not isinstance(compatibility, dict):
+        return None
+    hermes_talk = compatibility.get("hermesTalk")
+    hermes_blocked = _compatibility_status(hermes_talk) in _TALK_BLOCKING_COMPATIBILITY_STATUSES
+    agent_blocked = (
+        _compatibility_status(compatibility.get("agentViability")) in _TALK_BLOCKING_COMPATIBILITY_STATUSES
+    )
+    if not (hermes_blocked or agent_blocked):
+        return None
+    if hermes_blocked:
+        message = str(hermes_talk.get("userMessage") or "").strip()
+        if message:
+            return message
+    return TALK_MODEL_NOT_SUPPORTED_MESSAGE
+
+
+async def _require_hermes_talk_compatible() -> dict[str, Any]:
+    compatibility = await _active_model_app_compatibility()
+    reason = _hermes_talk_block_reason(compatibility)
+    if reason:
+        raise HTTPException(status_code=409, detail=reason)
+    return compatibility
+
+
+# Shown instead of a vision answer. llama-server serves exactly one model, so
+# an image goes to the active model, which must have loaded a vision projector.
+TALK_VISION_UNSUPPORTED_MESSAGE = (
+    "The active model can't read images. Switch to a model with vision support to attach photos."
+)
+TALK_VISION_UNCONFIRMED_MESSAGE = (
+    "ODS Talk can't confirm that the active model reads images, so photo attachments are off for now."
+)
+
+
+def _vision_override_model() -> str:
+    """A separately configured vision model, served at ``ODS_TALK_VISION_URL``.
+
+    Empty (the default) sends images to the active model.
+    """
+    return os.environ.get("ODS_TALK_VISION_MODEL", "").strip()
+
+
+def _vision_backend_base_url() -> str:
+    """OpenAI-compatible base URL of a separately configured vision server.
+
+    ``ODS_TALK_VISION_URL`` accepts either a host root
+    (``http://host:8080``) or a full OpenAI-compatible base
+    (``http://host:8080/v1`` / ``http://host:8080/api/v1``). Normalising here
+    keeps a host root from becoming ``/v1/v1`` or ``/api/v1/v1``.
+    """
+    raw = (
+        os.environ.get("ODS_TALK_VISION_URL")
+        or os.environ.get("LLM_API_URL")
+        or "http://llama-server:8080"
+    ).rstrip("/")
+    if raw.endswith("/v1") or raw.endswith("/api/v1"):
+        return raw
+
+    base_path = (os.environ.get("LLM_API_BASE_PATH") or "/v1").strip()
+    if not base_path:
+        base_path = "/v1"
+    if not base_path.startswith("/"):
+        base_path = f"/{base_path}"
+    return f"{raw}{base_path.rstrip('/')}"
+
+
+def _vision_chat_completions_url() -> str:
+    return f"{_vision_backend_base_url()}/chat/completions"
+
+
+def _vision_backend_key() -> str:
+    """Bearer token for a separately configured vision server, if it needs one."""
+    return os.environ.get("ODS_TALK_VISION_KEY") or ""
+
+
+async def _vision_route() -> tuple[str, str, dict[str, str]]:
+    """Chat Completions URL, model and headers for an image turn.
+
+    A separately configured vision server (``ODS_TALK_VISION_MODEL`` with
+    ``ODS_TALK_VISION_URL`` and ``ODS_TALK_VISION_KEY``) is used as set.
+    Otherwise the image goes to the active model over its chat route, and only
+    when its llama-server loaded a vision projector; raises 409 otherwise.
+    """
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    override = _vision_override_model()
+    if override:
+        key = _vision_backend_key()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return _vision_chat_completions_url(), override, headers
+    vision = await get_llama_vision_support()
+    if vision is False:
+        raise HTTPException(status_code=409, detail=TALK_VISION_UNSUPPORTED_MESSAGE)
+    if vision is not True:
+        raise HTTPException(status_code=409, detail=TALK_VISION_UNCONFIRMED_MESSAGE)
+    url, model, route_headers = resolve_chat_route("http://llama-server:8080")
+    return url, model, {**route_headers, **headers}
+
+
+async def _stream_vision_chat(
+    image_bytes: bytes,
+    content_type: str,
+    prompt_text: str,
+    route: tuple[str, str, dict[str, str]],
+) -> AsyncIterator[bytes]:
+    """Send a single multimodal turn over ``route`` (from ``_vision_route``)
+    and translate the streaming response into the same SSE frame shape ODS
+    Talk already uses (session / delta / complete / done / error). Bypasses
+    Hermes for image queries because Hermes's prompt.submit only takes text —
+    the multimodal content array is a llama-server-level concept.
+
+    Trade-off: image queries don't get Hermes's tool layer (no web_search,
+    memory, etc.) — they're a one-shot "describe this image" exchange. For
+    follow-up turns, users continue typing normally and Hermes resumes.
+    """
+    url, model, headers = route
+    image_url = f"data:{content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    payload = {
+        "model": model,
+        "stream": True,
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]},
+        ],
+    }
+    yield _sse_event("session", {"session_id": "vision-oneshot"})
+
+    accumulated: list[str] = []
+    completed = False
+    warning = None
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    detail = body.decode("utf-8", errors="replace")[:300]
+                    yield _sse_event("error", {"status_code": resp.status_code, "detail": detail})
+                    yield _sse_event("done", {})
+                    return
+                async for raw in resp.aiter_lines():
+                    if not raw or not raw.startswith("data:"):
+                        continue
+                    payload_str = raw[5:].strip()
+                    if payload_str == "[DONE]":
+                        completed = True
+                        break
+                    try:
+                        chunk = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(chunk, dict) and chunk.get("error") is not None:
+                        yield _sse_event("error", {"status_code": 502, "detail": "The vision model returned an error before completing."})
+                        yield _sse_event("done", {})
+                        return
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    text = delta.get("content")
+                    if isinstance(text, str) and text:
+                        accumulated.append(text)
+                        yield _sse_event("delta", {"text": text})
+                    finish_reason = chunk.get("choices", [{}])[0].get("finish_reason")
+                    if finish_reason in ("stop", "length"):
+                        completed = True
+                        if finish_reason == "length":
+                            warning = "The vision answer reached its token limit and may be incomplete."
+                    elif finish_reason is not None:
+                        yield _sse_event("error", {"status_code": 502, "detail": "The vision model stopped without a completed text answer."})
+                        yield _sse_event("done", {})
+                        return
+    except (httpx.ReadTimeout, httpx.ConnectError, httpx.HTTPError) as exc:
+        yield _sse_event("error", {"status_code": 502, "detail": f"Vision model unavailable: {exc}"})
+        yield _sse_event("done", {})
+        return
+
+    if not completed:
+        yield _sse_event("error", {"status_code": 502, "detail": "The vision response ended before completing. Please try again."})
+        yield _sse_event("done", {})
+        return
+
+    final_text = "".join(accumulated).strip() or "(no response)"
+    yield _sse_event("complete", {
+        "session_id": "vision-oneshot",
+        "text": final_text,
+        "status": "ok",
+        "warning": warning,
+    })
+    yield _sse_event("done", {})
+
+
+def _require_session(request: Request) -> tuple[str, int]:
+    cookie_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+    ok, reason = session_signer.verify(cookie_value)
+    if not ok:
+        logger.info("ods-talk session denied: reason=%s", reason)
+        raise HTTPException(status_code=401, detail="Scan the owner card again to start a ODS Talk session.")
+    try:
+        _, expiry_str, _ = cookie_value.split(".")
+        expires_at = int(expiry_str)
+    except (ValueError, TypeError):
+        expires_at = 0
+    return hermes_bridge.talk_session_key(cookie_value), expires_at
+
+
+async def _service_config(service_id: str) -> dict[str, Any] | None:
+    """The service's registry entry, including a built-in added after startup.
+
+    SERVICES is read once when dashboard-api starts. Extensions can add Whisper,
+    Kokoro or Hermes later without an API restart, so read a missing built-in's
+    current manifest, as the catalog's health poll does (helpers.get_all_services).
+    Without this, Talk turned voice off after the owner added it.
+    """
+    cfg = SERVICES.get(service_id)
+    if cfg or service_id not in LIBRARY_MANAGEABLE_BUILTINS:
+        return cfg
+    try:
+        current, _, _ = await asyncio.to_thread(
+            load_extension_manifests, EXTENSIONS_DIR, GPU_BACKEND,
+            only_service_ids=frozenset({service_id}),
+        )
+    except OSError as exc:
+        logger.warning("ODS Talk could not read the %s manifest: %s", service_id, exc)
+        return None
+    return current.get(service_id)
+
+
+async def _service_state(service_id: str) -> dict[str, Any]:
+    cfg = await _service_config(service_id)
+    if not cfg:
+        return {"configured": False, "status": "not_configured"}
+    try:
+        result = await check_service_health(service_id, cfg)
+        return {"configured": True, "status": result.status}
+    except Exception:
+        logger.warning("ODS Talk health check failed for %s", service_id, exc_info=True)
+        return {"configured": True, "status": "unavailable"}
+
+
+def _whisper_url() -> str:
+    return (os.environ.get("WHISPER_URL") or "http://whisper:8000").rstrip("/")
+
+
+def _tts_url() -> str:
+    return (os.environ.get("KOKORO_URL") or os.environ.get("TTS_URL") or "http://tts:8880").rstrip("/")
+
+
+# Compose passes the AUDIO_* speech settings to Open WebUI, not dashboard-api,
+# so read them from the mounted .env: the installer-selected STT model (e.g.
+# large-v3-turbo on CUDA) is the only one Speaches has downloaded.
+def _stt_model() -> str:
+    return read_live_env_value("AUDIO_STT_MODEL") or "Systran/faster-whisper-base"
+
+
+def _tts_model() -> str:
+    return read_live_env_value("AUDIO_TTS_MODEL") or "kokoro"
+
+
+def _tts_voice() -> str:
+    # Only the Kokoro voice. Installers still write TTS_VOICE=en_US-lessac-medium,
+    # the retired Piper voice, which Kokoro rejects with a 400 for every reply.
+    return read_live_env_value("AUDIO_TTS_VOICE") or "af_heart"
+
+
+async def _transcribe_bytes(data: bytes, filename: str, content_type: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(
+                f"{_whisper_url()}/v1/audio/transcriptions",
+                data={"model": _stt_model()},
+                files={"file": (filename, data, content_type or "application/octet-stream")},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Speech transcription is not available right now.") from exc
+
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=422, detail="No speech was detected in that audio.")
+    return text.strip()
+
+
+async def _stream_speech(text: str) -> AsyncIterator[bytes]:
+    """Stream MP3 bytes from Kokoro as they arrive instead of buffering the
+    whole reply before sending anything back to the SPA.
+
+    Kokoro already supports streaming (``stream: true`` is its default; we
+    just used to throw it away by reading ``resp.content``). For a typical
+    multi-sentence Hermes reply Kokoro emits its first audio chunk in
+    ~500ms-1s while the full mux still takes 5-15s — so streaming cuts
+    time-to-first-audio from "wait for whole mp3" to "wait for one
+    sentence." That's the difference between a 7-second silent pause and
+    nearly-instant playback for the operator on ODS Talk.
+
+    On a mid-stream Kokoro error we log + end the response cleanly. The
+    browser then hears truncated audio (half a sentence) rather than
+    silence — strictly better UX than the previous buffer-then-503
+    failure mode, which the SPA had to silently swallow.
+    """
+    payload = {
+        "model": _tts_model(),
+        "voice": _tts_voice(),
+        "input": text,
+        "response_format": "mp3",
+        # Explicitly request streaming. Kokoro's default is true but the
+        # request schema lets clients override; pinning makes the
+        # contract obvious to anyone tracing the call.
+        "stream": True,
+    }
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{_tts_url()}/v1/audio/speech",
+                json=payload,
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    logger.warning(
+                        "kokoro returned %s for /v1/audio/speech: %s",
+                        resp.status_code, body.decode("utf-8", errors="replace")[:200],
+                    )
+                    return
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
+    except (httpx.HTTPError, httpx.StreamError) as exc:
+        # Mid-stream errors: log + return. The browser sees the response
+        # close early and plays whatever audio it already buffered.
+        logger.warning("kokoro stream ended early: %s", exc)
+        return
+
+
+async def _send_to_hermes(session_key: str, text: str) -> dict[str, Any]:
+    try:
+        reply = await hermes_bridge.submit_prompt(session_key, text)
+    except hermes_bridge.HermesUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (hermes_bridge.HermesBridgeError, asyncio.TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc) or "Hermes did not finish the response.") from exc
+
+    return {
+        "session_id": reply.session_id,
+        "text": reply.text,
+        "status": reply.status,
+        "warning": reply.warning,
+    }
+
+
+def _sse_event(event_type: str, data: dict[str, Any]) -> bytes:
+    """Encode one Server-Sent Events frame."""
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8")
+
+
+# SSE comment frame — clients ignore lines starting with ``:``. Used as a
+# keepalive so iOS Safari and intermediate proxies don't close the connection
+# while llama-server is doing 30-60s of prompt processing with no real frames.
+_SSE_KEEPALIVE = b": keepalive\n\n"
+
+# Emit a keepalive frame this often during silent gaps (in seconds).
+_KEEPALIVE_INTERVAL = 5.0
+
+
+class _TalkStreamingResponse(StreamingResponse):
+    """StreamingResponse that actively watches for an HTTP disconnect.
+
+    Starlette 0.48 stops listening to the ASGI receive channel when the server
+    advertises ASGI 2.4 and relies only on a later socket-write failure.  A
+    quiet Talk stream can therefore keep its Hermes/model request alive long
+    after the client has gone.  Race body streaming against the real
+    ``http.disconnect`` signal on every ASGI version, then close the iterator
+    so its Hermes-interrupt cleanup runs immediately.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        stream_task = asyncio.create_task(self.stream_response(send))
+        disconnect_task = asyncio.create_task(self.listen_for_disconnect(receive))
+        try:
+            done, _pending = await asyncio.wait(
+                {stream_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stream_task in done:
+                try:
+                    await stream_task
+                except OSError as exc:
+                    raise ClientDisconnect from exc
+        finally:
+            for task in (stream_task, disconnect_task):
+                if not task.done():
+                    task.cancel()
+            for task in (stream_task, disconnect_task):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            close = getattr(self.body_iterator, "aclose", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
+        if self.background is not None:
+            await self.background()
+
+
+# Hermes tool name → human-readable spinner caption. We map by exact name
+# first, then by a few well-known prefixes. The fallback is a literal "Using
+# `<name>`…" so an unrecognised tool still produces something honest rather
+# than a blank.
+_TOOL_LABELS: dict[str, str] = {
+    "web_search": "Searching the web…",
+    "web_extract": "Reading the page…",
+    "execute_code": "Running code…",
+    "read_file": "Looking at a file…",
+    "write_file": "Saving a file…",
+    "patch": "Editing a file…",
+    "search_files": "Searching files…",
+    "memory": "Checking memory…",
+    "text_to_speech": "Generating voice…",
+    "session_search": "Searching past conversations…",
+    "todo": "Updating todos…",
+    "cronjob": "Scheduling…",
+    "delegate_task": "Delegating to a subagent…",
+    "image_generate": "Drawing an image…",
+    "vision_analyze": "Looking at an image…",
+    "clarify": "Asking for clarification…",
+    "send_message": "Sending a message…",
+}
+
+
+def _label_for_tool(tool_name: str) -> str:
+    """Map a Hermes tool name to a friendly spinner caption."""
+    if tool_name in _TOOL_LABELS:
+        return _TOOL_LABELS[tool_name]
+    # Common prefixes — browser_* / memory_* / skill_* etc.
+    if tool_name.startswith("browser_"):
+        return "Browsing…"
+    if tool_name.startswith("memory_") or tool_name.startswith("memory"):
+        return "Checking memory…"
+    if tool_name.startswith("skill_") or tool_name == "skills_list":
+        return "Loading a skill…"
+    if tool_name.startswith("github_"):
+        return "Talking to GitHub…"
+    # Honest fallback — show the literal tool name so the operator can map it
+    # in _TOOL_LABELS next pass.
+    return f"Using `{tool_name}`…"
+
+
+async def _stream_hermes_sse(session_key: str, text: str, request: Request):
+    """SSE generator wrapping the bridge's stream_prompt.
+
+    Yields one ``data:`` line per bridge event, terminated by ``\\n\\n``. A
+    final ``done`` frame is emitted on normal completion or bridge errors, so
+    the client knows the stream closed cleanly. If the HTTP client disconnects
+    or the ASGI task is cancelled, the upstream bridge is cancelled without
+    trying to write another frame to the dead response.
+
+    Two ongoing-availability mechanisms:
+
+    1. **Keepalive** — emit a ``: keepalive`` SSE comment every
+       ``_KEEPALIVE_INTERVAL`` seconds while the bridge is silent (e.g.
+       during the 30-60s cold prompt processing of the system prompt). Without
+       this, iOS Safari and some intermediate proxies close idle streams,
+       leaving the SPA stuck on a stalled "thinking" spinner.
+    2. **Disconnect cancellation** — if the client's HTTP connection drops
+       mid-request (phone screen locked, tab closed, retry), stop pulling
+       from the bridge so we don't keep an upstream llama-server slot busy
+       for a response nobody will ever read.
+    """
+    bridge_iter = hermes_bridge.stream_prompt(session_key, text).__aiter__()
+    pending: asyncio.Task | None = None
+    emit_done = True
+    upstream_complete = False
+    approval_pending = False
+    approval_denied = False
+
+    async def deny_before_cancel() -> None:
+        nonlocal approval_denied
+        if not approval_pending or approval_denied:
+            return
+        approval_denied = True
+        with contextlib.suppress(Exception):
+            await hermes_bridge.deny_pending_approval(session_key)
+
+    async def cancel_pending() -> None:
+        nonlocal pending
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
+            # Interrupt cleanup closes the pooled Hermes WebSocket before this
+            # task is cancelled. Consume either outcome so a raced connection-
+            # closed exception cannot become an unobserved task warning.
+            with contextlib.suppress(
+                asyncio.CancelledError,
+                asyncio.TimeoutError,
+                StopAsyncIteration,
+                hermes_bridge.HermesBridgeError,
+            ):
+                await pending
+        pending = None
+
+    async def interrupt_before_cancel() -> None:
+        # Hermes detaches sessions when a WebSocket disappears. Explicitly use
+        # its session-scoped abort RPC first; otherwise the abandoned agent can
+        # keep the only local llama-server slot occupied long after the phone
+        # or fleet client has gone away.
+        with contextlib.suppress(Exception):
+            await hermes_bridge.interrupt_active_prompt(session_key)
+
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.create_task(bridge_iter.__anext__())
+            try:
+                done_set, _ = await asyncio.wait({pending}, timeout=_KEEPALIVE_INTERVAL)
+            except asyncio.CancelledError:
+                emit_done = False
+                raise
+            if not done_set:
+                # No bridge event in the keepalive window; check disconnect
+                # before sending more bytes, then emit a keepalive comment.
+                if await request.is_disconnected():
+                    emit_done = False
+                    return
+                yield _SSE_KEEPALIVE
+                continue
+            # The bridge yielded something — pending is in done_set.
+            try:
+                event = pending.result()
+            except StopAsyncIteration:
+                upstream_complete = True
+                pending = None
+                break
+            except hermes_bridge.HermesUnavailable as exc:
+                yield _sse_event("error", {"status_code": 503, "detail": str(exc)})
+                pending = None
+                break
+            except (hermes_bridge.HermesBridgeError, asyncio.TimeoutError) as exc:
+                yield _sse_event("error", {"status_code": 502, "detail": str(exc) or "Hermes did not finish the response."})
+                pending = None
+                break
+            pending = None  # ready for next iteration
+
+            et = event.get("type")
+            if et == "session":
+                yield _sse_event("session", {"session_id": event.get("session_id", "")})
+            elif et == "delta":
+                yield _sse_event("delta", {"text": event.get("text", "")})
+            elif et == "status":
+                # Hermes pre-formatted status text (e.g. "⏳ Retrying in 5.1s…",
+                # "🔎 Searching the web…"). Forward verbatim — upstream is
+                # responsible for the human-readable wording.
+                yield _sse_event("status", {
+                    "label": event.get("label"),
+                    "kind": event.get("kind"),
+                    "tool": None,
+                    "detail": None,
+                })
+            elif et == "tool_start":
+                # Translate raw bridge event into a friendly "status" frame
+                # the SPA renders as the spinner caption. The SPA replaces
+                # the caption on each new status, then drops it once
+                # message.delta frames start arriving.
+                tool_name = event.get("tool", "")
+                yield _sse_event("status", {
+                    "label": _label_for_tool(tool_name),
+                    "tool": tool_name,
+                    "detail": event.get("detail") or None,
+                })
+            elif et == "tool_complete":
+                # Tool finished — flip back to the default "Thinking…" caption
+                # until the next tool starts or message.delta arrives. SPA
+                # treats label=None as "clear and show default."
+                yield _sse_event("status", {
+                    "label": None,
+                    "tool": None,
+                    "detail": None,
+                })
+            elif et == "approval":
+                approval_pending = True
+                yield _sse_event("approval", {
+                    "command": str(event.get("command") or "")[:500],
+                    "description": str(event.get("description") or "")[:500],
+                    "choices": ["once", "deny"],
+                })
+            elif et == "complete":
+                # Mark the upstream turn complete before yielding.  ASGI may
+                # close the response generator as soon as this frame reaches
+                # the client, before it resumes us to emit ``done``.
+                upstream_complete = True
+                approval_pending = False
+                yield _sse_event("complete", {
+                    "session_id": event.get("session_id", ""),
+                    "text": event.get("text", ""),
+                    "status": event.get("status") or "ok",
+                    "warning": event.get("warning"),
+                })
+    except GeneratorExit:
+        # StreamingResponse may close an abandoned body iterator with
+        # ``aclose()``.  Yielding the normal terminal frame while handling
+        # GeneratorExit raises "async generator ignored GeneratorExit" and,
+        # more importantly, used to bypass the explicit disconnect branches.
+        emit_done = False
+        raise
+    finally:
+        await deny_before_cancel()
+        # Starlette can close a streaming response with ``aclose()`` /
+        # GeneratorExit rather than injecting CancelledError.  The explicit
+        # disconnect branches above therefore cannot be the only place that
+        # interrupts Hermes: cancelling just the local reader detaches the
+        # Hermes session and leaves its provider request running.  Interrupt
+        # every abandoned turn before cancelling the reader task.  A normal
+        # message.complete path stays pooled and is not interrupted.
+        if not upstream_complete:
+            logger.info("ods-talk: interrupting abandoned Hermes turn for %s", session_key[:8])
+            await interrupt_before_cancel()
+        await cancel_pending()
+        if emit_done:
+            yield _sse_event("done", {})
+
+
+@router.get("/api/talk/status")
+async def talk_status(request: Request) -> dict[str, Any]:
+    _session_key, expires_at = _require_session(request)
+    hermes, whisper, tts, model_compatibility = await asyncio.gather(
+        _service_state("hermes"),
+        _service_state("whisper"),
+        _service_state("tts"),
+        _active_model_app_compatibility(),
+    )
+    talk_block_reason = _hermes_talk_block_reason(model_compatibility)
+    text_chat_ready = hermes.get("status") == "healthy" and not talk_block_reason
+    voice_ready = whisper.get("status") == "healthy" and tts.get("status") == "healthy"
+    return {
+        "ok": True,
+        "session": {"expires_at": expires_at},
+        "modelCompatibility": model_compatibility,
+        "services": {
+            "hermes": hermes,
+            "whisper": whisper,
+            "tts": tts,
+        },
+        "capabilities": {
+            "text_chat": text_chat_ready,
+            "tts": tts.get("status") == "healthy",
+            "audio_message": voice_ready,
+            "live_mic_requires_secure_context": True,
+        },
+        # User-facing copy (never the catalog's internal fleet note).
+        "reason": talk_block_reason,
+        "reasonCode": TALK_MODEL_NOT_SUPPORTED_CODE if talk_block_reason else None,
+    }
+
+
+@router.post("/api/talk/session")
+async def talk_session(request: Request) -> dict[str, Any]:
+    session_key, expires_at = _require_session(request)
+    await _require_hermes_talk_compatible()
+    try:
+        session_id = await hermes_bridge.ensure_session(session_key)
+    except hermes_bridge.HermesUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (hermes_bridge.HermesBridgeError, asyncio.TimeoutError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc) or "Hermes session could not be started.") from exc
+    return {"session_id": session_id, "expires_at": expires_at}
+
+
+def _extract_message_text(payload: Any) -> str:
+    """Pull and validate the ``text`` field from a /api/talk/message body."""
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=422, detail="Message text is required.")
+    text = text.strip()
+    if len(text) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=413, detail="Message is too long.")
+    return text
+
+
+@router.post("/api/talk/message")
+async def talk_message(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    """Synchronous chat send. Waits for the full Hermes reply, returns JSON.
+
+    Kept for non-browser callers and tests. New UI code should use the SSE
+    endpoint /api/talk/message/stream so the user sees tokens land as Hermes
+    generates them — on a cold first message (16k-token system prompt) the
+    blocking version can hold the request open for 60+ seconds before any
+    visible feedback, which strands the UI on a "thinking" spinner.
+    """
+    session_key, _expires_at = _require_session(request)
+    await _require_hermes_talk_compatible()
+    text = _extract_message_text(payload)
+    return await _send_to_hermes(session_key, text)
+
+
+@router.post("/api/talk/message/stream")
+async def talk_message_stream(payload: dict[str, Any], request: Request) -> StreamingResponse:
+    """Server-Sent Events chat send. Streams delta + complete events.
+
+    Frame shape (one JSON object per ``data:`` line, ``\\n\\n`` terminator):
+
+      {"type": "session",  "session_id": "<id>"}
+      {"type": "delta",    "text": "<chunk>"}                    # repeats
+      {"type": "complete", "session_id": "<id>", "text": "...",
+                           "status": "ok", "warning": null}
+      {"type": "error",    "status_code": 502|503, "detail": "..."}  # on failure
+      {"type": "done"}                                                # always last
+
+    The endpoint sets ``X-Accel-Buffering: no`` and ``Cache-Control: no-cache``
+    so the dashboard nginx proxy passes frames through immediately rather
+    than batching them.
+    """
+    session_key, _expires_at = _require_session(request)
+    await _require_hermes_talk_compatible()
+    text = _extract_message_text(payload)
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return _TalkStreamingResponse(
+        _stream_hermes_sse(session_key, text, request),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
+@router.post("/api/talk/approval")
+async def talk_approval(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    """Answer the one pending Hermes tool approval for this Talk session."""
+    session_key, _expires_at = _require_session(request)
+    if set(payload) != {"choice"} or payload.get("choice") not in {"once", "deny"}:
+        raise HTTPException(status_code=422, detail="Choice must be 'once' or 'deny'.")
+
+    try:
+        accepted = await hermes_bridge.respond_approval(session_key, payload["choice"])
+    except hermes_bridge.HermesBridgeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not accepted:
+        raise HTTPException(status_code=409, detail="No pending approval for this session.")
+    return {"accepted": True, "choice": payload["choice"]}
+
+
+def _classify_attachment(file: UploadFile) -> str:
+    """Return one of: ``image``, ``text``, or raise 415.
+
+    Looks at the MIME type the browser supplied first; falls back to filename
+    extension because some browsers / iOS upload everything as
+    application/octet-stream. We deliberately keep the accept-set narrow on
+    this v1 surface — chat, not document ingestion.
+    """
+    ct = (file.content_type or "").lower()
+    name = (file.filename or "").lower()
+    ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+
+    if any(ct.startswith(p) for p in _IMAGE_MIME_PREFIXES):
+        return "image"
+    if ext in _IMAGE_EXTENSION_MIMES:
+        return "image"
+    if ct in _TEXT_LIKE_MIMES:
+        return "text"
+    if ext in _TEXT_LIKE_EXTENSIONS:
+        return "text"
+    raise HTTPException(
+        status_code=415,
+        detail=f"This file type isn't supported on chat yet (got {ct or 'unknown'}, {ext or 'no extension'}). Try an image, .txt, .md, .csv, .json, or code file.",
+    )
+
+
+def _image_content_type(file: UploadFile) -> str:
+    """Return a browser-safe image MIME, falling back from filename extension."""
+    ct = (file.content_type or "").lower()
+    if any(ct.startswith(p) for p in _IMAGE_MIME_PREFIXES):
+        return ct
+
+    name = (file.filename or "").lower()
+    ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+    return _IMAGE_EXTENSION_MIMES.get(ext, "image/png")
+
+
+@router.post("/api/talk/attachment")
+async def talk_attachment(
+    request: Request,
+    file: UploadFile = File(...),
+    text: str = Form(""),
+) -> StreamingResponse:
+    """Multipart attachment endpoint. Returns the same SSE event shape as
+    ``/api/talk/message/stream`` so the SPA can use a single rendering path.
+
+    Two routing paths inside:
+
+    1. **Images** → multimodal one-shot to the active model when its
+       llama-server loaded a vision projector (or to a separately configured
+       vision server). Hermes's prompt.submit API only accepts plain text, so
+       vision queries bypass the agent loop. Acceptable trade-off for v1: image queries don't get
+       Hermes's tool layer, but they do get a real model-vision answer.
+    2. **Text-like files** (.txt/.md/.csv/.json/code) → extract content,
+       prepend to the user's caption, route through the existing Hermes
+       bridge so the agent retains tools and memory.
+
+    PDF/docx aren't in scope for v1 (no parser dependency yet).
+    """
+    session_key, _expires_at = _require_session(request)
+    kind = _classify_attachment(file)
+
+    caption = (text or "").strip()
+    if len(caption) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=413, detail="Caption is too long.")
+
+    if kind == "image":
+        data = await file.read(MAX_IMAGE_BYTES + 1)
+        if len(data) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail=f"Image is too large (max {MAX_IMAGE_BYTES // (1024 * 1024)} MB).")
+        prompt_text = caption or "Describe what you see in this image."
+        route = await _vision_route()
+        return StreamingResponse(
+            _stream_vision_chat(data, _image_content_type(file), prompt_text, route),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    # text-like
+    await _require_hermes_talk_compatible()
+    data = await file.read(MAX_DOC_BYTES + 1)
+    if len(data) > MAX_DOC_BYTES:
+        raise HTTPException(status_code=413, detail=f"File is too large (max {MAX_DOC_BYTES // (1024 * 1024)} MB).")
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        content = data.decode("utf-8", errors="replace")
+    if len(content) > MAX_DOC_CHARS:
+        content = content[:MAX_DOC_CHARS] + f"\n\n[Truncated — file was {len(data):,} bytes, showing first {MAX_DOC_CHARS:,} chars]"
+
+    filename = file.filename or "attachment.txt"
+    prompt = (
+        f"[Attached file: {filename}]\n"
+        f"```\n{content}\n```\n\n"
+        f"{caption or 'Take a look at this and let me know what you think.'}"
+    )
+    return _TalkStreamingResponse(
+        _stream_hermes_sse(session_key, prompt, request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.post("/api/talk/audio-message")
+async def talk_audio_message(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    session_key, _expires_at = _require_session(request)
+    await _require_hermes_talk_compatible()
+    data = await file.read(MAX_AUDIO_BYTES + 1)
+    if len(data) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Audio message is too large.")
+    transcript = await _transcribe_bytes(
+        data,
+        file.filename or "ods-talk-audio.webm",
+        file.content_type or "application/octet-stream",
+    )
+    reply = await _send_to_hermes(session_key, transcript)
+    reply["transcript"] = transcript
+    return reply
+
+
+@router.post("/api/talk/speak")
+async def talk_speak(request: Request, text: str = Form(...)) -> StreamingResponse:
+    """Stream MP3 audio for ``text`` as Kokoro produces it.
+
+    The SPA's preferred consumption path is the browser's ``MediaSource`` API
+    fed from ``fetch().response.body``, which plays audio chunks as they
+    arrive (first audible token within ~500ms-1s). Browsers without
+    ``MediaSource`` fall back to collecting the full body into a Blob
+    before playback — same wall-clock as today, but no regression.
+    """
+    _session_key, _expires_at = _require_session(request)
+    clean = text.strip()
+    if not clean:
+        raise HTTPException(status_code=422, detail="Text is required.")
+    if len(clean) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=413, detail="Text is too long.")
+    return StreamingResponse(
+        _stream_speech(clean),
+        media_type="audio/mpeg",
+        # X-Accel-Buffering: no tells nginx (and similar reverse proxies)
+        # NOT to buffer the audio stream — otherwise our streaming work
+        # gets re-buffered into the same multi-second delay we just removed.
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )

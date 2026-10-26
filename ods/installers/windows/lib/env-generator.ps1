@@ -1,0 +1,1282 @@
+# ============================================================================
+# ODS Windows Installer -- Environment Generator
+# ============================================================================
+# Part of: installers/windows/lib/
+# Purpose: Generate .env file and SearXNG config
+#          Uses .NET crypto for secrets (no openssl dependency)
+#
+# Canonical source: installers/phases/06-directories.sh (keep .env format in sync)
+#
+# Modder notes:
+#   Modify New-ODSEnv to add new environment variables.
+#   All secrets use cryptographic RNG -- never use Get-Random for secrets.
+# ============================================================================
+
+# Write-Utf8NoBom and the current-user-only writers live in private-file.ps1,
+# which the Portal's durable launcher also copies beside its private plan.
+. (Join-Path $PSScriptRoot 'private-file.ps1')
+
+function Resolve-WindowsODSPort {
+    <#
+    .SYNOPSIS
+        Resolve a Windows installer port from an explicit process override,
+        persisted .env state, or the platform default.
+    .PARAMETER RequireValidProcessOverride
+        Reject a present process value that Compose cannot use as a decimal
+        port, rather than falling back while Compose still inherits that value.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [int]$DefaultPort,
+
+        [hashtable]$ExistingEnv,
+        [string]$InstallDir = "",
+        [switch]$RequireValidProcessOverride
+    )
+
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    $processValue = [Environment]::GetEnvironmentVariable($Name)
+    if ($RequireValidProcessOverride -and
+        [Environment]::GetEnvironmentVariables("Process").Contains($Name)) {
+        # Compose inherits process values ahead of --env-file, including empty
+        # values. A fallback here would check/write a different port from the
+        # one Compose consumes. Keep the legacy WebUI/Whisper contract opt-out.
+        $processPort = 0
+        if ($processValue -cnotmatch '\A[0-9]+\z' -or
+            -not [int]::TryParse($processValue, [ref]$processPort) -or
+            $processPort -lt 1 -or $processPort -gt 65535) {
+            throw "$Name process override must be a decimal port from 1 to 65535. Remove the environment variable to use the retained .env value or default."
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($processValue)) {
+        [void]$candidates.Add($processValue)
+    }
+
+    if ($ExistingEnv -and $ExistingEnv.ContainsKey($Name)) {
+        [void]$candidates.Add([string]$ExistingEnv[$Name])
+    } elseif (-not [string]::IsNullOrWhiteSpace($InstallDir)) {
+        $envPath = Join-Path $InstallDir ".env"
+        if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+            $assignment = Get-Content -LiteralPath $envPath -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match "^$([regex]::Escape($Name))=(.*)$" } |
+                Select-Object -First 1
+            if ($assignment -and $assignment -match "^[^=]+=(.*)$") {
+                [void]$candidates.Add([string]$Matches[1])
+            }
+        }
+    }
+
+    [void]$candidates.Add([string]$DefaultPort)
+    foreach ($candidate in $candidates) {
+        $parsedPort = 0
+        if ([int]::TryParse(([string]$candidate).Trim(), [ref]$parsedPort) -and
+            $parsedPort -ge 1 -and $parsedPort -le 65535) {
+            return $parsedPort
+        }
+    }
+
+    return $DefaultPort
+}
+
+function Test-WindowsLemonadeWhisperPortConflict {
+    <#
+    .SYNOPSIS
+        Side-effect-free probe: does any process listening on host port 9000
+        look like a native Lemonade server/router? Scans ALL listeners, not
+        just the first. Never stops processes or prints command lines.
+    .NOTES
+        Compatibility only: ODS no longer runs Lemonade, but leaves a user's
+        own Lemonade installed, and its router can keep holding port 9000.
+    #>
+    param([int]$Port = 9000)
+
+    try {
+        $connections = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+    if ($connections.Count -eq 0) { return $false }
+
+    $seenPids = @{}
+    foreach ($conn in $connections) {
+        $listenerPid = $conn.OwningProcess
+        if (-not $listenerPid -or $seenPids.ContainsKey($listenerPid)) { continue }
+        $seenPids[$listenerPid] = $true
+        try {
+            $proc = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
+        } catch {
+            $proc = $null
+        }
+        if (-not $proc) { continue }
+        $name = [string]$proc.ProcessName
+        if ($name -match '^(?i:lemonadeserver|lemonade-server|lemonade-router)$') {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Resolve-WindowsWhisperHostPort {
+    <#
+    .SYNOPSIS
+        Resolve the Whisper host port. Non-9000 configured ports pass through
+        untouched (no probe); existing .env ports are kept by the caller, so a
+        former managed Lemonade install keeps its 9100. A default 9000 moves
+        to 9100 only when a Lemonade router actually listens there.
+    #>
+    param(
+        [string]$ConfiguredPort = "9000"
+    )
+
+    if ($ConfiguredPort -ne '9000') { return $ConfiguredPort }
+    if (Test-WindowsLemonadeWhisperPortConflict -Port 9000) { return '9100' }
+    return '9000'
+}
+
+function Get-ODSDockerMemoryGB {
+    try {
+        $raw = (& docker info --format "{{.MemTotal}}" 2>$null | Select-Object -First 1)
+        $bytes = [int64]0
+        if ([int64]::TryParse(([string]$raw).Trim(), [ref]$bytes) -and $bytes -ge 1GB) {
+            return [int][Math]::Floor($bytes / 1GB)
+        }
+    } catch { }
+    return 0
+}
+
+function Get-ODSEffectiveContainerMemoryGB {
+    param(
+        [int]$SystemRamGB,
+        [int]$DockerRamGB
+    )
+
+    if ($SystemRamGB -gt 0 -and $DockerRamGB -gt 0) {
+        return [Math]::Min($SystemRamGB, $DockerRamGB)
+    }
+    if ($DockerRamGB -gt 0) {
+        return $DockerRamGB
+    }
+    return [Math]::Max(0, $SystemRamGB)
+}
+
+function Get-ODSDefaultNvidiaLlamaMemoryLimit {
+    param([int]$AvailableRamGB)
+
+    if ($AvailableRamGB -le 0) {
+        return "64G"
+    }
+
+    $reserveGB = $(if ($AvailableRamGB -lt 16) { 3 } else { 4 })
+    $usableGB = [Math]::Max(1, $AvailableRamGB - $reserveGB)
+    $usableGB = [Math]::Min(64, $usableGB)
+    return "${usableGB}G"
+}
+
+function New-SecureHex {
+    <#
+    .SYNOPSIS
+        Generate a cryptographically secure hex string.
+    .PARAMETER Bytes
+        Number of random bytes (output is 2x chars). Default 32.
+    #>
+    param([int]$Bytes = 32)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $buf = New-Object byte[] $Bytes
+    $rng.GetBytes($buf)
+    return ($buf | ForEach-Object { $_.ToString("x2") }) -join ""
+}
+
+function New-SecureBase64 {
+    <#
+    .SYNOPSIS
+        Generate a cryptographically secure Base64 string.
+    .PARAMETER Bytes
+        Number of random bytes. Default 32.
+    #>
+    param([int]$Bytes = 32)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $buf = New-Object byte[] $Bytes
+    $rng.GetBytes($buf)
+    return [Convert]::ToBase64String($buf)
+}
+
+function ConvertTo-ODSDotenvValue {
+    <# Serialize a value for Bash, Docker Compose, and ODS safe-env readers. #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+
+    $text = ([string]$Value) -replace "`r", " " -replace "`n", " "
+    if ($text.IndexOf("'") -ge 0) {
+        # Bash and Compose disagree about \` inside double-quoted dotenv
+        # values. Normalize it only in this apostrophe fallback so both readers
+        # receive the same safe text.
+        $text = $text.Replace('`', [string][char]0x02CB)
+        $escaped = $text.Replace('\', '\\').Replace('"', '\"').Replace('$', '\$')
+        return '"' + $escaped + '"'
+    }
+    return "'" + $text + "'"
+}
+
+# Settings ODS tells the owner to put in .env that no installer writes: the
+# dashboard's n8n API key (routers/workflows.py), the Hugging Face token for
+# gated downloads (routers/models.py), the Intel Arc image override
+# (docker-compose.arc.yml), Open WebUI's speech settings (tts/README.md) and
+# whether apps use measured model profiles (ODS_MODEL_PROFILES,
+# docs/MODEL-MANAGEMENT.md) and the opt-out from the dashboard's GitHub
+# release check (DISABLE_UPDATE_CHECK, FAQ.md).
+# Same list as ODS_OWNER_ENV_KEYS in installers/lib/extension-env-carry.sh.
+# Installer-managed keys must not be listed: an old value would override the
+# installer's new choice.
+$script:ODS_OWNER_ENV_KEYS = @(
+    "N8N_API_KEY"
+    "HF_TOKEN"
+    "LLAMA_ARC_IMAGE"
+    "AUDIO_TTS_ENGINE"
+    "AUDIO_TTS_MODEL"
+    "AUDIO_TTS_VOICE"
+    "AUDIO_TTS_OPENAI_API_BASE_URL"
+    "AUDIO_TTS_OPENAI_API_KEY"
+    "ODS_MODEL_PROFILES"
+    "DISABLE_UPDATE_CHECK"
+)
+
+function Get-ODSCarriedEnvLines {
+    <# Return, for each key the new .env content lacks, its last assignment line
+       in the previous .env, as it is when .env is read. Keys match exactly. #>
+    param(
+        [AllowEmptyCollection()][string[]]$PreviousLines,
+        [AllowEmptyString()][string]$NewContent,
+        [string[]]$Keys
+    )
+    $carried = @()
+    foreach ($key in $Keys) {
+        $prefix = "$key="
+        if ($NewContent -cmatch ("(?m)^" + [regex]::Escape($prefix))) { continue }
+        $last = $null
+        foreach ($line in $PreviousLines) {
+            if ($line.StartsWith($prefix, [StringComparison]::Ordinal)) { $last = $line }
+        }
+        if ($null -ne $last) { $carried += $last }
+    }
+    return $carried
+}
+
+function New-ODSEnv {
+    <#
+    .SYNOPSIS
+        Generate the .env file matching Phase 06 output format.
+    .PARAMETER InstallDir
+        Target installation directory.
+    .PARAMETER TierConfig
+        Hashtable from Resolve-TierConfig (TierName, LlmModel, GgufFile, MaxContext).
+    .PARAMETER Tier
+        Tier identifier string (1-4, SH_COMPACT, SH_LARGE, etc.).
+    .PARAMETER GpuBackend
+        GPU backend: "nvidia", "amd", or "none".
+    .PARAMETER ODSMode
+        LLM backend mode: "local", "cloud", or "hybrid".
+    #>
+    param(
+        [string]$InstallDir,
+        [hashtable]$TierConfig,
+        [string]$Tier,
+        [string]$GpuBackend = "nvidia",
+        [string]$ODSMode = "local",
+        [string]$LlamaServerImage = "",
+        [string]$AmdInferenceRuntime = "",
+        [string]$AmdInferenceBackend = "",
+        [string]$AmdInferenceLocation = "",
+        [string]$AmdInferencePort = "",
+        [string]$AmdInferenceSupportedBackends = "",
+        [string]$AmdInferenceRuntimeMode = "",
+        [string]$AmdInferenceManaged = "",
+        [int]$SystemRamGB = 0,
+        [bool]$WhisperCudaEnabled = $true,
+        [string]$SwitchboardMode = "",
+        # Mirror the install-time ENABLE_LANGFUSE toggle from phase 03 into
+        # .env's LANGFUSE_ENABLED default. Re-install preserves whatever the
+        # user already had in .env (via Get-EnvOrNew), so manual
+        # `ods enable langfuse` edits survive.
+        [bool]$EnableLangfuse = $false,
+        [bool]$EnableLan = $false,
+        [bool]$EnableODSProxy = $false,
+        [bool]$EnableWebSearch = $true
+    )
+
+    # Preserve existing secrets on re-install (mirrors Linux _env_get logic)
+    $existingEnv = @{}
+    $previousEnvLines = @()
+    $envPath = Join-Path $InstallDir ".env"
+    if (Test-Path $envPath) {
+        $previousEnvLines = @(Get-Content $envPath)
+        $previousEnvLines | ForEach-Object {
+            if ($_ -match "^([A-Za-z_][A-Za-z0-9_]*)=(.*)$") {
+                $existingEnv[$Matches[1]] = $Matches[2]
+            }
+        }
+    }
+
+    # Helper: reuse existing value or generate new
+    function Get-EnvOrNew { param([string]$Key, [string]$Default)
+        if ($existingEnv.ContainsKey($Key) -and $existingEnv[$Key]) {
+            return $existingEnv[$Key]
+        }
+        return $Default
+    }
+
+    # Empty is meaningful for optional provider overrides: it selects the
+    # bundled service. Distinguish it from a key missing in an older .env.
+    function Get-EnvOrNewAllowEmpty { param([string]$Key, [string]$Default)
+        if ($existingEnv.ContainsKey($Key)) {
+            return $existingEnv[$Key]
+        }
+        return $Default
+    }
+
+    function Get-PositiveEnvInteger { param([string]$Key, [int]$Default)
+        $raw = ([string](Get-EnvOrNew $Key ([string]$Default))).Trim()
+        if ($raw.Length -ge 2 -and (
+            ($raw[0] -eq "'" -and $raw[$raw.Length - 1] -eq "'") -or
+            ($raw[0] -eq '"' -and $raw[$raw.Length - 1] -eq '"')
+        )) {
+            $raw = $raw.Substring(1, $raw.Length - 2)
+        }
+        $parsed = 0
+        if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+        return $Default
+    }
+
+    $bindAddressDefault = if ($EnableLan) { "0.0.0.0" } else { "127.0.0.1" }
+    $bindAddress = if ($EnableLan) {
+        # An explicit -Lan rerun must override a stale loopback-only .env.
+        $bindAddressDefault
+    } else {
+        Get-EnvOrNew "BIND_ADDRESS" $bindAddressDefault
+    }
+    $networkExposed = (
+        $bindAddress -notin @("127.0.0.1", "::1", "localhost") -or
+        $EnableODSProxy
+    )
+    if ($networkExposed) {
+        # Never carry an authless localhost value into a network-exposed rerun.
+        $webuiAuth = "true"
+    } else {
+        # On loopback, preserve an operator's explicit opt-in to authentication.
+        $webuiAuth = Get-EnvOrNew "WEBUI_AUTH" "false"
+    }
+
+    $webuiPort = Resolve-WindowsODSPort `
+        -Name "WEBUI_PORT" -DefaultPort 3000 `
+        -ExistingEnv $existingEnv -InstallDir $InstallDir
+
+    # A Lemonade router (which ODS leaves installed for users who run it) holds
+    # host port 9000 for websockets. Keep Whisper's container port unchanged,
+    # but move a default host port out of its way. Existing .env ports,
+    # including 9100 from former managed Lemonade installs, remain unchanged.
+    $whisperPort = Resolve-WindowsODSPort `
+        -Name "WHISPER_PORT" -DefaultPort 9000 `
+        -ExistingEnv $existingEnv -InstallDir $InstallDir
+    $whisperPort = Resolve-WindowsWhisperHostPort -ConfiguredPort ([string]$whisperPort)
+
+    function Get-ExistingTokenSpyApiKey {
+        $tokenSpyKeyFile = Join-Path $InstallDir "data\token-spy\token-spy-api-key.txt"
+        if (Test-Path $tokenSpyKeyFile) {
+            $value = (Get-Content -Raw -Path $tokenSpyKeyFile -ErrorAction SilentlyContinue)
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value.Trim()
+            }
+        }
+        return ""
+    }
+
+    function Select-AutoCpuValue {
+        param(
+            [string]$Key,
+            [string]$Detected
+        )
+
+        $existing = ""
+        if ($existingEnv.ContainsKey($Key)) {
+            $existing = $existingEnv[$Key]
+        }
+
+        $existingNumber = 0.0
+        $detectedNumber = 0.0
+        $style = [System.Globalization.NumberStyles]::Float
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        $existingValid = [double]::TryParse($existing, $style, $culture, [ref]$existingNumber)
+        $detectedValid = [double]::TryParse($Detected, $style, $culture, [ref]$detectedNumber)
+
+        if ($existingValid -and $detectedValid -and $existingNumber -gt 0 -and $existingNumber -le $detectedNumber) {
+            return $existing
+        }
+        return $Detected
+    }
+
+    function Select-CappedCpuValue {
+        param(
+            [string]$Desired,
+            [string]$Ceiling
+        )
+
+        $desiredNumber = 0.0
+        $ceilingNumber = 0.0
+        $style = [System.Globalization.NumberStyles]::Float
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        if (-not [double]::TryParse($Desired, $style, $culture, [ref]$desiredNumber)) {
+            $desiredNumber = 1.0
+        }
+        if (-not [double]::TryParse($Ceiling, $style, $culture, [ref]$ceilingNumber) -or $ceilingNumber -le 0) {
+            $ceilingNumber = 1.0
+        }
+
+        $value = [Math]::Min($desiredNumber, $ceilingNumber)
+        if ($value -lt 0.01) { $value = 0.01 }
+        return $value.ToString("0.0", $culture)
+    }
+
+    function Select-ServiceCpuLimit {
+        param(
+            [string]$Key,
+            [string]$Desired,
+            [string]$Available
+        )
+        return Select-AutoCpuValue -Key $Key -Detected (Select-CappedCpuValue -Desired $Desired -Ceiling $Available)
+    }
+
+    function Select-ServiceCpuReservation {
+        param(
+            [string]$Key,
+            [string]$Desired,
+            [string]$Limit
+        )
+        return Select-AutoCpuValue -Key $Key -Detected (Select-CappedCpuValue -Desired $Desired -Ceiling $Limit)
+    }
+
+    # Generate secrets (reuse existing on re-install)
+    $webuiSecret     = Get-EnvOrNew "WEBUI_SECRET"       (New-SecureHex -Bytes 32)
+    $n8nPass         = Get-EnvOrNew "N8N_PASS"           (New-SecureBase64 -Bytes 16)
+    $litellmKey      = Get-EnvOrNew "LITELLM_KEY"        "sk-ods-$(New-SecureHex -Bytes 16)"
+    # Bearer key of the native Windows llama-server (AMD). Generated once and
+    # kept on reruns; LiteLLM, the model router and the host agent send it.
+    $llamaServerApiKey = Get-EnvOrNew "LLAMA_SERVER_API_KEY" (New-SecureHex -Bytes 32)
+    if ($llamaServerApiKey -cnotmatch '^[0-9a-f]{64}$') { $llamaServerApiKey = New-SecureHex -Bytes 32 }
+    $llamaServerImageFallback = Get-EnvOrNew "LLAMA_SERVER_IMAGE_FALLBACK" ([Environment]::GetEnvironmentVariable("LLAMA_SERVER_IMAGE_FALLBACK"))
+    if ([string]::IsNullOrWhiteSpace($llamaServerImageFallback)) { $llamaServerImageFallback = "" }
+    $livekitSecret   = Get-EnvOrNew "LIVEKIT_API_SECRET" (New-SecureBase64 -Bytes 32)
+    $livekitApiKey   = Get-EnvOrNew "LIVEKIT_API_KEY"    (New-SecureHex -Bytes 16)
+    $dashboardApiKey = Get-EnvOrNew "DASHBOARD_API_KEY"  (New-SecureHex -Bytes 32)
+    $odsAgentKey   = Get-EnvOrNew "ODS_AGENT_KEY"    (New-SecureHex -Bytes 32)
+    # HMAC key for signing ods-session cookies. Without it the dashboard-api
+    # session_signer raises on issue() and verify-session returns no-secret —
+    # the magic-link gate effectively breaks.
+    $odsSessionSecret = Get-EnvOrNew "ODS_SESSION_SECRET" (New-SecureHex -Bytes 32)
+    # Hermes otherwise rotates its dashboard token on every process start,
+    # invalidating WebSocket URLs held by already-open browser tabs.
+    $hermesDashboardSessionToken = Get-EnvOrNew "HERMES_DASHBOARD_SESSION_TOKEN" (New-SecureHex -Bytes 32)
+    $shieldApiKey    = Get-EnvOrNew "SHIELD_API_KEY"     (New-SecureHex -Bytes 32)
+    $tokenSpyApiKeyDefault = Get-ExistingTokenSpyApiKey
+    if ([string]::IsNullOrWhiteSpace($tokenSpyApiKeyDefault)) {
+        $tokenSpyApiKeyDefault = New-SecureHex -Bytes 32
+    }
+    $tokenSpyApiKey = Get-EnvOrNew "TOKEN_SPY_API_KEY" $tokenSpyApiKeyDefault
+    $searxngSecret   = Get-EnvOrNew "SEARXNG_SECRET"     (New-SecureHex -Bytes 32)
+    $difySecretKey    = Get-EnvOrNew "DIFY_SECRET_KEY"           (New-SecureHex -Bytes 32)
+    $qdrantApiKey     = Get-EnvOrNew "QDRANT_API_KEY"            (New-SecureHex -Bytes 32)
+    $opencodePassword = Get-EnvOrNew "OPENCODE_SERVER_PASSWORD"  (New-SecureBase64 -Bytes 16)
+    $switchboardModeDefault = if ([string]::IsNullOrWhiteSpace($SwitchboardMode)) { "enabled" } else { $SwitchboardMode.Trim().ToLowerInvariant() }
+    if ($switchboardModeDefault -notin @("legacy", "observe", "enabled")) {
+        $switchboardModeDefault = "enabled"
+    }
+    $switchboardMode = Get-EnvOrNew "ODS_MODEL_SWITCHBOARD" $switchboardModeDefault
+    $switchboardMode = $switchboardMode.Trim().ToLowerInvariant()
+    if ($switchboardMode -notin @("legacy", "observe", "enabled")) {
+        $switchboardMode = "enabled"
+    }
+    $cpuBudget = Get-LlamaCpuBudget -GpuBackend $(if ($GpuBackend -eq "none") { "cpu" } else { $GpuBackend })
+    $llamaCpuLimit = Select-AutoCpuValue -Key "LLAMA_CPU_LIMIT" -Detected $cpuBudget.Limit
+    $llamaCpuReservation = Select-AutoCpuValue -Key "LLAMA_CPU_RESERVATION" -Detected $cpuBudget.Reservation
+    $limitNumber = 0.0
+    $reservationNumber = 0.0
+    $style = [System.Globalization.NumberStyles]::Float
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    if ([double]::TryParse($llamaCpuLimit, $style, $culture, [ref]$limitNumber) -and [double]::TryParse($llamaCpuReservation, $style, $culture, [ref]$reservationNumber)) {
+        if ($reservationNumber -gt $limitNumber) {
+            $llamaCpuReservation = $llamaCpuLimit
+        }
+    }
+    $ttsCpuLimit = Select-ServiceCpuLimit -Key "TTS_CPU_LIMIT" -Desired "8.0" -Available $cpuBudget.Available
+    $ttsCpuReservation = Select-ServiceCpuReservation -Key "TTS_CPU_RESERVATION" -Desired "2.0" -Limit $ttsCpuLimit
+    $ttsWorkers = Get-PositiveEnvInteger "TTS_WORKERS" 1
+    $ttsCpuNumber = 0.0
+    if (-not [double]::TryParse($ttsCpuLimit, $style, $culture, [ref]$ttsCpuNumber) -or $ttsCpuNumber -le 0) {
+        $ttsCpuNumber = 1.0
+    }
+    $ttsThreadDefault = [int][Math]::Max(1, [Math]::Min(4, [Math]::Floor($ttsCpuNumber / $ttsWorkers)))
+    $ttsThreads = [Math]::Min((Get-PositiveEnvInteger "TTS_THREADS" $ttsThreadDefault), $ttsThreadDefault)
+    $whisperCpuLimit = Select-ServiceCpuLimit -Key "WHISPER_CPU_LIMIT" -Desired "4.0" -Available $cpuBudget.Available
+    $whisperCpuReservation = Select-ServiceCpuReservation -Key "WHISPER_CPU_RESERVATION" -Desired "1.0" -Limit $whisperCpuLimit
+    $hermesCpuLimit = Select-ServiceCpuLimit -Key "HERMES_CPU_LIMIT" -Desired "4.0" -Available $cpuBudget.Available
+    $hermesCpuReservation = Select-ServiceCpuReservation -Key "HERMES_CPU_RESERVATION" -Desired "0.5" -Limit $hermesCpuLimit
+    $comfyuiCpuLimit = Select-ServiceCpuLimit -Key "COMFYUI_CPU_LIMIT" -Desired "16.0" -Available $cpuBudget.Available
+    $comfyuiCpuReservation = Select-ServiceCpuReservation -Key "COMFYUI_CPU_RESERVATION" -Desired "2.0" -Limit $comfyuiCpuLimit
+
+    # Langfuse observability secrets
+    $langfusePort              = Get-EnvOrNew "LANGFUSE_PORT"              "3006"
+    $langfuseDefault           = if ($EnableLangfuse) { "true" } else { "false" }
+    $langfuseEnabled           = Get-EnvOrNew "LANGFUSE_ENABLED"           $langfuseDefault
+    $enableWebSearchValue      = if ($EnableWebSearch) { "true" } else { "false" }
+    $langfuseNextauthSecret    = Get-EnvOrNew "LANGFUSE_NEXTAUTH_SECRET"   (New-SecureHex -Bytes 32)
+    $langfuseSalt              = Get-EnvOrNew "LANGFUSE_SALT"              (New-SecureHex -Bytes 32)
+    $langfuseEncryptionKey     = Get-EnvOrNew "LANGFUSE_ENCRYPTION_KEY"    (New-SecureHex -Bytes 32)
+    $langfuseDbPassword        = Get-EnvOrNew "LANGFUSE_DB_PASSWORD"       (New-SecureHex -Bytes 16)
+    $langfuseClickhousePassword = Get-EnvOrNew "LANGFUSE_CLICKHOUSE_PASSWORD" (New-SecureHex -Bytes 16)
+    $langfuseRedisPassword     = Get-EnvOrNew "LANGFUSE_REDIS_PASSWORD"    (New-SecureHex -Bytes 16)
+    $langfuseMinioAccessKey    = Get-EnvOrNew "LANGFUSE_MINIO_ACCESS_KEY"  (New-SecureHex -Bytes 16)
+    $langfuseMinioSecretKey    = Get-EnvOrNew "LANGFUSE_MINIO_SECRET_KEY"  (New-SecureHex -Bytes 32)
+    $langfuseProjectPublicKey  = Get-EnvOrNew "LANGFUSE_PROJECT_PUBLIC_KEY" "pk-lf-ods-$(New-SecureHex -Bytes 16)"
+    $langfuseProjectSecretKey  = Get-EnvOrNew "LANGFUSE_PROJECT_SECRET_KEY" "sk-lf-ods-$(New-SecureHex -Bytes 16)"
+    $langfuseInitProjectId     = Get-EnvOrNew "LANGFUSE_INIT_PROJECT_ID"   (New-SecureHex -Bytes 16)
+    $langfuseInitUserEmail     = Get-EnvOrNew "LANGFUSE_INIT_USER_EMAIL"   "admin@ods.local"
+    $langfuseInitUserPassword  = Get-EnvOrNew "LANGFUSE_INIT_USER_PASSWORD" (New-SecureHex -Bytes 16)
+
+    # Determine LLM backend engine and API URL.
+    # AMD on Windows runs inference natively on the host with ggml-org's
+    # llama-server.exe (Vulkan): the same OpenAI API at /v1 and the same
+    # ODS_MODE=local as every managed llama-server install, plus an API key.
+    $windowsAmdHostInference = ($GpuBackend -eq "amd" -and $ODSMode -ne "cloud")
+    $nativeInferencePort = "8080"
+    $parsedNativeInferencePort = 0
+    if ([int]::TryParse([string]$AmdInferencePort, [ref]$parsedNativeInferencePort) -and
+        $parsedNativeInferencePort -ge 1 -and $parsedNativeInferencePort -le 65535) {
+        $nativeInferencePort = [string]$parsedNativeInferencePort
+    }
+    $effectiveODSMode = $ODSMode
+    $llamaServerMemoryLimit = ""
+    if ($GpuBackend -eq "nvidia" -and $effectiveODSMode -ne "cloud") {
+        $dockerRamGB = Get-ODSDockerMemoryGB
+        $availableRamGB = Get-ODSEffectiveContainerMemoryGB `
+            -SystemRamGB $SystemRamGB -DockerRamGB $dockerRamGB
+        $llamaMemoryDefault = Get-ODSDefaultNvidiaLlamaMemoryLimit `
+            -AvailableRamGB $availableRamGB
+        $llamaServerMemoryLimit = Get-EnvOrNew "LLAMA_SERVER_MEMORY_LIMIT" $llamaMemoryDefault
+    } elseif ($GpuBackend -in @("none", "cpu") -and $effectiveODSMode -ne "cloud" -and $TierConfig.LLAMA_SERVER_MEMORY_LIMIT) {
+        # CPU runtime profiles size the container for their model; without
+        # one the CPU compose default (6G) applies as before.
+        $llamaServerMemoryLimit = Get-EnvOrNew "LLAMA_SERVER_MEMORY_LIMIT" $TierConfig.LLAMA_SERVER_MEMORY_LIMIT
+    }
+    $existingGgufFile = Get-EnvOrNew "GGUF_FILE" ""
+    $existingModelStore = ([string](Get-EnvOrNew "ODS_ACTIVE_MODEL_STORE" "default")).Trim().Trim('"').Trim("'")
+    $preservedModelStore = 'default'
+    if ($existingGgufFile.Trim('"').Trim("'") -eq [string]$TierConfig.GgufFile -and
+        $existingModelStore -match '^[a-z][a-z0-9-]{0,47}$') {
+        $preservedModelStore = $existingModelStore
+    }
+
+    # NOTE: $(if ...) syntax required for PS 5.1 compatibility
+    $llmBackend = $(if ($ODSMode -eq "cloud") {
+        "litellm"
+    } else {
+        "llama-server"
+    })
+
+    # llama-server serves its OpenAI-compatible API at /v1 everywhere.
+    $llmApiBasePath = "/v1"
+
+    $llmApiUrl = $(if ($windowsAmdHostInference) {
+        "http://host.docker.internal:$nativeInferencePort"
+    } elseif ($ODSMode -eq "cloud") {
+        "http://litellm:4000"
+    } else {
+        "http://llama-server:8080"
+    })
+
+    # Hermes streams through the OpenAI-compatible provider. Local switchboard
+    # installs use model-router directly so client cancellation reaches the
+    # active backend request; cloud installs still use authenticated LiteLLM.
+    # Windows AMD without the switchboard goes through LiteLLM, which holds the
+    # native llama-server key, rather than calling the keyed runtime directly.
+    $hermesUsesModelRouter = ($switchboardMode -eq "enabled" -and $ODSMode -ne "cloud")
+    $hermesUsesLiteLlm = (-not $hermesUsesModelRouter -and ($windowsAmdHostInference -or $ODSMode -eq "cloud"))
+    $hermesLlmBaseUrl = $(if ($hermesUsesModelRouter) {
+        "http://model-router:9099/v1"
+    } elseif ($hermesUsesLiteLlm) {
+        "http://litellm:4000/v1"
+    } else {
+        "$llmApiUrl$llmApiBasePath"
+    })
+    $hermesLlmApiKey = $(if ($hermesUsesModelRouter) { "no-key" } elseif ($hermesUsesLiteLlm) { $litellmKey } else { "sk-ods-hermes-local" })
+    $openWebuiLlmBaseUrl = Get-EnvOrNew "OPEN_WEBUI_LLM_BASE_URL" $(if ($switchboardMode -eq "enabled") { "http://litellm:4000" } else { "" })
+    $openWebuiLlmApiKey = Get-EnvOrNew "OPEN_WEBUI_LLM_API_KEY" $(if ($switchboardMode -eq "enabled") { $litellmKey } else { "" })
+
+    # Timezone -- convert Windows timezone ID to IANA for Docker containers
+    $tz = $(try {
+        $tzInfo = [System.TimeZoneInfo]::Local
+        # .NET 6+ has TimeZoneInfo.TryConvertWindowsIdToIanaId; fall back to common mappings
+        $ianaId = $null
+        try {
+            # Works on .NET 6+ / PS 7+
+            # TryConvert returns bool; the IANA ID is written to the [ref] out-param
+            $outIana = $null
+            $ok = [System.TimeZoneInfo]::TryConvertWindowsIdToIanaId($tzInfo.Id, [ref]$outIana)
+            if ($ok -and $outIana) { $ianaId = $outIana }
+        } catch { }
+        if ($ianaId) { $ianaId } else {
+            # PowerShell `switch` runs *every* matching arm, and as a
+            # subexpression it collects all emitted values into an array, so
+            # multi-matching IDs (e.g. "AUS Eastern Standard Time" hits both
+            # "*AUS Eastern*" and "*Eastern*") would write an invalid
+            # "TIMEZONE=America/New_York Australia/Sydney". `break` on every arm
+            # makes the first match win; the more specific "*AUS Eastern*" is
+            # ordered ahead of "*Eastern*" so it takes precedence.
+            switch -Wildcard ($tzInfo.Id) {
+                "*AUS Eastern*"  { "Australia/Sydney"; break }
+                "*Eastern*"    { "America/New_York"; break }
+                "*Central*"    { "America/Chicago"; break }
+                "*Mountain*"   { "America/Denver"; break }
+                "*Pacific*"    { "America/Los_Angeles"; break }
+                "*Alaska*"     { "America/Anchorage"; break }
+                "*Hawaii*"     { "Pacific/Honolulu"; break }
+                "*UTC*"        { "UTC"; break }
+                "*GMT*"        { "Europe/London"; break }
+                "*W. Europe*"  { "Europe/Berlin"; break }
+                "*Romance*"    { "Europe/Paris"; break }
+                "*India*"      { "Asia/Kolkata"; break }
+                "*China*"      { "Asia/Shanghai"; break }
+                "*Tokyo*"      { "Asia/Tokyo"; break }
+                "*Korea*"      { "Asia/Seoul"; break }
+                "*E. South America*" { "America/Sao_Paulo"; break }
+                "*SE Asia*"    { "Asia/Bangkok"; break }
+                "*Arab*"       { "Asia/Riyadh"; break }
+                "*Egypt*"      { "Africa/Cairo"; break }
+                "*South Africa*" { "Africa/Johannesburg"; break }
+                "*E. Europe*"  { "Europe/Bucharest"; break }
+                "*FLE*"        { "Europe/Kiev"; break }
+                default        { "UTC"; break }
+            }
+        }
+    } catch { "UTC" })
+
+    $timestamp = Get-Date -Format "o"
+    $whisperAccelerationDefault = $(if ($GpuBackend -eq "nvidia" -and $WhisperCudaEnabled) { "cuda" } else { "cpu" })
+    $whisperAcceleration = Get-EnvOrNew "WHISPER_ACCELERATION" $whisperAccelerationDefault
+    if ($GpuBackend -eq "nvidia" -and -not $WhisperCudaEnabled) {
+        $whisperAcceleration = "cpu"
+    }
+    if ($whisperAcceleration -notin @("cpu", "cuda")) {
+        $whisperAcceleration = $whisperAccelerationDefault
+    }
+
+    $whisperImageDefault = $(if ($whisperAcceleration -eq "cuda") { "" } else { "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu@sha256:2163775b6df5e451a71200e8f675fed68dbd8ab184fc604453d549e486f22fd2" })
+    $whisperImage = Get-EnvOrNew "WHISPER_IMAGE" $whisperImageDefault
+    if ($whisperAcceleration -eq "cpu" -and
+        ([string]::IsNullOrWhiteSpace($whisperImage) -or $whisperImage -match "(?i)cuda")) {
+        $whisperImage = "ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu@sha256:2163775b6df5e451a71200e8f675fed68dbd8ab184fc604453d549e486f22fd2"
+    }
+
+    $audioSttModelDefault = $(if ($whisperAcceleration -eq "cuda") { "deepdml/faster-whisper-large-v3-turbo-ct2" } else { "Systran/faster-whisper-base" })
+    $audioSttModel = Get-EnvOrNew "AUDIO_STT_MODEL" $audioSttModelDefault
+    if ($whisperAcceleration -eq "cpu" -and $audioSttModel -match "(?i)large-v3|turbo") {
+        $audioSttModel = $audioSttModelDefault
+    }
+    $embeddingModelDefault = [Environment]::GetEnvironmentVariable("EMBEDDING_MODEL")
+    if ([string]::IsNullOrWhiteSpace($embeddingModelDefault)) { $embeddingModelDefault = "BAAI/bge-base-en-v1.5" }
+    $embeddingModel = Get-EnvOrNew "EMBEDDING_MODEL" $embeddingModelDefault
+    $ragEmbeddingModel = Get-EnvOrNewAllowEmpty "RAG_EMBEDDING_MODEL" ([Environment]::GetEnvironmentVariable("RAG_EMBEDDING_MODEL"))
+    $ragOpenAiApiBaseUrl = Get-EnvOrNewAllowEmpty "RAG_OPENAI_API_BASE_URL" ([Environment]::GetEnvironmentVariable("RAG_OPENAI_API_BASE_URL"))
+    $ragOpenAiApiKey = Get-EnvOrNewAllowEmpty "RAG_OPENAI_API_KEY" ([Environment]::GetEnvironmentVariable("RAG_OPENAI_API_KEY"))
+    $embeddingsMemoryLimitDefault = [Environment]::GetEnvironmentVariable("EMBEDDINGS_MEMORY_LIMIT")
+    if ([string]::IsNullOrWhiteSpace($embeddingsMemoryLimitDefault)) { $embeddingsMemoryLimitDefault = "4G" }
+    $embeddingsMemoryLimit = Get-EnvOrNew "EMBEDDINGS_MEMORY_LIMIT" $embeddingsMemoryLimitDefault
+    $nGpuLayersDefault = [Environment]::GetEnvironmentVariable("N_GPU_LAYERS")
+    if ([string]::IsNullOrWhiteSpace($nGpuLayersDefault)) { $nGpuLayersDefault = "auto" }
+    $nGpuLayers = (Get-EnvOrNew "N_GPU_LAYERS" $nGpuLayersDefault).Trim()
+    if ([string]::IsNullOrWhiteSpace($nGpuLayers)) { $nGpuLayers = "auto" }
+    # Owner opt-out for the NVIDIA/CPU overlay default; empty keeps ngram-mod implicit.
+    $llamaSpecType = (Get-EnvOrNew "LLAMA_SPEC_TYPE" "").Trim()
+
+    # Build .env content (matches Phase 06 format)
+    $recommendationSource = ConvertTo-ODSDotenvValue $(if ($TierConfig.RecommendationSource) { $TierConfig.RecommendationSource } else { "installer_tier_map" })
+    $recommendationPolicy = ConvertTo-ODSDotenvValue $(if ($TierConfig.RecommendationPolicy) { $TierConfig.RecommendationPolicy } else { "tier-map" })
+    $recommendationConfidence = ConvertTo-ODSDotenvValue $(if ($TierConfig.RecommendationConfidence) { $TierConfig.RecommendationConfidence } else { "medium" })
+    $recommendationReason = ConvertTo-ODSDotenvValue $(if ($TierConfig.RecommendationReason) { $TierConfig.RecommendationReason } else { "Selected by installer tier $Tier ($($TierConfig.TierName)) for $GpuBackend backend; benchmark locally after first launch." })
+    $recommendationAlternatives = ConvertTo-ODSDotenvValue $(if ($TierConfig.RecommendationAlternatives) { $TierConfig.RecommendationAlternatives } else { "" })
+    $performanceLabel = ConvertTo-ODSDotenvValue "Benchmark after first launch"
+
+    $envContent = @"
+# ODS Configuration -- $($TierConfig.TierName) Edition
+# Generated by Windows installer v$($script:ODS_VERSION) on $timestamp
+# Tier: $Tier ($($TierConfig.TierName))
+
+#=== Network Binding ===
+# 127.0.0.1 = localhost only (secure default)
+# 0.0.0.0   = accessible from LAN (install with -Lan or set manually)
+BIND_ADDRESS=$bindAddress
+# Docker Desktop containers reach loopback-only host services through this name.
+ODS_AGENT_HOST=$(Get-EnvOrNew "ODS_AGENT_HOST" "host.docker.internal")
+# The dashboard-api container must call the host agent over Docker Desktop's
+# host gateway. Bearer auth still protects every host-agent endpoint.
+ODS_AGENT_BIND=$(Get-EnvOrNew "ODS_AGENT_BIND" "0.0.0.0")
+# Docker Desktop presents host-owned lifecycle secrets through its root group.
+REMOTE_PROVIDER_DATA_GID=0
+
+#=== LLM Backend Mode ===
+ODS_MODE=$effectiveODSMode
+ODS_MODEL_SWITCHBOARD=$switchboardMode
+LLM_BACKEND=$llmBackend
+LLM_API_URL=$llmApiUrl
+OPEN_WEBUI_LLM_BASE_URL=$openWebuiLlmBaseUrl
+OPEN_WEBUI_LLM_API_KEY=$openWebuiLlmApiKey
+LLM_API_BASE_PATH=$llmApiBasePath
+AMD_INFERENCE_RUNTIME=$AmdInferenceRuntime
+AMD_INFERENCE_BACKEND=$AmdInferenceBackend
+AMD_INFERENCE_LOCATION=$AmdInferenceLocation
+AMD_INFERENCE_PORT=$(if ($windowsAmdHostInference) { $nativeInferencePort } else { $AmdInferencePort })
+AMD_INFERENCE_SUPPORTED_BACKENDS=$AmdInferenceSupportedBackends
+AMD_INFERENCE_RUNTIME_MODE=$AmdInferenceRuntimeMode
+AMD_INFERENCE_MANAGED=$AmdInferenceManaged
+$(if ($windowsAmdHostInference) { "# Native Windows llama-server, as seen from Windows and from containers." })
+$(if ($windowsAmdHostInference) { "ODS_HOST_LLM_TRANSPORT=direct" })
+$(if ($windowsAmdHostInference) { "NATIVE_LLM_BASE_URL=http://127.0.0.1:$nativeInferencePort" })
+$(if ($windowsAmdHostInference) { "NATIVE_LLM_CONTAINER_BASE_URL=http://host.docker.internal:$nativeInferencePort" })
+
+#=== Cloud API Keys ===
+ANTHROPIC_API_KEY=$(Get-EnvOrNew "ANTHROPIC_API_KEY" "")
+OPENAI_API_KEY=$(Get-EnvOrNew "OPENAI_API_KEY" "")
+TOGETHER_API_KEY=$(Get-EnvOrNew "TOGETHER_API_KEY" "")
+MINIMAX_API_KEY=$(Get-EnvOrNew "MINIMAX_API_KEY" "")
+
+#=== LLM Settings (llama-server) ===
+TIER=$Tier
+MODEL_PROFILE=$(Get-EnvOrNew "MODEL_PROFILE" "$(if ($TierConfig.ModelProfileRequested) { $TierConfig.ModelProfileRequested } else { "qwen" })")
+LLM_MODEL=$($TierConfig.LlmModel)
+GGUF_FILE=$($TierConfig.GgufFile)
+ODS_ACTIVE_MODEL_STORE=$preservedModelStore
+MAX_CONTEXT=$($TierConfig.MaxContext)
+CTX_SIZE=$($TierConfig.MaxContext)
+MODEL_RECOMMENDED_MODEL=$($TierConfig.LlmModel)
+MODEL_RECOMMENDED_GGUF=$($TierConfig.GgufFile)
+MODEL_RECOMMENDED_CONTEXT=$($TierConfig.MaxContext)
+MODEL_RECOMMENDATION_SOURCE=$recommendationSource
+MODEL_RECOMMENDATION_POLICY=$recommendationPolicy
+MODEL_RECOMMENDATION_CONFIDENCE=$recommendationConfidence
+MODEL_RECOMMENDATION_REASON=$recommendationReason
+MODEL_RECOMMENDED_ALTERNATIVES=$recommendationAlternatives
+MODEL_RUNTIME_PROFILE=$(if ($TierConfig.RuntimeProfile) { $TierConfig.RuntimeProfile } else { "" })
+MODEL_RUNTIME_PROFILE_LABEL=$(if ($TierConfig.RuntimeProfileLabel) { $TierConfig.RuntimeProfileLabel } else { "" })
+MODEL_RUNTIME_PROFILE_SOURCE=$(if ($TierConfig.RuntimeProfileSource) { $TierConfig.RuntimeProfileSource } else { "" })
+MODEL_PERFORMANCE_SOURCE=benchmark_required
+MODEL_PERFORMANCE_LABEL=$performanceLabel
+GPU_BACKEND=$GpuBackend
+SYSTEM_RAM_GB=$SystemRamGB
+N_GPU_LAYERS=$nGpuLayers
+$(if ($LlamaServerImage) { "LLAMA_SERVER_IMAGE=$LlamaServerImage" } else { "#LLAMA_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda-b11429@sha256:883915ea20a4b350e98f7284098f4d400c21e9b366e248d397cd42d90602a84c" })
+$(if ($llamaServerImageFallback) { "LLAMA_SERVER_IMAGE_FALLBACK=$llamaServerImageFallback" } else { "#LLAMA_SERVER_IMAGE_FALLBACK=ghcr.io/ggml-org/llama.cpp:server-cuda-b9014@sha256:fcf285820892e7ce3218379634e3590826fc697e8b6745b9392072462e355c4f" })
+$(if ($llamaServerMemoryLimit) { "LLAMA_SERVER_MEMORY_LIMIT=$llamaServerMemoryLimit" })
+#=== llama.cpp Runtime Tuning ===
+LLAMA_PARALLEL=$(Get-EnvOrNew "LLAMA_PARALLEL" "$(if ($TierConfig.LLAMA_PARALLEL) { $TierConfig.LLAMA_PARALLEL } else { "1" })")
+LLAMA_ARG_FLASH_ATTN=$(Get-EnvOrNew "LLAMA_ARG_FLASH_ATTN" "$(if ($TierConfig.LLAMA_ARG_FLASH_ATTN) { $TierConfig.LLAMA_ARG_FLASH_ATTN } else { "auto" })")
+LLAMA_ARG_CACHE_TYPE_K=$(Get-EnvOrNew "LLAMA_ARG_CACHE_TYPE_K" "$(if ($TierConfig.LLAMA_ARG_CACHE_TYPE_K) { $TierConfig.LLAMA_ARG_CACHE_TYPE_K } else { "f16" })")
+LLAMA_ARG_CACHE_TYPE_V=$(Get-EnvOrNew "LLAMA_ARG_CACHE_TYPE_V" "$(if ($TierConfig.LLAMA_ARG_CACHE_TYPE_V) { $TierConfig.LLAMA_ARG_CACHE_TYPE_V } else { "f16" })")
+# Optional MoE only. Example for 8-12GB VRAM: LLAMA_ARG_N_CPU_MOE=25
+$(if ($TierConfig.LLAMA_ARG_N_CPU_MOE) { "LLAMA_ARG_N_CPU_MOE=$($TierConfig.LLAMA_ARG_N_CPU_MOE)" })
+$(if ($TierConfig.LLAMA_ARG_NO_CACHE_PROMPT) { "LLAMA_ARG_NO_CACHE_PROMPT=$($TierConfig.LLAMA_ARG_NO_CACHE_PROMPT)" })
+$(if ($TierConfig.LLAMA_ARG_CHECKPOINT_EVERY_NT) { "LLAMA_ARG_CHECKPOINT_EVERY_NT=$($TierConfig.LLAMA_ARG_CHECKPOINT_EVERY_NT)" })
+$(if ($TierConfig.LLAMA_ARG_CTX_CHECKPOINTS) { "LLAMA_ARG_CTX_CHECKPOINTS=$($TierConfig.LLAMA_ARG_CTX_CHECKPOINTS)" })
+$(if ($TierConfig.LLAMA_ARG_CACHE_RAM) { "LLAMA_ARG_CACHE_RAM=$($TierConfig.LLAMA_ARG_CACHE_RAM)" })
+# NVIDIA/CPU llama.cpp images default to lossless n-gram speculation (ngram-mod).
+# LLAMA_SPEC_TYPE=none turns it off; unset keeps the default.
+$(if ($llamaSpecType) { "LLAMA_SPEC_TYPE=$llamaSpecType" })
+# Optional per-model MTP speculative decoding. Requires an MTP-capable GGUF and llama.cpp build.
+# LLAMA_ARG_SPEC_TYPE=draft-mtp
+# LLAMA_ARG_SPEC_DRAFT_N_MAX=3
+LLAMA_CPU_LIMIT=$llamaCpuLimit
+LLAMA_CPU_RESERVATION=$llamaCpuReservation
+
+#=== Bundled Service CPU Budgets ===
+TTS_CPU_LIMIT=$ttsCpuLimit
+TTS_CPU_RESERVATION=$ttsCpuReservation
+TTS_WORKERS=$ttsWorkers
+TTS_THREADS=$ttsThreads
+WHISPER_CPU_LIMIT=$whisperCpuLimit
+WHISPER_CPU_RESERVATION=$whisperCpuReservation
+HERMES_CPU_LIMIT=$hermesCpuLimit
+HERMES_CPU_RESERVATION=$hermesCpuReservation
+COMFYUI_CPU_LIMIT=$comfyuiCpuLimit
+COMFYUI_CPU_RESERVATION=$comfyuiCpuReservation
+
+#=== Ports ===
+DASHBOARD_PORT=$(Resolve-WindowsODSPort -Name "DASHBOARD_PORT" -DefaultPort 3001 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+DASHBOARD_REMOTE_PORT=$(Resolve-WindowsODSPort -Name "DASHBOARD_REMOTE_PORT" -DefaultPort 3011 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+DASHBOARD_API_PORT=$(Resolve-WindowsODSPort -Name "DASHBOARD_API_PORT" -DefaultPort 3002 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+PERPLEXICA_PORT=$(Resolve-WindowsODSPort -Name "PERPLEXICA_PORT" -DefaultPort 3004 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+EMBEDDINGS_PORT=$(Resolve-WindowsODSPort -Name "EMBEDDINGS_PORT" -DefaultPort 8090 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+SHIELD_PORT=$(Resolve-WindowsODSPort -Name "SHIELD_PORT" -DefaultPort 8085 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+TOKEN_SPY_PORT=$(Resolve-WindowsODSPort -Name "TOKEN_SPY_PORT" -DefaultPort 3005 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+COMFYUI_PORT=$(Resolve-WindowsODSPort -Name "COMFYUI_PORT" -DefaultPort 8188 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+APE_PORT=$(Resolve-WindowsODSPort -Name "APE_PORT" -DefaultPort 7890 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+OLLAMA_PORT=11434
+WEBUI_PORT=$webuiPort
+WHISPER_PORT=$whisperPort
+TTS_PORT=$(Resolve-WindowsODSPort -Name "TTS_PORT" -DefaultPort 8880 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+N8N_PORT=$(Resolve-WindowsODSPort -Name "N8N_PORT" -DefaultPort 5678 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+QDRANT_PORT=$(Resolve-WindowsODSPort -Name "QDRANT_PORT" -DefaultPort 6333 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+QDRANT_GRPC_PORT=$(Resolve-WindowsODSPort -Name "QDRANT_GRPC_PORT" -DefaultPort 6334 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+QDRANT_API_KEY=$qdrantApiKey
+LITELLM_PORT=$(Resolve-WindowsODSPort -Name "LITELLM_PORT" -DefaultPort 4000 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+SEARXNG_PORT=$(Resolve-WindowsODSPort -Name "SEARXNG_PORT" -DefaultPort 8888 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+
+#=== Hermes Agent ===
+HERMES_LLM_BASE_URL=$hermesLlmBaseUrl
+HERMES_LLM_API_KEY=$hermesLlmApiKey
+HERMES_LANGUAGE=en
+HERMES_REQUIRE_OWNER_CARD=$(Get-EnvOrNew "HERMES_REQUIRE_OWNER_CARD" $(if ($env:HERMES_REQUIRE_OWNER_CARD) { $env:HERMES_REQUIRE_OWNER_CARD } else { "false" }))
+HERMES_PROXY_PORT=$(Resolve-WindowsODSPort -Name "HERMES_PROXY_PORT" -DefaultPort 9120 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+HERMES_PROXY_UPSTREAM=ods-hermes:9119
+ODS_AUTH_UPSTREAM=ods-dashboard-api:3002
+
+#=== Security (auto-generated, keep secret!) ===
+WEBUI_SECRET=$webuiSecret
+DASHBOARD_API_KEY=$dashboardApiKey
+ODS_AGENT_KEY=$odsAgentKey
+ODS_SESSION_SECRET=$odsSessionSecret
+HERMES_DASHBOARD_SESSION_TOKEN=$hermesDashboardSessionToken
+SHIELD_API_KEY=$shieldApiKey
+N8N_USER=admin@ods.local
+N8N_PASS=$n8nPass
+LITELLM_KEY=$litellmKey
+$(if ($windowsAmdHostInference) { "LLAMA_SERVER_API_KEY=$llamaServerApiKey" })
+LIVEKIT_API_KEY=$livekitApiKey
+LIVEKIT_API_SECRET=$livekitSecret
+OPENCODE_SERVER_PASSWORD=$opencodePassword
+OPENCODE_PORT=$(Resolve-WindowsODSPort -Name "OPENCODE_PORT" -DefaultPort 3003 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+TOKEN_SPY_API_KEY=$tokenSpyApiKey
+SEARXNG_SECRET=$searxngSecret
+DIFY_SECRET_KEY=$difySecretKey
+
+#=== Voice Settings ===
+WHISPER_MODEL=base
+# Whisper STT runtime. Windows NVIDIA uses CUDA only when the driver supports
+# the bundled Speaches CUDA image; otherwise Whisper stays on the CPU image.
+WHISPER_ACCELERATION=$whisperAcceleration
+$(if ($whisperImage) { "WHISPER_IMAGE=$whisperImage" } else { "#WHISPER_IMAGE=ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu@sha256:2163775b6df5e451a71200e8f675fed68dbd8ab184fc604453d549e486f22fd2" })
+# Whisper STT model — CUDA uses the larger turbo model, CPU uses base.
+# Open WebUI reads this to request transcription; installer pre-downloads
+# the same model so the first transcription works.
+AUDIO_STT_MODEL=$audioSttModel
+TTS_VOICE=en_US-lessac-medium
+
+#=== Embeddings / RAG ===
+# Open WebUI uses this canonical model at every start unless an explicit
+# external-provider override is configured.
+EMBEDDING_MODEL=$embeddingModel
+RAG_EMBEDDING_MODEL=$ragEmbeddingModel
+RAG_OPENAI_API_BASE_URL=$ragOpenAiApiBaseUrl
+RAG_OPENAI_API_KEY=$ragOpenAiApiKey
+EMBEDDINGS_MEMORY_LIMIT=$embeddingsMemoryLimit
+
+#=== Web UI Settings ===
+# Loopback installs open directly. LAN installs require a login by default.
+WEBUI_AUTH=$webuiAuth
+ENABLE_WEB_SEARCH=$enableWebSearchValue
+WEB_SEARCH_ENGINE=searxng
+
+#=== n8n Settings ===
+N8N_HOST=localhost
+N8N_WEBHOOK_URL=http://localhost:5678
+TIMEZONE=$tz
+
+#=== Langfuse Observability ===
+LANGFUSE_PORT=$langfusePort
+LANGFUSE_ENABLED=$langfuseEnabled
+LANGFUSE_NEXTAUTH_SECRET=$langfuseNextauthSecret
+LANGFUSE_SALT=$langfuseSalt
+LANGFUSE_ENCRYPTION_KEY=$langfuseEncryptionKey
+LANGFUSE_DB_PASSWORD=$langfuseDbPassword
+LANGFUSE_CLICKHOUSE_PASSWORD=$langfuseClickhousePassword
+LANGFUSE_REDIS_PASSWORD=$langfuseRedisPassword
+LANGFUSE_MINIO_ACCESS_KEY=$langfuseMinioAccessKey
+LANGFUSE_MINIO_SECRET_KEY=$langfuseMinioSecretKey
+LANGFUSE_PROJECT_PUBLIC_KEY=$langfuseProjectPublicKey
+LANGFUSE_PROJECT_SECRET_KEY=$langfuseProjectSecretKey
+LANGFUSE_INIT_PROJECT_ID=$langfuseInitProjectId
+LANGFUSE_INIT_USER_EMAIL=$langfuseInitUserEmail
+LANGFUSE_INIT_USER_PASSWORD=$langfuseInitUserPassword
+"@
+
+    # NOTE: No VIDEO_GID, RENDER_GID, HSA_OVERRIDE_GFX_VERSION on Windows
+    # Those are Linux-only for AMD ROCm container device access
+
+    # The template above replaces .env; keep the owner's own settings.
+    $ownerLines = @(Get-ODSCarriedEnvLines -PreviousLines $previousEnvLines `
+        -NewContent $envContent -Keys $script:ODS_OWNER_ENV_KEYS)
+    if ($ownerLines.Count -gt 0) {
+        $nl = $(if ($envContent.Contains("`r`n")) { "`r`n" } else { "`n" })
+        $envContent += "$nl$nl#=== Owner settings (kept from the previous .env) ===$nl" + ($ownerLines -join $nl)
+    }
+
+    $envPath = Join-Path $InstallDir ".env"
+    if (Test-Path -LiteralPath $envPath -PathType Container) {
+        Remove-Item -LiteralPath $envPath -Recurse -Force
+        Write-AIWarn "Removed malformed .env directory from a previous partial install."
+    }
+    # The template above replaces .env; keep the owner's public URLs
+    # (docs/ODS-PROXY.md) as the Linux installer does.
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $publicUrlLines = @(Get-ODSPublicUrlEnvLines -NewContent $envContent `
+            -PreviousLines @(Get-Content -LiteralPath $envPath -Encoding UTF8))
+        if ($publicUrlLines.Count -gt 0) {
+            $nl = $(if ($envContent.Contains("`r`n")) { "`r`n" } else { "`n" })
+            $envContent += "$nl$nl#=== Public URLs (kept from the previous .env) ===$nl" + ($publicUrlLines -join $nl)
+        }
+    }
+    Write-ODSPrivateEnvFile -Path $envPath -Content $envContent
+
+    if ($effectiveODSMode -eq "local") {
+        $litellmDir = Join-Path (Join-Path $InstallDir "config") "litellm"
+        $localModel = $(if ($TierConfig.GgufFile) { $TierConfig.GgufFile } else { $TierConfig.LlmModel })
+        $localApiBase = "$llmApiUrl$llmApiBasePath"
+        # The native Windows llama-server requires its key; LiteLLM reads it
+        # from the environment, never from this file.
+        $localApiKey = $(if ($windowsAmdHostInference) { "os.environ/LLAMA_SERVER_API_KEY" } else { "sk-ods-hermes-local" })
+        $localConfig = @"
+model_list:
+  - model_name: default
+    litellm_params:
+      model: openai/$localModel
+      api_base: $localApiBase
+      api_key: $localApiKey
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+  - model_name: "*"
+    litellm_params:
+      model: openai/$localModel
+      api_base: $localApiBase
+      api_key: $localApiKey
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  request_timeout: 900
+  stream_timeout: 900
+"@
+        # ODS-CONTRACT-WRITER: litellm-local-native
+        Write-Utf8NoBom -Path (Join-Path $litellmDir "local.yaml") -Content $localConfig
+    }
+
+    $modelRouterDir = Join-Path (Join-Path $InstallDir "config") "model-router"
+    New-Item -ItemType Directory -Path $modelRouterDir -Force | Out-Null
+    function ConvertTo-RouterOrigin {
+        param([string]$Url, [string]$Fallback)
+        $value = if ([string]::IsNullOrWhiteSpace($Url)) { $Fallback } else { $Url.TrimEnd("/") }
+        if ($value.EndsWith("/api/v1", [StringComparison]::OrdinalIgnoreCase)) {
+            return $value.Substring(0, $value.Length - "/v1".Length)
+        }
+        if ($value.EndsWith("/v1", [StringComparison]::OrdinalIgnoreCase)) {
+            return $value.Substring(0, $value.Length - "/v1".Length)
+        }
+        return $value
+    }
+    # Origin only; the router appends /v1. The native Windows llama-server is
+    # http://host.docker.internal:<port> from containers.
+    $routerLlamaBase = ConvertTo-RouterOrigin -Url "$llmApiUrl$llmApiBasePath" -Fallback "http://llama-server:8080"
+    $routerEndpoints = @(
+        [ordered]@{ id = "llama-server-default"; baseUrl = $routerLlamaBase }
+    )
+    $routerPayload = [ordered]@{ endpoints = $routerEndpoints }
+    Write-Utf8NoBom -Path (Join-Path $modelRouterDir "endpoints.json") -Content (($routerPayload | ConvertTo-Json -Depth 6) + "`n")
+
+    return @{
+        SearxngSecret  = $searxngSecret
+    }
+}
+
+function Get-ODSPublicUrlEnvLines {
+    <# Return the owner's public-URL settings (docs/ODS-PROXY.md:
+       ODS_PUBLIC_URL, ODS_SERVICE_PUBLIC_URLS, <SERVICE>_PUBLIC_URL) from the
+       previous .env that the new content lacks, as Linux's
+       ods_carry_public_url_env_keys does: the last assignment of each key, in
+       first-seen order. #>
+    param(
+        [AllowEmptyCollection()][string[]]$PreviousLines,
+        [AllowEmptyString()][string]$NewContent
+    )
+    $order = [System.Collections.Generic.List[string]]::new()
+    $last = @{}
+    foreach ($line in $PreviousLines) {
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 0) { continue }
+        $key = $line.Substring(0, $eq).Trim()
+        if ($key -cnotmatch '^[A-Z][A-Z0-9_]*_PUBLIC_URLS?$') { continue }
+        if (-not $last.ContainsKey($key)) { $order.Add($key) }
+        $last[$key] = $key + $line.Substring($eq)
+    }
+    $carried = @()
+    foreach ($key in $order) {
+        if ($NewContent -cmatch ("(?m)^\s*" + [regex]::Escape($key) + "\s*=")) { continue }
+        $carried += $last[$key]
+    }
+    return $carried
+}
+
+function Get-SearxngDefaultLanguage {
+    <#
+    .SYNOPSIS
+        Map a culture name (en-US, de-DE, zh-Hant-TW) to a SearXNG locale tag.
+    .DESCRIPTION
+        Mirrors ods_searxng_default_lang in installers/lib/searxng-locale.sh.
+        SearXNG refuses to start when search.default_lang is not one of its
+        locale tags, so only listed tags are returned; anything else is "en".
+    #>
+    param([string]$Locale = (Get-Culture).Name)
+
+    # searxng/searxng:2026.9.25-12f8b6515@sha256:5286edb35782454ab8a102c5eff6b54bff745853191b46aeead95f225aa6dfb6 searx/sxng_locales.py
+    $tags = "af ar ar-SA bg bg-BG ca ca-ES cs cs-CZ cy da da-DK de de-AT de-BE de-CH de-DE el el-GR en en-AU en-CA en-GB en-HK en-IE en-IN en-NZ en-PH en-PK en-SG en-US en-ZA es es-AR es-CL es-CO es-ES es-MX es-PE es-VE et et-EE fa fi fi-FI fil fil-PH fr fr-BE fr-CA fr-CH fr-FR gl hi hi-IN hr hr-HR hu hu-HU id id-ID it it-CH it-IT ja ja-JP ko ko-KR lt lt-LT lv lv-LV mi mi-NZ nb nb-NO nl nl-BE nl-NL nn nn-NO pl pl-PL pt pt-BR pt-PT ro ro-RO ru ru-RU sk sk-SK sl sl-SI sq sv sv-FI sv-SE th th-TH tr tr-TR uk uk-UA vi vi-VN zh zh-CN zh-HK zh-TW" -split ' '
+
+    $raw = (("$Locale" -split '[.@]')[0]) -replace '_', '-'
+    $parts = @($raw -split '-' | Where-Object { $_ })
+    if ($parts.Count -eq 0) { return "en" }
+    $lang = $parts[0].ToLowerInvariant()
+    if ($lang -cnotmatch '^[a-z]{2,3}$') { return "en" }
+    $region = $parts | Select-Object -Skip 1 | Where-Object { $_ -match '^[A-Za-z]{2}$' } | Select-Object -First 1
+    if ($region) {
+        $tag = "$lang-$($region.ToUpperInvariant())"
+        if ($tags -ccontains $tag) { return $tag }
+    }
+    if ($tags -ccontains $lang) { return $lang }
+    return "en"
+}
+
+function New-SearxngConfig {
+    <#
+    .SYNOPSIS
+        Generate SearXNG settings.yml with randomized secret key.
+    #>
+    param(
+        [string]$InstallDir,
+        [string]$SecretKey,
+        [string]$SearchLanguage = (Get-SearxngDefaultLanguage)
+    )
+
+    $configDir = Join-Path (Join-Path $InstallDir "config") "searxng"
+    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+
+    # Seznam stays the general-web fallback for when major engines refuse the
+    # household IP; keep its Czech-market .cz shops out unless the owner is
+    # Czech. Mirrors ods_searxng_hostnames_yaml in installers/lib/searxng-locale.sh.
+    $hostnames = ""
+    if (($SearchLanguage -split '-')[0] -ne "cs") {
+        $hostnames = @'
+hostnames:
+  # Seznam (below) is a Czech-market fallback; keep its .cz shops out of
+  # results unless the install locale is Czech.
+  remove:
+    - '\.cz$'
+'@
+    }
+
+    $config = @"
+use_default_settings: true
+server:
+  secret_key: "$SecretKey"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+search:
+  safe_search: 0
+  # Install locale. API clients send no language, so "auto" would mean "all".
+  default_lang: "$SearchLanguage"
+  formats:
+    - html
+    - json
+$hostnames
+engines:
+  - name: bing
+    # Fallback when other general engines are blocked (CAPTCHA/429/access denied).
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: google
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: seznam
+    # Independent general-web fallback when major engines block this household IP.
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: github
+    disabled: false
+  - name: stackoverflow
+    disabled: false
+"@
+
+    $settingsPath = Join-Path $configDir "settings.yml"
+    Write-Utf8NoBom -Path $settingsPath -Content $config
+    return $settingsPath
+}
+
+function Set-PerplexicaConfig {
+    <#
+    .SYNOPSIS
+        Auto-configure Perplexica to use the local llama-server on first boot.
+        Seeds the chat model and embedding model, then marks setup complete
+        so the wizard is bypassed. Mirrors installers/phases/12-health.sh logic.
+    .PARAMETER PerplexicaPort
+        Port where Perplexica is running (default 3004).
+    .PARAMETER LlmModel
+        Served model id to configure as the default chat model.
+    .PARAMETER LlmBaseUrl
+        OpenAI-compatible base URL as seen from the Perplexica container.
+    .PARAMETER ApiKey
+        API key for the configured provider.
+    #>
+    param(
+        [int]$PerplexicaPort = 3004,
+        [string]$LlmModel,
+        [string]$LlmBaseUrl = "http://llama-server:8080/v1",
+        [string]$ApiKey = "no-key"
+    )
+
+    $baseUrl = "http://localhost:$PerplexicaPort"
+    if ([string]::IsNullOrWhiteSpace($LlmModel)) { $LlmModel = "default" }
+    if ([string]::IsNullOrWhiteSpace($LlmBaseUrl)) { $LlmBaseUrl = "http://llama-server:8080/v1" }
+    $LlmBaseUrl = $LlmBaseUrl.TrimEnd("/")
+    if (-not ($LlmBaseUrl.EndsWith("/v1") -or $LlmBaseUrl.EndsWith("/api/v1"))) {
+        $LlmBaseUrl = "$LlmBaseUrl/v1"
+    }
+    if ([string]::IsNullOrWhiteSpace($ApiKey)) { $ApiKey = "no-key" }
+
+    function Set-PerplexicaObjectProperty {
+        param($Target, [string]$Name, $Value)
+        $property = $Target.PSObject.Properties[$Name]
+        if ($property) {
+            $property.Value = $Value
+        } else {
+            $Target | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+        }
+    }
+
+    function Post-Json {
+        param([string]$Uri, $Value)
+        $body = $Value | ConvertTo-Json -Depth 10 -Compress
+        $utf8Bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $req = [System.Net.HttpWebRequest]::Create($Uri)
+        $req.Method = "POST"
+        $req.ContentType = "application/json"
+        $req.Timeout = 5000
+        $stream = $req.GetRequestStream()
+        $stream.Write($utf8Bytes, 0, $utf8Bytes.Length)
+        $stream.Close()
+        $resp = $req.GetResponse()
+        $resp.Close()
+    }
+
+    # Helper: POST a key/value pair to the config API.
+    function Post-ConfigValue {
+        param([string]$Key, $Value)
+        Post-Json -Uri "$baseUrl/api/config" -Value @{ key = $Key; value = $Value }
+    }
+
+    function Mark-SetupComplete {
+        try {
+            Post-Json -Uri "$baseUrl/api/config/setup-complete" -Value @{}
+        } catch {
+            Post-ConfigValue -Key "setupComplete" -Value $true
+        }
+    }
+
+    function Test-PerplexicaConfigReady {
+        param($Config)
+        if (-not $Config.setupComplete) { return $false }
+        $providers = @($Config.modelProviders)
+        $openaiProv = $providers | Where-Object { $_.type -eq "openai" } | Select-Object -First 1
+        if (-not $openaiProv) { return $false }
+        $chatModels = @($openaiProv.chatModels)
+        $hasModel = $false
+        foreach ($model in $chatModels) {
+            if ($model.key -eq $LlmModel -or $model.name -eq $LlmModel) {
+                $hasModel = $true
+                break
+            }
+        }
+        if (-not $hasModel) { return $false }
+        if (-not $Config.preferences) { return $false }
+        return ($Config.preferences.defaultChatModel -eq $LlmModel -and
+            $Config.preferences.defaultChatProvider -eq $openaiProv.id -and
+            $openaiProv.config.baseURL -eq $LlmBaseUrl -and
+            $openaiProv.config.apiKey -eq $ApiKey)
+    }
+
+    try {
+        # GET current config using HttpWebRequest (avoids PS 5.1 credential dialog)
+        $req = [System.Net.HttpWebRequest]::Create("$baseUrl/api/config")
+        $req.Method = "GET"
+        $req.Timeout = 5000
+        $httpResp = $req.GetResponse()
+        $reader = New-Object System.IO.StreamReader($httpResp.GetResponseStream())
+        $respBody = $reader.ReadToEnd()
+        $reader.Close()
+        $httpResp.Close()
+        $config = ($respBody | ConvertFrom-Json).values
+
+        if (Test-PerplexicaConfigReady -Config $config) { return $true }
+
+        $providers = @($config.modelProviders)
+        $openaiProv = $providers | Where-Object { $_.type -eq "openai" } | Select-Object -First 1
+        $transformersProv = $providers | Where-Object { $_.type -eq "transformers" } | Select-Object -First 1
+
+        if (-not $openaiProv) { return $false }
+
+        # Seed the chat model into the OpenAI provider and set provider auth/config.
+        Set-PerplexicaObjectProperty -Target $openaiProv -Name "chatModels" -Value @(@{ key = $LlmModel; name = $LlmModel })
+        if (-not $openaiProv.PSObject.Properties["config"] -or $null -eq $openaiProv.config) {
+            Set-PerplexicaObjectProperty -Target $openaiProv -Name "config" -Value ([pscustomobject]@{})
+        }
+        Set-PerplexicaObjectProperty -Target $openaiProv.config -Name "apiKey" -Value $ApiKey
+        Set-PerplexicaObjectProperty -Target $openaiProv.config -Name "baseURL" -Value $LlmBaseUrl
+        # GET /api/config includes Vane's built-in catalog. Persist only the
+        # OpenAI route fields so each install cannot duplicate embedding models.
+        $openaiIndex = -1
+        for ($i = 0; $i -lt $providers.Count; $i++) {
+            if ($providers[$i].id -eq $openaiProv.id) { $openaiIndex = $i; break }
+        }
+        if ($openaiIndex -lt 0) { return $false }
+        Post-ConfigValue -Key "modelProviders.$openaiIndex.chatModels" -Value @(@{ key = $LlmModel; name = $LlmModel })
+        Post-ConfigValue -Key "modelProviders.$openaiIndex.config.baseURL" -Value $LlmBaseUrl
+        Post-ConfigValue -Key "modelProviders.$openaiIndex.config.apiKey" -Value $ApiKey
+
+        # Keep owner-selected embedding and other preferences on retained installs.
+        $preferences = $config.preferences
+        if ($null -eq $preferences) { $preferences = [pscustomobject]@{} }
+        Set-PerplexicaObjectProperty -Target $preferences -Name "defaultChatProvider" -Value $openaiProv.id
+        Set-PerplexicaObjectProperty -Target $preferences -Name "defaultChatModel" -Value $LlmModel
+        if ([string]::IsNullOrWhiteSpace([string]$preferences.defaultEmbeddingProvider) -and
+            [string]::IsNullOrWhiteSpace([string]$preferences.defaultEmbeddingModel) -and $transformersProv) {
+            $localEmbedding = @($transformersProv.embeddingModels) |
+                Where-Object { $_.key -eq "Xenova/all-MiniLM-L6-v2" } | Select-Object -First 1
+            if ($localEmbedding) {
+                Set-PerplexicaObjectProperty -Target $preferences -Name "defaultEmbeddingProvider" -Value $transformersProv.id
+                Set-PerplexicaObjectProperty -Target $preferences -Name "defaultEmbeddingModel" -Value "Xenova/all-MiniLM-L6-v2"
+            }
+        }
+        Post-ConfigValue -Key "preferences" -Value $preferences
+
+        # Mark setup complete to bypass wizard
+        Mark-SetupComplete
+
+        return $true
+    } catch {
+        return $false
+    }
+}

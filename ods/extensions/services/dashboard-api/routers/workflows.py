@@ -1,0 +1,400 @@
+"""Workflow management endpoints â€” n8n integration."""
+
+import asyncio
+import json
+import logging
+import re
+import sys
+
+if sys.version_info >= (3, 11):
+    from asyncio import timeout as _async_timeout
+else:  # Python 3.10 standalone deployments
+    from async_timeout import timeout as _async_timeout
+
+import aiohttp
+from fastapi import APIRouter, Depends, HTTPException
+
+from config import (
+    SERVICES, WORKFLOW_DIR, WORKFLOW_CATALOG_FILE,
+    DEFAULT_WORKFLOW_CATALOG, N8N_URL, read_live_env_value,
+)
+from security import verify_api_key
+
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["workflows"])
+_WORKFLOW_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+# --- Helpers ---
+
+def _validate_workflow_id(workflow_id: str) -> None:
+    if not _WORKFLOW_ID_RE.fullmatch(workflow_id):
+        raise HTTPException(status_code=400, detail="Invalid workflow ID format")
+
+
+def _n8n_headers() -> dict[str, str]:
+    """n8n API auth headers from the mounted .env.
+
+    Compose does not pass N8N_API_KEY to dashboard-api, and the key is created
+    in n8n after install, so read it live rather than at process start.
+    """
+    api_key = read_live_env_value("N8N_API_KEY")
+    return {"X-N8N-API-KEY": api_key} if api_key else {}
+
+
+def load_workflow_catalog() -> dict:
+    """Load workflow catalog from JSON file."""
+    if not WORKFLOW_CATALOG_FILE.exists():
+        return DEFAULT_WORKFLOW_CATALOG
+    try:
+        with open(WORKFLOW_CATALOG_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logger.warning("Workflow catalog must be a JSON object: %s", WORKFLOW_CATALOG_FILE)
+            return DEFAULT_WORKFLOW_CATALOG
+        workflows = data.get("workflows", [])
+        categories = data.get("categories", {})
+        if not isinstance(workflows, list):
+            workflows = []
+        if not isinstance(categories, dict):
+            categories = {}
+        return {"workflows": workflows, "categories": categories}
+    except (json.JSONDecodeError, OSError, KeyError) as e:
+        logger.warning("Failed to load workflow catalog from %s: %s", WORKFLOW_CATALOG_FILE, e)
+        return DEFAULT_WORKFLOW_CATALOG
+
+
+def _n8n_data_items(data: object) -> list[dict]:
+    """Accept only a complete n8n list envelope before exposing its rows."""
+    if not isinstance(data, dict):
+        raise ValueError("n8n list response must be a JSON object")
+    items = data.get("data")
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("n8n list response data must be an array of objects")
+    return items
+
+
+async def _read_workflow_pages(session, headers: dict) -> list[dict] | None:
+    workflows = []
+    params: dict[str, str] = {}
+    seen_cursors = set()
+    while True:
+        async with session.get(f"{N8N_URL}/api/v1/workflows", headers=headers, params=params) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+            else:
+                # Unavailable inventory must not look like zero installed workflows.
+                if resp.status in (401, 403):
+                    logger.warning(
+                        "n8n rejected the workflow listing (HTTP %s): %s. The n8n "
+                        "public API requires an API key â€” create one in n8n "
+                        "(Settings > n8n API) and set N8N_API_KEY in .env.",
+                        resp.status,
+                        "N8N_API_KEY is not set"
+                        if not headers
+                        else "the configured N8N_API_KEY was refused",
+                    )
+                else:
+                    logger.warning(
+                        "n8n returned HTTP %s for %s/api/v1/workflows",
+                        resp.status,
+                        N8N_URL,
+                    )
+                return None
+        workflows.extend(_n8n_data_items(data))
+        cursor = data.get("nextCursor")
+        if cursor is None or cursor == "":
+            return workflows
+        if not isinstance(cursor, str) or cursor in seen_cursors:
+            raise HTTPException(status_code=502, detail="n8n returned an invalid or repeated workflow cursor")
+        seen_cursors.add(cursor)
+        params = {"cursor": cursor}
+
+
+async def get_n8n_workflows() -> list[dict] | None:
+    """Get the complete inventory with a deadline shared by every page.
+
+    Returns None when the inventory could not be read completely (transport
+    error, timeout, malformed envelope, or any non-200 page). Returns [] only
+    for a genuinely empty, fully-read inventory.
+    """
+    try:
+        headers = _n8n_headers()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with _async_timeout(5):
+                return await _read_workflow_pages(session, headers)
+    except (aiohttp.ClientError, OSError, asyncio.TimeoutError, ValueError) as e:
+        logger.warning(f"Failed to fetch workflows from n8n: {e}")
+    return None
+
+
+def _installed_n8n_workflows(catalog_name: str, n8n_workflows: list[dict]) -> list[dict]:
+    """n8n workflows imported from a catalog entry: the same name, ignoring case.
+
+    Templates are imported under their catalog name. A partial match would
+    also select the owner's own workflows, such as an n8n duplicate named
+    "Daily Digest copy", and removing a catalog workflow deletes what it selects.
+    """
+    wanted = catalog_name.casefold()
+    return [wf for wf in n8n_workflows if str(wf.get("name") or "").casefold() == wanted]
+
+
+async def check_workflow_dependencies(deps: list[str], health_cache: dict[str, bool] | None = None) -> dict[str, bool]:
+    """Check if required services are running. Uses health_cache to avoid duplicate checks."""
+    from helpers import check_service_health
+
+    _DEP_ALIASES = {"ollama": "llama-server"}
+    if health_cache is None:
+        health_cache = {}
+    results = {}
+    for dep in deps:
+        resolved = _DEP_ALIASES.get(dep, dep)
+        if resolved in health_cache:
+            results[dep] = health_cache[resolved]
+        elif resolved in SERVICES:
+            status = await check_service_health(resolved, SERVICES[resolved])
+            healthy = status.status == "healthy"
+            health_cache[resolved] = healthy
+            results[dep] = healthy
+        else:
+            # An undeclared/uninstalled service has no health evidence.
+            # Keep the catalog and enable prerequisite unavailable.
+            results[dep] = False
+    return results
+
+
+async def check_n8n_available() -> bool:
+    """Check if n8n is responding."""
+    try:
+        from helpers import _get_aio_session
+        session = await _get_aio_session()
+        async with session.get(f"{N8N_URL}/healthz") as resp:
+            return resp.status < 500
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return False
+
+
+# --- Endpoints ---
+
+@router.get("/api/workflows/categories")
+async def api_workflow_categories(api_key: str = Depends(verify_api_key)):
+    """Return workflow categories from the catalog."""
+    catalog = load_workflow_catalog()
+    return {"categories": catalog.get("categories", {})}
+
+
+@router.get("/api/workflows/n8n/status")
+async def api_n8n_status(api_key: str = Depends(verify_api_key)):
+    """Check n8n availability and return basic status."""
+    available = await check_n8n_available()
+    return {"available": available, "url": N8N_URL}
+
+
+@router.get("/api/workflows")
+async def api_workflows(api_key: str = Depends(verify_api_key)):
+    """Get workflow catalog with status and dependency info."""
+    catalog = load_workflow_catalog()
+    n8n_workflows = await get_n8n_workflows()
+    inventory_complete = n8n_workflows is not None
+    n8n_workflows = n8n_workflows or []
+
+    workflows = []
+    health_cache: dict[str, bool] = {}
+    for wf in catalog.get("workflows", []):
+        matches = _installed_n8n_workflows(wf["name"], n8n_workflows)
+        installed = matches[0] if matches else None
+
+        dep_status = await check_workflow_dependencies(wf.get("dependencies", []), health_cache)
+        all_deps_met = all(dep_status.values())
+
+        executions = 0
+        if installed:
+            executions = installed.get("statistics", {}).get("executions", {}).get("total", 0)
+
+        workflows.append({
+            "id": wf["id"],
+            "name": wf["name"],
+            "description": wf["description"],
+            "icon": wf.get("icon", "Workflow"),
+            "category": wf.get("category", "general"),
+            "status": "active" if installed and installed.get("active") else ("installed" if installed else "available"),
+            "installed": installed is not None,
+            "active": installed.get("active", False) if installed else False,
+            "n8nId": installed.get("id") if installed else None,
+            "dependencies": wf.get("dependencies", []),
+            "dependencyStatus": dep_status,
+            "allDependenciesMet": all_deps_met,
+            "diagram": wf.get("diagram", {}),
+            "setupTime": wf.get("setupTime", "~2 min"),
+            "executions": executions,
+            "featured": wf.get("featured", False)
+        })
+
+    return {
+        "workflows": workflows,
+        "categories": catalog.get("categories", {}),
+        "catalogSource": str(WORKFLOW_CATALOG_FILE),
+        "workflowDir": str(WORKFLOW_DIR),
+        "n8nUrl": N8N_URL,
+        # Health alone cannot prove the workflow inventory was read.
+        "n8nAvailable": inventory_complete and (
+            len(n8n_workflows) > 0 or await check_n8n_available()
+        ),
+        "n8nInventoryComplete": inventory_complete,
+    }
+
+
+@router.post("/api/workflows/{workflow_id}/enable")
+async def enable_workflow(workflow_id: str, api_key: str = Depends(verify_api_key)):
+    """Import a workflow template into n8n."""
+    _validate_workflow_id(workflow_id)
+
+    catalog = load_workflow_catalog()
+    wf_info = next((wf for wf in catalog.get("workflows", []) if wf["id"] == workflow_id), None)
+    if not wf_info:
+        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+    dep_status = await check_workflow_dependencies(wf_info.get("dependencies", []))
+    missing_deps = [dep for dep, ok in dep_status.items() if not ok]
+    if missing_deps:
+        raise HTTPException(status_code=400, detail=f"Missing dependencies: {', '.join(missing_deps)}. Enable these services first.")
+
+    workflow_file = WORKFLOW_DIR / wf_info["file"]
+    try:
+        workflow_file = workflow_file.resolve()
+        if not workflow_file.is_relative_to(WORKFLOW_DIR.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid workflow file path")
+    except HTTPException:
+        raise
+    except (OSError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid workflow file path")
+
+    if not workflow_file.exists():
+        raise HTTPException(status_code=404, detail=f"Workflow file not found: {wf_info['file']}")
+
+    try:
+        with open(workflow_file) as f:
+            workflow_data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read workflow: {e}")
+
+    # Public create accepts workflow content, not export-only/read-only fields
+    # such as active, meta and tags present in the bundled templates.
+    workflow_data = {key: value for key, value in workflow_data.items() if key in (
+        "name", "nodes", "connections", "settings", "staticData", "pinData",
+        "nodeGroups", "projectId", "parentFolderId", "shared",
+    )}
+    try:
+        headers = {"Content-Type": "application/json", **_n8n_headers()}
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(f"{N8N_URL}/api/v1/workflows", headers=headers, json=workflow_data) as resp:
+                if resp.status in (200, 201):
+                    try:
+                        result = await resp.json()
+                    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+                        raise HTTPException(status_code=502, detail="n8n accepted the workflow import but its response was unavailable. Check n8n before importing again.")
+                    n8n_id = result.get("id") if isinstance(result, dict) else None
+                    if not isinstance(n8n_id, str) or not _WORKFLOW_ID_RE.fullmatch(n8n_id):
+                        raise HTTPException(status_code=502, detail="n8n imported the workflow but returned no valid ID. Check n8n before importing again.")
+                    activated = False
+                    try:
+                        async with session.post(f"{N8N_URL}/api/v1/workflows/{n8n_id}/activate", headers=headers, json={}) as activate_resp:
+                            if activate_resp.status == 200:
+                                activation = await activate_resp.json()
+                                activated = isinstance(activation, dict) and activation.get("active") is True
+                    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+                        # Import already committed. Preserve its ID even when
+                        # activation's outcome is unavailable, avoiding a retry
+                        # that would create a second copy of the workflow.
+                        logger.warning("Workflow %s imported; n8n activation was not confirmed", n8n_id)
+                    message = (f"{wf_info['name']} is now active!" if activated else
+                               f"{wf_info['name']} was imported, but activation was not confirmed. Open workflow {n8n_id} in n8n to check and activate it before importing again.")
+                    return {"status": "success", "workflowId": workflow_id, "n8nId": n8n_id, "activated": activated, "message": message}
+                else:
+                    error_text = await resp.text()
+                    raise HTTPException(status_code=resp.status, detail=f"n8n API error: {error_text}")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="n8n workflow add timed out")
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=503, detail=f"Cannot reach n8n: {e}")
+
+
+async def _remove_workflow(workflow_id: str):
+    """Shared logic for disabling/removing a workflow from n8n."""
+    catalog = load_workflow_catalog()
+    wf_info = next((wf for wf in catalog.get("workflows", []) if wf["id"] == workflow_id), None)
+    if not wf_info:
+        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+    n8n_workflows = await get_n8n_workflows()
+    if n8n_workflows is None:
+        raise HTTPException(status_code=503, detail="n8n workflow inventory is unavailable; cannot confirm the workflow is installed")
+    matches = _installed_n8n_workflows(wf_info["name"], n8n_workflows)
+    if not matches:
+        raise HTTPException(status_code=404, detail="Workflow not installed in n8n")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Several n8n workflows are named {wf_info['name']}. Remove the one you do not want in n8n.",
+        )
+    n8n_wf = matches[0]
+
+    try:
+        headers = _n8n_headers()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.delete(f"{N8N_URL}/api/v1/workflows/{n8n_wf['id']}", headers=headers) as resp:
+                if resp.status in (200, 204):
+                    return {"status": "success", "workflowId": workflow_id, "message": f"{wf_info['name']} has been removed"}
+                else:
+                    error_text = await resp.text()
+                    raise HTTPException(status_code=resp.status, detail=f"n8n API error: {error_text}")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="n8n workflow remove timed out")
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=503, detail=f"Cannot reach n8n: {e}")
+
+
+@router.post("/api/workflows/{workflow_id}/disable")
+async def disable_workflow_post(workflow_id: str, api_key: str = Depends(verify_api_key)):
+    """Remove a workflow from n8n (POST /disable)."""
+    _validate_workflow_id(workflow_id)
+    return await _remove_workflow(workflow_id)
+
+
+@router.delete("/api/workflows/{workflow_id}")
+async def disable_workflow(workflow_id: str, api_key: str = Depends(verify_api_key)):
+    """Remove a workflow from n8n (DELETE)."""
+    _validate_workflow_id(workflow_id)
+    return await _remove_workflow(workflow_id)
+
+
+@router.get("/api/workflows/{workflow_id}/executions")
+async def workflow_executions(workflow_id: str, limit: int = 20, api_key: str = Depends(verify_api_key)):
+    """Get recent executions for a workflow."""
+    _validate_workflow_id(workflow_id)
+    catalog = load_workflow_catalog()
+    wf_info = next((wf for wf in catalog.get("workflows", []) if wf["id"] == workflow_id), None)
+    if not wf_info:
+        raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
+
+    n8n_workflows = await get_n8n_workflows()
+    if n8n_workflows is None:
+        return {"executions": [], "error": "n8n workflow inventory is unavailable"}
+    matches = _installed_n8n_workflows(wf_info["name"], n8n_workflows)
+    if not matches:
+        return {"executions": [], "message": "Workflow not installed"}
+    n8n_wf = matches[0]
+
+    try:
+        headers = _n8n_headers()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(f"{N8N_URL}/api/v1/executions", headers=headers, params={"workflowId": n8n_wf["id"], "limit": limit}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {"workflowId": workflow_id, "n8nId": n8n_wf["id"], "executions": _n8n_data_items(data)}
+                else:
+                    return {"executions": [], "error": "Failed to fetch executions"}
+    except (aiohttp.ClientError, OSError, asyncio.TimeoutError, ValueError):
+        logger.exception("Failed to fetch workflow executions")
+        return {"executions": [], "error": "Failed to fetch executions"}

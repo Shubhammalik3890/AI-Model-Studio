@@ -1,0 +1,196 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import ServiceMap, { buildTopology } from './ServiceMap'
+
+afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+it('does not append a zero to status for services without a port', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ok:true,json:async () => ({
+    services: [{id:'router',name:'Model router',status:'healthy',port:0}],
+  })}))
+  render(<ServiceMap compact />)
+  const row = await screen.findByRole('button', {name:/Model router/})
+  expect(row).toBeVisible()
+  expect(row.querySelector('.integration-status')).toHaveTextContent(/^healthy$/)
+  expect(screen.queryByText('healthy0')).not.toBeInTheDocument()
+})
+
+it('fits the map initially, offers actual size, and opens details by keyboard', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => statusPayload }))
+  render(<ServiceMap />)
+  const zoom = await screen.findByRole('button', { name: 'Actual size' })
+  const region = screen.getByRole('region', { name: 'Service topology' })
+  expect(region.querySelector('svg')).toHaveAttribute('width', '100%')
+  fireEvent.click(zoom)
+  expect(region.querySelector('svg').getAttribute('width')).not.toBe('100%')
+  fireEvent.click(screen.getByRole('button', { name: 'Fit to panel' }))
+  expect(region.querySelector('svg')).toHaveAttribute('width', '100%')
+  fireEvent.keyDown(screen.getByRole('button', { name: 'APE (Agent Policy Engine): healthy' }), { key: 'Enter' })
+  expect(screen.getByRole('button', { name: 'Close service details' })).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Close service details' }))
+  expect(screen.queryByRole('button', { name: 'Close service details' })).toBeNull()
+})
+
+it('re-checks the ODS session before opening Hermes from its details', async () => {
+  vi.stubGlobal('fetch', vi.fn(async url => url === '/api/auth/verify-session'
+    ? {ok:false,status:401}
+    : {ok:true,json:async () => ({services:[{id:'hermes-proxy',name:'Hermes Auth Proxy',status:'healthy',port:9120,ui_path:'/auth/ods'}]})}))
+  const tab = {opener:window,closed:false,location:{replace:vi.fn()}}
+  const open = vi.spyOn(window, 'open').mockReturnValue(tab)
+  render(<ServiceMap compact />)
+  fireEvent.click(await screen.findByRole('button',{name:/Hermes Auth Proxy/}))
+  expect(fireEvent.click(screen.getByRole('link',{name:'Open service'}))).toBe(false)
+  expect(open).toHaveBeenCalledWith('', '_blank')
+  await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith('http://localhost:9120/auth/ods'))
+  expect(fetch).toHaveBeenCalledWith('/api/auth/admin-session', expect.objectContaining({method:'POST'}))
+  open.mockRestore()
+})
+
+it('starts with readable service rows in a panel and keeps the full map accessible', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ok:true,json:async () => statusPayload}))
+  render(<ServiceMap compact />)
+  await screen.findByRole('button',{name:'View map'})
+  expect(screen.queryByRole('region',{name:'Service topology'})).toBeNull()
+  fireEvent.click(screen.getByRole('button',{name:/APE/}))
+  expect(screen.getByRole('button',{name:'Close service details'})).toBeVisible()
+  fireEvent.click(screen.getByRole('button',{name:'View map'}))
+  expect(screen.getByRole('region',{name:'Service topology'})).toBeVisible()
+  fireEvent.click(screen.getByRole('button',{name:'Service list'}))
+  expect(screen.getByRole('button',{name:'View map'})).toBeVisible()
+})
+
+const statusPayload = {
+  services: [
+    { id: 'ape', name: 'APE (Agent Policy Engine)', status: 'healthy', port: 7890, uptime: 120 },
+    { id: 'comfyui', name: 'ComfyUI (Image Generation)', status: 'healthy', port: 8188, uptime: 120 },
+    { id: 'dashboard', name: 'Dashboard (Control Center)', status: 'healthy', port: 3001, uptime: 120 },
+    { id: 'dashboard-api', name: 'Dashboard API (System Status)', status: 'healthy', port: 3002, uptime: 120 },
+    { id: 'embeddings', name: 'TEI (Embeddings)', status: 'healthy', port: 8090, uptime: 120 },
+    { id: 'langfuse', name: 'Langfuse (LLM Observability)', status: 'healthy', port: 3007, uptime: 120 },
+    { id: 'llama-server', name: 'llama-server (LLM Inference)', status: 'healthy', port: 11434, uptime: 120 },
+    { id: 'litellm', name: 'LiteLLM (API Gateway)', status: 'healthy', port: 4000, uptime: 120 },
+    { id: 'n8n', name: 'n8n (Workflows)', status: 'healthy', port: 5678, uptime: 120 },
+    { id: 'open-webui', name: 'Open WebUI (Chat)', status: 'healthy', port: 3000, uptime: 120 },
+    { id: 'opencode', name: 'OpenCode (IDE)', status: 'healthy', port: 3003, uptime: 120 },
+    { id: 'perplexica', name: 'Perplexica (Deep Research)', status: 'healthy', port: 3004, uptime: 120 },
+    { id: 'privacy-shield', name: 'Privacy Shield (PII Protection)', status: 'healthy', port: 8085, uptime: 120 },
+    { id: 'qdrant', name: 'Qdrant (Vector DB)', status: 'healthy', port: 6333, uptime: 120 },
+    { id: 'searxng', name: 'SearXNG (Web Search)', status: 'healthy', port: 8888, uptime: 120 },
+    { id: 'token-spy', name: 'Token Spy (Usage Monitor)', status: 'healthy', port: 3005, uptime: 120 },
+    { id: 'tts', name: 'Kokoro (TTS)', status: 'healthy', port: 8880, uptime: 120 },
+    { id: 'whisper', name: 'Whisper (STT)', status: 'healthy', port: 9000, uptime: 120 },
+  ],
+}
+
+it('filters the compact list and renders a panel-sized map with inline details', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ok:true,json:async () => statusPayload}))
+  render(<ServiceMap compact />)
+  await screen.findByRole('searchbox', { name: 'Search integrations' })
+  fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'llama' } })
+  expect(screen.queryByRole('button', { name: /APE/ })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: /llama-server/ }))
+  expect(screen.getByRole('button', { name: 'Close service details' }).closest('.integration-detail')).not.toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'View map' }))
+  expect(screen.getByRole('region', { name: 'Service topology' }).querySelector('svg').getAttribute('viewBox').split(' ')[2]).toBe('418')
+  fireEvent.click(screen.getByRole('combobox', { name: 'Service status' }))
+  fireEvent.click(screen.getByRole('option', { name: 'Not healthy' }))
+  expect(screen.getByText('No matching services.')).toBeVisible()
+})
+
+const expectedIds = [
+  'ape',
+  'comfyui',
+  'dashboard',
+  'dashboard-api',
+  'embeddings',
+  'langfuse',
+  'llama-server',
+  'litellm',
+  'n8n',
+  'open-webui',
+  'opencode',
+  'perplexica',
+  'privacy-shield',
+  'qdrant',
+  'searxng',
+  'token-spy',
+  'tts',
+  'whisper',
+]
+
+const expectedCategories = {
+  'llama-server': 'core',
+  qdrant: 'core',
+  searxng: 'core',
+  embeddings: 'core',
+  whisper: 'core',
+  tts: 'core',
+  litellm: 'middleware',
+  'dashboard-api': 'middleware',
+  'token-spy': 'middleware',
+  'privacy-shield': 'middleware',
+  langfuse: 'middleware',
+  ape: 'middleware',
+  'open-webui': 'user-facing',
+  perplexica: 'user-facing',
+  n8n: 'user-facing',
+  dashboard: 'user-facing',
+  comfyui: 'user-facing',
+  opencode: 'user-facing',
+}
+
+const expectedEdges = [
+  ['open-webui', 'litellm', 'LLM proxy'],
+  ['litellm', 'llama-server', 'inference'],
+  ['perplexica', 'searxng', 'search'],
+  ['perplexica', 'litellm', 'LLM proxy'],
+  ['n8n', 'litellm', 'LLM proxy'],
+  ['n8n', 'qdrant', 'vector store'],
+  ['litellm', 'langfuse', 'observability'],
+  ['qdrant', 'embeddings', 'embeddings'],
+  ['open-webui', 'whisper', 'voice input'],
+  ['open-webui', 'tts', 'voice output'],
+  ['dashboard', 'dashboard-api', 'API'],
+  ['dashboard-api', 'llama-server', 'API'],
+  ['token-spy', 'litellm', 'intercept'],
+  ['privacy-shield', 'litellm', 'privacy'],
+  ['comfyui', 'open-webui', 'API'],
+  ['ape', 'litellm', 'LLM proxy'],
+]
+
+describe('buildTopology', () => {
+  it('uses /api/status service ids for categories and known edges', () => {
+    const topology = buildTopology(statusPayload)
+
+    expect(topology.nodes.map(node => node.id)).toEqual(expectedIds)
+    for (const [id, category] of Object.entries(expectedCategories)) {
+      expect(topology.nodes.find(node => node.id === id)?.category).toBe(category)
+    }
+    expect(topology.edges).toHaveLength(expectedEdges.length)
+    expect(topology.edges).toEqual(expect.arrayContaining(
+      expectedEdges.map(([source, target, label]) => expect.objectContaining({ source, target, label }))
+    ))
+  })
+
+  it('does not collapse nodes when an older /api/status payload only has names', () => {
+    const legacyPayload = {
+      services: statusPayload.services.map(service => ({
+        name: service.name,
+        status: service.status,
+        port: service.port,
+        uptime: service.uptime,
+      })),
+    }
+
+    const topology = buildTopology(legacyPayload)
+
+    expect(topology.nodes).toHaveLength(statusPayload.services.length)
+    expect(new Set(topology.nodes.map(node => node.id)).size).toBe(statusPayload.services.length)
+    expect(topology.nodes.some(node => node.id === undefined)).toBe(false)
+    expect(topology.nodes.map(node => node.id)).toEqual(expectedIds)
+    expect(topology.edges).toHaveLength(expectedEdges.length)
+    expect(topology.edges).toEqual(expect.arrayContaining(
+      expectedEdges.map(([source, target, label]) => expect.objectContaining({ source, target, label }))
+    ))
+  })
+})

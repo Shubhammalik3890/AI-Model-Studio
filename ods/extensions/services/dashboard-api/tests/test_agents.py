@@ -1,0 +1,124 @@
+"""Tests for routers/agents.py — agent monitoring endpoints."""
+
+from unittest.mock import AsyncMock
+
+
+# --- GET /api/agents/metrics ---
+
+
+class TestGetAgentMetrics:
+
+    def test_returns_metrics_structure(self, test_client):
+        resp = test_client.get("/api/agents/metrics", headers=test_client.auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "timestamp" in data
+        assert "agent" in data
+        assert "cluster" in data
+        assert "throughput" in data
+        assert "session_count" in data["agent"]
+        assert "tokens_per_second" in data["agent"]
+
+    def test_requires_auth(self, test_client):
+        resp = test_client.get("/api/agents/metrics")
+        assert resp.status_code == 401
+
+
+# --- GET /api/agents/metrics.html ---
+
+
+class TestGetAgentMetricsHtml:
+
+    def test_returns_html_fragment(self, test_client):
+        resp = test_client.get("/api/agents/metrics.html", headers=test_client.auth_headers)
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        body = resp.text
+        assert "<div" in body
+        assert "Cluster Status" in body
+        assert "Active Sessions" in body
+        assert "Throughput" in body
+
+    def test_escapes_html_special_chars(self, test_client, monkeypatch):
+        """HTML content should be escaped to prevent XSS."""
+        from agent_monitor import agent_metrics
+        from datetime import datetime
+
+        # Inject XSS-like data into agent metrics
+        original_last_update = agent_metrics.last_update
+        agent_metrics.last_update = datetime.fromisoformat("2026-01-01T12:00:00")
+
+        resp = test_client.get("/api/agents/metrics.html", headers=test_client.auth_headers)
+        assert resp.status_code == 200
+        body = resp.text
+        # The output should contain safely rendered content, no raw script tags
+        assert "<script>" not in body
+
+        # Restore original
+        agent_metrics.last_update = original_last_update
+
+
+# --- GET /api/agents/cluster ---
+
+
+class TestGetClusterStatus:
+
+    def test_returns_cluster_data(self, test_client, monkeypatch):
+        from agent_monitor import cluster_status
+        monkeypatch.setattr(cluster_status, "refresh", AsyncMock())
+
+        resp = test_client.get("/api/agents/cluster", headers=test_client.auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "nodes" in data
+        assert "total_gpus" in data
+        assert "active_gpus" in data
+        assert "failover_ready" in data
+
+
+# --- GET /api/agents/throughput ---
+
+
+class TestGetThroughput:
+
+    def test_returns_throughput_stats(self, test_client):
+        resp = test_client.get("/api/agents/throughput", headers=test_client.auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "current" in data
+        assert "average" in data
+        assert "peak" in data
+        assert "history" in data
+
+    def test_throughput_metrics_add_sample_sanitization(self):
+        from agent_monitor import ThroughputMetrics
+        tm = ThroughputMetrics()
+        tm.add_sample(float("nan"))
+        tm.add_sample(-10.5)
+        tm.add_sample(25.0)
+        stats = tm.get_stats()
+        assert stats["current"] == 25.0
+        assert stats["average"] == 25.0
+        assert len(stats["history"]) == 1
+
+
+def test_html_missing_and_retained_runtime_measurements(test_client, monkeypatch):
+    from routers import agents
+    from datetime import datetime, timezone
+    sample = {"current": None, "state": "unavailable"}
+    monkeypatch.setattr(agents, "get_full_agent_metrics", lambda: {"throughput": sample})
+    response = test_client.get("/api/agents/metrics.html", headers=test_client.auth_headers)
+    assert response.status_code == 200
+    assert "Unavailable" in response.text
+    assert "Runtime Throughput" in response.text
+    assert "avg:" not in response.text
+    sample.update(current=55, state="retained", model="<model>",
+                  sampled_at=datetime.now(timezone.utc).timestamp())
+    response = test_client.get("/api/agents/metrics.html", headers=test_client.auth_headers)
+    assert "55.0" in response.text
+    assert "Last run" in response.text
+    assert "&lt;model&gt;" in response.text
+    sample["state"] = "unavailable"
+    response = test_client.get("/api/agents/metrics.html", headers=test_client.auth_headers)
+    assert "Last known rate" in response.text
+    assert "55.0" in response.text

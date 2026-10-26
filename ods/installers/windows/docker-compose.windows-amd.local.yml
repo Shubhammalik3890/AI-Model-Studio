@@ -1,0 +1,46 @@
+# ODS -- Windows AMD local-LLM readiness sidecar
+# Loaded only when the native llama-server.exe runs on the Windows host.
+# Probes its public /health, which answers 503 while the model loads and 200
+# once it can serve, so open-webui starts after the model is ready.
+#
+# Use with: docker compose -f docker-compose.base.yml \
+#                          -f installers/windows/docker-compose.windows-amd.yml \
+#                          -f installers/windows/docker-compose.windows-amd.local.yml up -d
+
+services:
+  llama-server-ready:
+    image: busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    container_name: ods-llama-ready
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo "Waiting for the native llama-server on the host..."
+        while ! wget -qO- "http://host.docker.internal:${AMD_INFERENCE_PORT:-8080}/health" >/dev/null 2>&1; do
+          sleep 2
+        done
+        echo "Inference server is ready"
+        sleep infinity
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'wget -qO- "http://host.docker.internal:${AMD_INFERENCE_PORT:-8080}/health" >/dev/null 2>&1 || exit 1'
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 32M
+    security_opt:
+      - no-new-privileges:true
+
+  open-webui:
+    depends_on:
+      llama-server-ready:
+        condition: service_healthy

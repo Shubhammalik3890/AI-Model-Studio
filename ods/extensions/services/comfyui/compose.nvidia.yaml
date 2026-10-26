@@ -1,0 +1,44 @@
+services:
+  comfyui:
+    build:
+      context: ./extensions/services/comfyui
+      dockerfile: Dockerfile
+    container_name: ods-comfyui
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${COMFYUI_PORT:-8188}:8188"
+    volumes:
+      - ./data/comfyui/models:/models:z
+      - ./data/comfyui/output:/output:z
+      - ./data/comfyui/input:/input:z
+      - ./data/comfyui/workflows:/workflows:ro,z
+      # Saved workflows and UI settings. Without this they live only in the
+      # container layer and are lost on every recreate (e.g. `ods update`).
+      - ./data/comfyui/user:/user:z
+    shm_size: '8g'
+    deploy:
+      resources:
+        limits:
+          cpus: '${COMFYUI_CPU_LIMIT:-1.0}'
+          memory: 24G
+        reservations:
+          devices:
+            - driver: nvidia
+              # One GPU. On multi-GPU hosts the installer writes COMFYUI_GPU_UUID and the
+              # multigpu overlay requires it; a second reservation there would be
+              # appended by Compose and hand the container an extra GPU.
+              device_ids: ["${COMFYUI_GPU_UUID:-0}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:8188"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

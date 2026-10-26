@@ -1,0 +1,1690 @@
+import HelpLink from '../components/HelpLink'
+import {
+  Database, Cpu, Workflow, Plug, Image, MessageSquare, Code,
+  FileText, Shield, Globe, Music, Video, Search, Puzzle,
+  Box, Loader2, RefreshCw, RotateCcw, ChevronDown, ChevronUp, Package, Info, X, Download, Trash2, ExternalLink, Terminal, Copy, Check,
+} from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Link } from 'react-router-dom'
+import { DependencyBadges, DependencyConfirmDialog, DisableDependentWarning } from '../components/DependencyBadges'
+import { TemplatePicker } from '../components/TemplatePicker'
+import { getTemplateStatus } from '../lib/templates'
+import { serviceUrl } from '../lib/serviceUrls'
+import { openWithFreshSession, opensWithOdsSession } from '../lib/odsSession'
+import { createRecoveryTracker } from '../utils/recoveryTracker'
+import MetalMetricIcon from '../components/MetalMetricIcon'
+import FittedLibraryPage from '../components/FittedLibraryPage'
+import {
+  ExtensionSettingsFields, installPlanSettings, installPlanWarnings, missingSettingsRefusal, saveExtensionSettings,
+  savedSettingsWarning, settingProblem,
+} from '../components/ExtensionInstallSettings'
+import './extensions-refined.css'
+
+// Re-export so existing importers of getTemplateStatus from this module keep working.
+export { getTemplateStatus }
+
+// API/backend services with no user-facing web UI — show badge instead of port link.
+const HEADLESS_EXTENSIONS = new Set(['embeddings', 'tts', 'whisper', 'privacy-shield', 'litellm'])
+const UPDATE_CONFIRMATION_STATES = {
+  update_state_unknown: 'unknown',
+  locally_modified: 'modified',
+  untracked_install: 'untracked',
+}
+
+// Auth: nginx injects "Authorization: Bearer ${DASHBOARD_API_KEY}" via
+// proxy_set_header for all /api/ requests (see nginx.conf).  All fetches
+// use relative URLs so they route through the nginx proxy which adds the
+// header before forwarding to dashboard-api.  No explicit auth in JS.
+
+const fetchJson = async (url, ms = 8000) => {
+  const c = new AbortController()
+  const t = setTimeout(() => c.abort(), ms)
+  try {
+    return await fetch(url, { signal: c.signal })
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+const ICON_MAP = {
+  Database, Cpu, Workflow, Plug, Image, MessageSquare, Code,
+  FileText, Shield, Globe, Music, Video, Search, Puzzle, Box,
+}
+const CATEGORY_ICONS = { ai:Cpu, tools:Workflow, search:Search, media:Image, audio:Music, voice:Music, video:Video, security:Shield, development:Code, storage:Database, automation:Workflow, networking:Globe, chat:MessageSquare, integration:Plug, integrations:Plug, monitoring:Cpu, productivity:FileText, infrastructure:Box }
+const SERVICE_ICONS = { searxng:Search, perplexica:Search, comfyui:Image, whisper:Music, tts:Music, embeddings:Database, litellm:Workflow, hermes:MessageSquare, 'hermes-proxy':Shield, 'privacy-shield':Shield, 'open-webui':MessageSquare, n8n:Workflow, opencode:Code, 'model-router':Workflow, 'token-spy':FileText }
+export const extensionIcon = ext => SERVICE_ICONS[ext.id] || ICON_MAP[ext.features?.[0]?.icon] || CATEGORY_ICONS[ext.features?.[0]?.category?.toLowerCase()] || Puzzle
+
+const friendlyError = (detail) => {
+  if (!detail || typeof detail !== 'string') return detail
+  if (detail.includes('build context') || detail.includes('local build'))
+    return 'This extension requires a local build and cannot be installed through the portal yet.'
+  if (detail.includes('already installed'))
+    return 'This extension is already installed.'
+  if (detail.includes('already enabled'))
+    return 'This extension is already enabled.'
+  if (detail.includes('already disabled'))
+    return 'This extension is already disabled.'
+  if (detail.includes('Disable extension before'))
+    return 'Please disable this extension before removing it.'
+  if (detail.includes('still enabled'))
+    return 'Please disable this extension before purging its data.'
+  if (detail.includes('No data directory'))
+    return 'No data directory found for this extension.'
+  if (detail.includes('Missing dependencies'))
+    return detail
+  return detail
+}
+
+// While a start recreates dashboard-api (the first Hermes enable does), the
+// dashboard's nginx answers the open request itself. dashboard-api's own
+// refusals always carry a JSON detail; these gateway answers carry none.
+const GATEWAY_STATUSES = new Set([502, 503, 504])
+const isGatewayAnswer = (status, body) => GATEWAY_STATUSES.has(status) && body?.detail === undefined
+
+const STATUS_STYLES = {
+  enabled:       'bg-green-500/20 text-green-400',
+  cli_installed: 'bg-green-500/20 text-green-400',
+  stopped:       'bg-red-500/20 text-red-400',
+  unhealthy:     'bg-theme-text-secondary/20 text-theme-text-secondary',
+  disabled:      'bg-theme-border text-theme-text-muted',
+  not_installed: 'border border-theme-border text-theme-text-muted',
+  incompatible:  'bg-theme-text-secondary/20 text-theme-text-secondary',
+  installing:    'bg-blue-500/20 text-blue-400',
+  setting_up:    'bg-blue-500/20 text-blue-400',
+  error:         'bg-red-500/20 text-red-300',
+}
+
+const STATUS_DESCRIPTIONS = {
+  enabled:       'Service is running and healthy',
+  cli_installed: 'CLI tool installed \u2014 invoke via `docker compose run --rm <service>`',
+  disabled:      'Installed but turned off \u2014 won\u2019t start on restart',
+  stopped:       'Enabled but container is not running',
+  unhealthy:     'Container is running but health check is failing \u2014 check logs',
+  not_installed: 'Available to install from the extension library',
+  incompatible:  'Requires a GPU backend not available on this system',
+  installing:    'Being downloaded and set up',
+  setting_up:    'Running post-install configuration hooks',
+  error:         'Installation or startup failed \u2014 click for details',
+}
+
+export default function Extensions({ compact = false }) {
+  const [catalog, setCatalog] = useState(null)
+  const [webuiSelection, setWebuiSelection] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [search, setSearch] = useState('')
+  const [category, setCategory] = useState('all')
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [libraryView, setLibraryView] = useState('all')
+  const [expanded, setExpanded] = useState(null)
+  const [mutating, setMutating] = useState(null)
+  const [confirm, setConfirm] = useState(null)
+  const [toast, setToast] = useState(null)
+  const [consoleExt, setConsoleExt] = useState(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [progressMap, setProgressMap] = useState({})
+  const [depConfirm, setDepConfirm] = useState(null)
+  // Values typed into the dialog's required settings. Kept only until they
+  // are submitted or the dialog closes; never echoed back from the API.
+  const [settingValues, setSettingValues] = useState({})
+  const [settingsBusy, setSettingsBusy] = useState(false)
+  const dialogSeq = useRef(0)
+  const webuiAddInFlight = useRef(false)
+  const settingsSave = useRef(null)
+  const [templates, setTemplates] = useState([])
+  const [pollingLost, setPollingLost] = useState(false)
+  const installProgressRef = useRef(null)
+  const activePollers = useRef({})
+  const catalogRequest = useRef(0)
+  const catalogPending = useRef(false)
+  // Per-service recovery tracker: counts consecutive fetch failures and
+  // fires onThresholdReached/onRecovered to drive the polling-lost banner.
+  // Keyed by serviceId because multiple installs can be polling concurrently.
+  const recoveryTrackers = useRef({})
+
+  // followCatalog: the start's own answer was lost, so its progress record may
+  // predate it or have been orphaned by the restart; the catalog decides.
+  const pollProgress = (serviceId, { followCatalog = false } = {}) => {
+    if (activePollers.current[serviceId]) return
+    recoveryTrackers.current[serviceId] = createRecoveryTracker({
+      threshold: 3,
+      onThresholdReached: () => {
+        setPollingLost(true)
+        // Attempt to recover catalog state — if the backend is back,
+        // the next successful poll will clear the banner.
+        fetchCatalog()
+      },
+      onRecovered: () => setPollingLost(prev => (prev ? false : prev)),
+    })
+    activePollers.current[serviceId] = setInterval(async () => {
+      try {
+        const res = await fetchJson(`/api/extensions/${serviceId}/progress`)
+        // Successful fetch (regardless of HTTP status) means the dashboard
+        // is reachable again — reset the failure counter and clear the banner.
+        recoveryTrackers.current[serviceId]?.recordSuccess()
+        if (!res.ok) return
+        const data = await res.json()
+        // A 'prepared' record is the finished image download that preceded
+        // this enable; it says nothing about the start itself.
+        if (data.status === 'idle' || data.status === 'prepared') {
+          setProgressMap(prev => {
+            if (!(serviceId in prev)) return prev
+            const next = { ...prev }
+            delete next[serviceId]
+            return next
+          })
+        } else {
+          setProgressMap(prev => ({ ...prev, [serviceId]: data }))
+        }
+        if (data.status === 'error') {
+          clearInterval(activePollers.current[serviceId])
+          delete activePollers.current[serviceId]
+          delete recoveryTrackers.current[serviceId]
+          setToast({ type: 'error', text: data.error || 'Installation failed' })
+          setProgressMap(prev => { const next = { ...prev }; delete next[serviceId]; return next })
+          fetchCatalog()
+        } else if (followCatalog || data.status === 'started' || data.status === 'idle' || data.status === 'prepared') {
+          // Enable can finish without an install-progress record. Keep checking
+          // live health even when progress is idle after the selection changed.
+          // Refresh catalog — if it shows "enabled" (long-running service)
+          // or "cli_installed" (one-shot CLI tool whose container exits
+          // after init), we're done.
+          const catData = await fetchCatalog({ background: true })
+          if (!catData) return
+          const ext = catData.extensions?.find(e => e.id === serviceId)
+          if (ext && (ext.status === 'enabled' || ext.status === 'cli_installed')) {
+            clearInterval(activePollers.current[serviceId])
+            delete activePollers.current[serviceId]
+            delete recoveryTrackers.current[serviceId]
+            const successText = ext.status === 'cli_installed'
+              ? `${ext.name || 'Extension'} installed — run via \`docker compose run --rm ${serviceId}\`.`
+              : 'Extension installed and started.'
+            setToast({ type: 'success', text: successText })
+            setProgressMap(prev => { const next = { ...prev }; delete next[serviceId]; return next })
+          }
+          // If not yet "enabled" / "cli_installed", keep polling — healthcheck still running
+        }
+      } catch (err) {
+        // Dashboard-api may be mid-restart, or the browser briefly lost
+        // network. Tracker counts consecutive failures; surfaces a banner
+        // after 3 via onThresholdReached so the user isn't left staring
+        // at a silent spinner forever.
+        console.warn('poll fetch failed:', err)
+        recoveryTrackers.current[serviceId]?.recordFailure()
+      }
+    }, 3000)
+  }
+
+  useEffect(() => {
+    fetchCatalog()
+    fetchWebuiSelection()
+    fetch('/api/templates')
+      .then(r => r.ok ? r.json() : { templates: [] })
+      .then(d => setTemplates(d.templates || []))
+      .catch(() => {})
+    return () => {
+      catalogRequest.current += 1
+      Object.values(activePollers.current).forEach(clearInterval)
+      activePollers.current = {}
+      recoveryTrackers.current = {}
+    }
+  }, [])
+
+  // Start polling for installing extensions + fetch progress for error state (after page refresh)
+  useEffect(() => {
+    if (!catalog) return
+    const installing = catalog.extensions.filter(e => e.status === 'installing' || e.status === 'setting_up')
+    installing.forEach(e => pollProgress(e.id))
+    // Fetch progress once for errored extensions to show the error message
+    catalog.extensions.filter(e => e.status === 'error').forEach(async (e) => {
+      try {
+        const res = await fetchJson(`/api/extensions/${e.id}/progress`)
+        if (!res.ok) return
+        const data = await res.json()
+        if (data.status === 'error') setProgressMap(prev => ({ ...prev, [e.id]: data }))
+      } catch { /* ignore */ }
+    })
+  }, [catalog])
+
+  useEffect(() => {
+    if (toast && toast.type !== 'info') {
+      const t = setTimeout(() => setToast(null), 8000)
+      return () => clearTimeout(t)
+    }
+  }, [toast])
+
+  useEffect(() => {
+    if (!confirm) return
+    const handler = (e) => { if (e.key === 'Escape') setConfirm(null) }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [confirm])
+
+  // Each dialog has its own identity. Opening, replacing or closing one
+  // discards typed settings and cancels its pending settings requests, so a
+  // secret never outlives the dialog it was typed in and a cancelled dialog
+  // never goes on to install.
+  const dialogId = confirm?.id
+  useEffect(() => {
+    setSettingValues({})
+    setSettingsBusy(false)
+    if (!dialogId) return undefined
+    const request = new AbortController()
+    const current = confirm
+    if (current.action === 'install' && current.settings?.loading) {
+      const timeout = setTimeout(() => request.abort(), 15000)
+      fetch(`/api/extensions/${current.ext.id}/install-plan`, { signal: request.signal, cache: 'no-store' })
+        .then(async response => {
+          if (!response.ok) return null
+          const plan = await response.json()
+          return { fields: installPlanSettings(plan, current.ext.id), warnings: installPlanWarnings(plan, current.ext.id) }
+        })
+        .catch(() => null)
+        .then(result => {
+          // Without a plan the install endpoint still refuses missing
+          // settings, and this dialog then asks for them.
+          setConfirm(open => (open?.id === dialogId
+            ? { ...open, settings: { ...open.settings, fields: result?.fields || [],
+              warnings: result?.warnings || [], loading: false } } : open))
+        })
+        .finally(() => clearTimeout(timeout))
+    }
+    return () => {
+      request.abort()
+      if (settingsSave.current?.id === dialogId) settingsSave.current.controller.abort()
+    }
+  }, [dialogId])
+
+  const openDialog = dialog => setConfirm({ ...dialog, id: ++dialogSeq.current })
+
+  const fetchCatalog = async ({ background = false } = {}) => {
+    // A slow read must get time to finish instead of being superseded on every
+    // progress tick. Explicit refreshes and action completions still take priority.
+    if (background && catalogPending.current) return null
+    // Polls, manual refreshes and action completions share one ordering rule:
+    // only the newest request may publish catalog state or finish its loading UI.
+    const request = ++catalogRequest.current
+    catalogPending.current = true
+    try {
+      if (!background) {
+        if (!catalog) setLoading(true)
+        setRefreshing(true)
+        setError(null)
+      }
+      const res = await fetchJson(`/api/extensions/catalog`)
+      if (!res.ok) {
+        if (background) return null
+        throw new Error(`HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      if (request !== catalogRequest.current) return null
+      setCatalog(data)
+      return data
+    } catch (err) {
+      if (request !== catalogRequest.current) return null
+      if (background) throw err
+      setError(err.name === 'AbortError' ? 'Request timed out' : 'Failed to load extensions catalog')
+      console.error('Extensions fetch error:', err)
+      return null
+    } finally {
+      if (request === catalogRequest.current) {
+        catalogPending.current = false
+        setLoading(false)
+        setRefreshing(false)
+      }
+    }
+  }
+
+  const fetchWebuiSelection = async () => {
+    try {
+      const res = await fetch('/api/webui/selection', { cache: 'no-store' })
+      if (!res.ok) throw new Error('Open WebUI selection unavailable')
+      const data = await res.json()
+      setWebuiSelection(typeof data.enabled === 'boolean' && typeof data.supported === 'boolean' ? data : null)
+    } catch {
+      setWebuiSelection(null)
+    }
+  }
+
+  // A first image download can outlast any request on a slow link. Services
+  // shipped with ODS download their images first, with progress on the card,
+  // and the enable that follows starts from local images.
+  const prepareImages = async (serviceId, { autoEnableDeps = false } = {}) => {
+    const query = autoEnableDeps ? '?auto_enable_deps=true' : ''
+    const res = await fetch(`/api/extensions/${serviceId}/prepare${query}`, {
+      method: 'POST', signal: AbortSignal.timeout(180000),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(typeof err.detail === 'string' ? err.detail : 'Could not download the images this needs')
+    }
+    if (res.status !== 202) return
+    for (;;) {
+      await new Promise(resolve => setTimeout(resolve, 3000))
+      const progress = await fetchJson(`/api/extensions/${serviceId}/progress`).catch(() => null)
+      if (!progress?.ok) continue
+      const data = await progress.json()
+      if (data.status === 'pulling') {
+        setProgressMap(prev => ({ ...prev, [serviceId]: data }))
+        continue
+      }
+      setProgressMap(prev => { const next = { ...prev }; delete next[serviceId]; return next })
+      if (data.status === 'prepared') return
+      throw new Error(data.status === 'error' && data.error
+        ? data.error : 'The image download stopped. Retry to resume it.')
+    }
+  }
+
+  // The host keeps starting services while dashboard-api restarts, so a start
+  // whose answer was lost may well have succeeded. Follow it like any start:
+  // the poller rides out the restart and reads the catalog once the API is back.
+  const followLostStart = (serviceId, action, displayServiceId) => {
+    const name = extensions.find(e => e.id === displayServiceId)?.name || displayServiceId
+    setToast({ type: 'info', text: action === 'install'
+      ? `Connection to ODS was interrupted while installing ${name}. Checking whether it finished…`
+      : `Connection to ODS was interrupted while starting ${name}. Checking whether it started…` })
+    pollProgress(serviceId, { followCatalog: true })
+  }
+
+  const handleMutation = async (serviceId, action, { autoEnableDeps = false, force = false, displayServiceId = serviceId } = {}) => {
+    setMutating(displayServiceId)
+    setConfirm(null)
+    setDepConfirm(null)
+    try {
+      if (action === 'enable' && extensions.find(e => e.id === serviceId)?.source === 'core') {
+        await prepareImages(serviceId, { autoEnableDeps })
+      }
+      let url = action === 'uninstall'
+        ? `/api/extensions/${serviceId}`
+        : action === 'purge'
+        ? `/api/extensions/${serviceId}/data`
+        : `/api/extensions/${serviceId}/${action}`
+      if (action === 'enable' && autoEnableDeps) {
+        url += '?auto_enable_deps=true'
+      }
+      if (action === 'update' && force) {
+        url += '?force=true'
+      }
+      const opts = {
+        method: action === 'uninstall' || action === 'purge' ? 'DELETE' : 'POST',
+        signal: AbortSignal.timeout(
+          action === 'update' || action === 'rollback' ? 30 * 60 * 1000
+            : action === 'enable' ? 13 * 60 * 1000 : 300000,
+        ),
+      }
+      if (action === 'purge') {
+        opts.headers = { 'Content-Type': 'application/json' }
+        opts.body = JSON.stringify({ confirm: true })
+      }
+      const followsStart = action === 'install' || action === 'enable'
+      let res
+      try {
+        res = await fetch(url, opts)
+      } catch (err) {
+        // fetch rejects with a TypeError when the connection drops unanswered.
+        if (!followsStart || !(err instanceof TypeError)) throw err
+        followLostStart(serviceId, action, displayServiceId)
+        return
+      }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        if (followsStart && isGatewayAnswer(res.status, err)) {
+          followLostStart(serviceId, action, displayServiceId)
+          return
+        }
+        const detail = err.detail
+        // Handle missing dependencies response
+        if (action === 'enable' && res.status === 400 && detail?.missing_dependencies) {
+          const ext = extensions.find(e => e.id === serviceId)
+          setMutating(null)
+          setDepConfirm({ ext, missingDeps: detail.missing_dependencies })
+          return
+        }
+        // Nothing was installed or enabled: ask for the listed settings in
+        // the same dialog, then repeat the request.
+        const refusal = (action === 'install' || action === 'enable') && res.status === 400
+          ? missingSettingsRefusal(detail) : null
+        const refusedExt = refusal && extensions.find(e => e.id === serviceId)
+        if (refusedExt) {
+          openDialog({
+            action, ext: refusedExt, autoEnableDeps,
+            message: refusal.message,
+            settings: { serviceId: refusal.serviceId, fields: refusal.fields, loading: false, error: '' },
+          })
+          return
+        }
+        if (action === 'update' && !force && res.status === 409 && detail?.force_available === true
+          && Object.hasOwn(UPDATE_CONFIRMATION_STATES, detail.code)) {
+          const ext = extensions.find(e => e.id === serviceId)
+          if (ext) {
+            // The server inspected newer state than the catalog. Reopen
+            // review with that reason; never automatically resend with force.
+            requestAction({
+              ...ext,
+              update_status: UPDATE_CONFIRMATION_STATES[detail.code],
+              locally_modified: detail.code === 'locally_modified',
+            }, 'update')
+            return
+          }
+        }
+        throw new Error((typeof detail === 'string' ? detail : detail?.message) || `Failed to ${action}`)
+      }
+      const data = await res.json()
+
+      if (action === 'enable' && Array.isArray(data.failed_services)
+        && data.failed_services.includes(serviceId)) {
+        const ext = extensions.find(item => item.id === serviceId)
+        setToast({ type: 'error', text: `${ext?.name || serviceId} was selected but did not start. Inspect its error, then retry or disable it.` })
+        await fetchCatalog()
+        return
+      }
+
+      if (action === 'install' || action === 'enable') {
+        // Refresh catalog to show "installing" state, then let the
+        // catalog-driven poller handle the rest (toast + final refresh)
+        await fetchCatalog()
+        pollProgress(serviceId)
+      } else {
+        let successText = data.message || (
+          action === 'uninstall' ? 'Extension removed' :
+          action === 'purge' ? `Data purged — ${data.size_gb_freed ?? 0} GB freed` :
+          `Extension ${action}d`
+        )
+        if (data.data_info) {
+          successText += ` Data preserved (${data.data_info.size_gb} GB) — purge to remove.`
+        }
+        if (data.restart_required) {
+          setToast({ type: 'info', text: `${successText} — restart needed to apply.` })
+        } else {
+          setToast({ type: 'success', text: successText })
+        }
+        await fetchCatalog()
+      }
+    } catch (err) {
+      const base = friendlyError(err.message) || `Failed to ${action} extension`
+      setToast({ type: 'error', text: base })
+    } finally {
+      setMutating(null)
+    }
+  }
+
+  const handleWebuiAdd = async () => {
+    if (webuiAddInFlight.current) return
+    webuiAddInFlight.current = true
+    setMutating('open-webui')
+    setConfirm(null)
+    try {
+      await prepareImages('open-webui')
+      const response = await fetch('/api/webui/selection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+        signal: AbortSignal.timeout(900000),
+      })
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}))
+        throw new Error(typeof error.detail === 'string' ? error.detail : 'Could not add Open WebUI')
+      }
+      await Promise.all([fetchCatalog(), fetchWebuiSelection()])
+      // Selection is host-owned, but the catalog's health cache may still be
+      // catching up (or its immediate probe may have failed). Follow readiness
+      // without repeating Add; only catalog health exposes the launch link.
+      setToast({ type: 'info', text: 'Open WebUI selected. Waiting for its service to become ready.' })
+      pollProgress('open-webui')
+    } catch (error) {
+      await fetchWebuiSelection()
+      setToast({ type: 'error', text: friendlyError(error.message) || 'Could not add Open WebUI. Check its selection before retrying.' })
+    } finally {
+      webuiAddInFlight.current = false
+      setMutating(null)
+    }
+  }
+
+  const requestAction = (ext, action) => {
+    // Hermes is internal-only; add its browser proxy and required services together.
+    const addHermesWeb = action === 'enable' && ext.id === 'hermes'
+      && ext.library_selected === false && ext.status === 'disabled'
+    const messages = {
+      'add-webui': 'Add Open WebUI? ODS will download and start its chat service. Any existing Open WebUI chats and settings will be reused.',
+      install: `Install ${ext.name}? This will download and start the service.`,
+      enable: addHermesWeb
+        ? 'Add Hermes Agent and its browser access? ODS will start Hermes, Hermes Auth Proxy, and required services including SearXNG.'
+        : `Enable ${ext.name}? The service will be started.`,
+      disable: `Disable ${ext.name}? The service will be stopped.`,
+      // A failed extension still has an enabled definition; the API stops
+      // whatever the failed attempt left running before removing it.
+      uninstall: ext.status === 'error'
+        ? `Remove ${ext.name}? ODS will stop anything its failed setup left running, then remove it. Service data is kept, and you can reinstall it from the library.`
+        : `Remove ${ext.name}? You can reinstall it from the library.`,
+      purge: `Permanently delete all data for ${ext.name}? This cannot be undone.`,
+      update: ext.update_status === 'unknown'
+        ? `ODS could not inspect the installed files for ${ext.name}. Refresh from the ODS library? This replaces the installed definition, including any local changes, and retains the current files as a rollback backup.`
+        : ext.locally_modified
+        ? `Update ${ext.name} from the ODS library? Local definition changes will be replaced, but retained as a rollback backup.`
+        : ext.update_status === 'untracked'
+        ? `Refresh this legacy ${ext.name} install from the ODS library and begin tracking future updates? The current definition will be retained as a rollback backup.`
+        : `Update ${ext.name} from the ODS library? The current definition will be retained for rollback.`,
+      rollback: `Restore the previous ${ext.name} extension definition? Current service data and configuration will be preserved.`,
+    }
+    // Install asks for required settings in the dialog itself (loaded from
+    // the install plan), before any request that copies or starts anything.
+    openDialog({
+      action, ext, message: messages[action],
+      ...(addHermesWeb ? { targetServiceId: 'hermes-proxy', autoEnableDeps: true } : {}),
+      ...(action === 'install'
+        ? { settings: { serviceId: ext.id, fields: [], loading: true, error: '' } } : {}),
+    })
+  }
+
+  const confirmAction = async () => {
+    const current = confirm
+    if (!current || settingsBusy || current.settings?.loading) return
+    const run = () => current.action === 'add-webui' ? handleWebuiAdd() : handleMutation(current.targetServiceId || current.ext.id, current.action, {
+      autoEnableDeps: current.autoEnableDeps === true,
+      displayServiceId: current.ext.id,
+      force: current.action === 'update' && (
+        current.ext.locally_modified || ['untracked', 'unknown'].includes(current.ext.update_status)
+      ),
+    })
+    const fields = current.settings?.fields || []
+    if (!fields.length) return run()
+    const values = Object.fromEntries(fields.map(field => [field.key, settingValues[field.key] || '']))
+    const showError = error => setConfirm(open => (open?.id === current.id
+      ? { ...open, settings: { ...open.settings, error } } : open))
+    // The button stays disabled until every value passes its declared
+    // format; the API checks the same format again before writing.
+    if (fields.some(field => settingProblem(field, values[field.key], values))) {
+      showError('Enter every required setting in its expected format.')
+      return
+    }
+    const controller = new AbortController()
+    settingsSave.current = { id: current.id, controller }
+    setSettingsBusy(true)
+    setSettingValues({})
+    const timeout = setTimeout(() => controller.abort(), 60000)
+    try {
+      await saveExtensionSettings(current.settings.serviceId, values, controller.signal)
+    } catch (err) {
+      const reason = err.name === 'AbortError' ? 'Saving settings did not finish.' : String(err.message || '')
+      showError(`${/[.!?]$/.test(reason) ? reason : `${reason}.`} Nothing was installed or started.`)
+      return
+    } finally {
+      clearTimeout(timeout)
+      if (settingsSave.current?.controller === controller) settingsSave.current = null
+      setSettingsBusy(false)
+    }
+    // A dialog closed while saving is a cancelled request: never install.
+    if (!controller.signal.aborted) await run()
+  }
+
+  if (loading && !catalog) {
+    return (
+      <div className="p-8 flex items-center justify-center h-64">
+        <Loader2 className="animate-spin text-theme-accent" size={32} />
+      </div>
+    )
+  }
+
+  if (!catalog && error) {
+    return (
+      <div className="p-6" role="alert">
+        <h2 className="text-sm font-semibold text-theme-text">Extension catalog unavailable</h2>
+        <p className="mt-2 text-sm text-theme-text-secondary">{error}. The extension list could not be read.</p>
+        <button className="mt-3 underline" onClick={fetchCatalog}>Retry</button> · <HelpLink />
+      </div>
+    )
+  }
+
+  const allExtensions = catalog?.extensions || []
+  const extensions = allExtensions.filter(ext => !['incompatible', 'unsupported'].includes(ext.status) && ext.compatible !== false)
+  const webuiCanAdd = webuiSelection?.supported === true && webuiSelection.enabled === false
+  const availableForAdd = ext => ext.status === 'not_installed'
+    || (ext.id === 'open-webui' && webuiCanAdd)
+    || (ext.source === 'core' && ext.library_manageable === true
+      && ext.library_selected === false && ['disabled', 'error'].includes(ext.status))
+  const unsupportedIds = new Set(allExtensions.filter(ext => !extensions.includes(ext)).map(ext => ext.id))
+  const summary = {
+    not_installed: extensions.filter(availableForAdd).length,
+    updates_available: extensions.filter(ext => ext.update_available).length,
+  }
+
+  // Derive unique categories from features
+  const categories = ['all', ...new Set(
+    extensions
+      .flatMap(ext => ext.features?.map(f => f.category) || [])
+      .filter(Boolean)
+  )]
+
+  const STATUS_FILTERS = ['all', 'enabled', 'cli_installed', 'stopped', 'unhealthy', 'disabled', 'installing', 'setting_up', 'error', 'not_installed']
+  const STATUS_LABELS = { all: 'All', enabled: 'Enabled', cli_installed: 'CLI Installed', stopped: 'Stopped', unhealthy: 'Unhealthy', disabled: 'Disabled', installing: 'Installing', setting_up: 'Setting Up', error: 'Error', not_installed: 'Not Installed', incompatible: 'Incompatible' }
+
+  // Filter extensions
+  const normalizeSearch = value => String(value ?? '').toLowerCase().replace(/[\s_-]+/g, ' ').trim()
+  const query = normalizeSearch(search)
+  const filtered = extensions.filter(ext => {
+    if (libraryView === 'installed' && availableForAdd(ext)) return false
+    if (libraryView === 'available' && !availableForAdd(ext)) return false
+    if (libraryView === 'updates' && !ext.update_available) return false
+    if (statusFilter !== 'all' && ext.status !== statusFilter) return false
+    if (category !== 'all' && !ext.features?.some(f => f.category === category)) return false
+    if (query && !normalizeSearch(ext.name).includes(query) && !normalizeSearch(ext.description).includes(query)) return false
+    return true
+  })
+  const collections = templates
+    .filter(template => !(template.services || []).some(id => unsupportedIds.has(id)))
+    .map(template => ({...template, _status: getTemplateStatus(template, extensions)}))
+    .filter(template => template._status !== 'applied')
+  const filteredCollections = collections.filter(template => !query || normalizeSearch(`${template.name} ${template.description || ''}`).includes(query))
+  const showingCollections = libraryView === 'collections'
+
+  return (
+    <div className="extensions-refined p-8">
+      <div className="extensions-toolbar mb-8 flex items-start justify-between">
+        <div>
+          {!compact && <h1 className="text-2xl font-bold text-theme-text">Extensions</h1>}
+          <h2 className="extensions-library-title">Your library</h2>
+        </div>
+        <div className="extensions-agent flex items-center gap-4 text-xs text-theme-text-muted">
+          {catalog?.agent_available !== undefined && (
+            <div className="flex items-center gap-1.5">
+              <span className={`w-1.5 h-1.5 rounded-full ${catalog.agent_available ? 'bg-emerald-400' : 'bg-red-500'}`} />
+              <span className={catalog.agent_available ? 'text-theme-text-secondary' : 'text-theme-text-muted'}>
+                {catalog.agent_available ? 'Agent online' : 'Agent offline'}
+              </span>
+            </div>
+          )}
+          <button
+            onClick={fetchCatalog}
+            aria-label="Refresh extensions"
+            disabled={refreshing}
+            className="text-theme-text-muted/65 hover:text-theme-text transition-colors disabled:opacity-50 flex items-center gap-1.5 uppercase tracking-[0.16em]"
+          >
+            <MetalMetricIcon icon={RefreshCw} size={14} className={refreshing ? 'animate-spin' : ''} />
+          </button>
+        </div>
+      </div>
+
+      {/* Error state */}
+      {error && (
+        <div className="mb-6 rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-200">
+          {error} — <button className="underline" onClick={fetchCatalog}>Retry</button> · <HelpLink />
+        </div>
+      )}
+
+      <nav className="extensions-library-tabs" aria-label="Library views">
+        {[['all','All',extensions.length],['installed','Installed',extensions.filter(ext => !availableForAdd(ext)).length],['available','Available',summary.not_installed ?? 0],['updates','Updates',summary.updates_available ?? 0]].map(([id,label,count]) => <button key={id} aria-label={`${label} ${count}`} aria-pressed={libraryView === id} onClick={() => {setLibraryView(id);setStatusFilter('all')}}>{label}<span>{count}</span></button>)}
+        {collections.length > 0 && <button aria-label={`Starter collections ${collections.length}`} aria-pressed={showingCollections} onClick={() => {setLibraryView('collections');setStatusFilter('all');setCategory('all')}}>Collections<span>{collections.length}</span></button>}
+      </nav>
+
+      {/* Status filter row */}
+      {compact ? <div className="portal-extension-filters">
+        <div className="extensions-search"><Search size={15} aria-hidden="true"/><input aria-label="Search extensions" placeholder="Find an extension…" value={search} onChange={event => setSearch(event.target.value)} /></div>
+        {!showingCollections && <><label>Status<select value={statusFilter} onChange={event => setStatusFilter(event.target.value)}>{STATUS_FILTERS.map(value => <option key={value} value={value}>{STATUS_LABELS[value]}</option>)}</select></label>
+        <label>Category<select value={category} onChange={event => setCategory(event.target.value)}>{categories.map(value => <option key={value} value={value}>{value === 'all' ? 'All categories' : value}</option>)}</select></label></>}
+      </div> : <>
+      <div className="flex flex-wrap gap-1.5 mb-3">
+        {STATUS_FILTERS.map(s => (
+          <button
+            key={s}
+            onClick={() => setStatusFilter(s)}
+            className={`px-2.5 py-1 rounded-full text-[10px] font-medium uppercase tracking-[0.12em] border transition-colors ${
+              statusFilter === s
+                ? 'bg-theme-accent/15 text-theme-accent-light border-theme-accent/25'
+                : 'bg-transparent text-theme-text-muted/65 hover:text-theme-text-secondary hover:bg-theme-surface-hover/40 border-theme-border/50'
+            }`}
+          >
+            {STATUS_LABELS[s]}
+          </button>
+        ))}
+      </div>
+
+      {/* Category filter row */}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 mb-6">
+        <div className="flex flex-wrap gap-1.5">
+          {categories.map(cat => (
+            <button
+              key={cat}
+              onClick={() => setCategory(cat)}
+              className={`px-2.5 py-1 rounded-full text-[10px] font-medium uppercase tracking-[0.12em] border transition-colors ${
+                category === cat
+                  ? 'bg-theme-surface-hover/60 text-theme-text-secondary border-theme-border/60'
+                  : 'bg-transparent text-theme-text-muted/55 hover:text-theme-text-secondary hover:bg-theme-surface-hover/40 border-transparent'
+              }`}
+            >
+              {cat === 'all' ? 'All Categories' : cat}
+            </button>
+          ))}
+        </div>
+        <input
+          type="text"
+          placeholder="Search extensions..."
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          className="bg-theme-bg/60 border border-theme-border/50 text-theme-text placeholder-theme-text-muted/45 rounded-lg px-3 py-1.5 text-xs w-full sm:w-56 outline-none focus:border-theme-accent/30 transition-colors"
+        />
+      </div>
+
+      {/* Agent offline banner */}
+      </>}
+      {catalog?.agent_available === false && (
+        <div className="mb-4 rounded-xl border border-theme-border bg-theme-text-secondary/[0.06] px-4 py-3 text-[11px] text-theme-text-secondary/80 flex items-center gap-2.5">
+          <span className="shrink-0 text-theme-text-secondary">!</span>
+          <span>Host agent is offline — install, enable, and disable operations are unavailable. Container logs cannot be fetched.</span>
+        </div>
+      )}
+
+      {/* Polling-lost banner — 3+ consecutive progress-fetch failures.
+          Surfaces when dashboard-api restarts mid-install. Auto-clears on
+          the next successful poll. */}
+      {pollingLost && (
+        <div className="mb-4 rounded-xl border border-theme-border bg-theme-text-secondary/[0.04] px-4 py-2 text-[10px] text-theme-text-secondary/80 flex items-center gap-2">
+          <Loader2 size={10} className="animate-spin shrink-0" />
+          <span>Connection to dashboard lost — retrying. Refresh if this persists.</span>
+        </div>
+      )}
+
+      <div className="extensions-results"><span>{showingCollections ? 'Starter collections' : libraryView === 'all' ? 'Explore extensions' : libraryView === 'installed' ? 'In your workspace' : libraryView === 'updates' ? 'Ready to update' : 'Available to install'}</span><span>{showingCollections ? filteredCollections.length : filtered.length} results</span></div>
+      {(showingCollections ? filteredCollections : filtered).length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-16 text-theme-text-muted/50">
+          <Package size={40} className="mb-4 opacity-30" />
+          <p className="text-sm font-semibold text-theme-text-muted/60">{showingCollections ? 'No collections match' : 'No extensions match'}</p>
+          <p className="text-[10px] uppercase tracking-[0.14em] text-theme-text-muted/40 mt-1.5">Try adjusting your search or filters</p>
+        </div>
+      ) : showingCollections ? <FittedLibraryPage key={`collections:${search}`} items={filteredCollections} label="Collection library">{items => <TemplatePicker templates={items} onApplied={fetchCatalog} variant="library"/>}</FittedLibraryPage> : (
+        <FittedLibraryPage key={`${libraryView}:${search}:${statusFilter}:${category}`} items={filtered} label="Extension library">
+        {items => (
+        <div className="extensions-list" aria-label="Extension library">
+          {items.map(ext => (
+            <ExtensionCard
+              key={ext.id}
+              ext={ext}
+              hermesProxy={ext.id === 'hermes' ? extensions.find(e => e.id === 'hermes-proxy') : null}
+              gpuBackend={catalog?.gpu_backend}
+              agentAvailable={catalog?.agent_available}
+              onDetails={() => setExpanded(ext.id)}
+              onConsole={() => setConsoleExt(ext)}
+              onAction={requestAction}
+              webuiSelection={webuiSelection}
+              mutating={mutating}
+              progressData={progressMap[ext.id] || (ext.id === 'hermes' ? progressMap['hermes-proxy'] : null)}
+            />
+          ))}
+        </div>
+        )}
+        </FittedLibraryPage>
+      )}
+
+      {/* Detail modal */}
+      {expanded && (
+        <DetailModal ext={extensions.find(e => e.id === expanded)} gpuBackend={catalog?.gpu_backend} onClose={() => setExpanded(null)} />
+      )}
+
+      {/* Console modal */}
+      {consoleExt && (
+        <ConsoleModal ext={consoleExt} onClose={() => setConsoleExt(null)} />
+      )}
+
+      {/* Confirmation dialog */}
+      {confirm && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setConfirm(null)}>
+          <div className="bg-theme-card border border-theme-border rounded-xl p-6 max-w-md mx-4 shadow-2xl" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Confirm action">
+            <h3 className="text-base font-semibold text-theme-text mb-2">
+              {confirm.action === 'add-webui' ? 'Add Open WebUI' : `${confirm.action === 'uninstall' ? 'Remove' : confirm.action === 'purge' ? 'Purge Data' : confirm.action.charAt(0).toUpperCase() + confirm.action.slice(1)} Extension`}
+            </h3>
+            <p className="text-[11px] text-theme-text-muted/70 mb-5 leading-relaxed">{confirm.message}</p>
+            {confirm.action === 'disable' && confirm.ext.dependents?.length > 0 && (
+              <DisableDependentWarning dependents={confirm.ext.dependents} />
+            )}
+            {confirm.settings?.loading && (
+              <p className="mb-5 flex items-center gap-2 text-[11px] text-theme-text-muted/70">
+                <Loader2 size={12} className="animate-spin" /> Checking required settings…
+              </p>
+            )}
+            {confirm.settings?.warnings?.length > 0 && (
+              <p role="note" className="mb-5 text-[11px] leading-relaxed text-amber-300">
+                {savedSettingsWarning(confirm.ext.name, confirm.settings.warnings)}
+              </p>
+            )}
+            {confirm.settings?.fields?.length > 0 && (
+              <ExtensionSettingsFields
+                fields={confirm.settings.fields}
+                values={settingValues}
+                disabled={settingsBusy}
+                onChange={(key, value) => setSettingValues(current => ({ ...current, [key]: value }))}
+              />
+            )}
+            {confirm.settings?.error && (
+              <p role="alert" className="mb-4 text-[11px] leading-relaxed text-red-300">{confirm.settings.error}</p>
+            )}
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setConfirm(null)} autoFocus className="px-4 py-2 text-[10px] font-mono uppercase tracking-[0.16em] text-theme-text-muted/65 hover:text-theme-text transition-colors">Cancel</button>
+              <button
+                onClick={confirmAction}
+                disabled={settingsBusy || confirm.settings?.loading === true
+                  || (confirm.settings?.fields || []).some(field => settingProblem(field, settingValues[field.key], settingValues))}
+                className={`px-4 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg transition-colors disabled:opacity-50 ${
+                  confirm.action === 'uninstall' || confirm.action === 'purge' ? 'bg-red-500/15 text-red-400 hover:bg-red-500/25' :
+                  'bg-theme-accent/15 text-theme-accent-light hover:bg-theme-accent/25'
+                }`}
+              >
+                {(() => {
+                  const label = confirm.action === 'add-webui' ? 'Add' : confirm.action === 'uninstall' ? 'Remove' : confirm.action === 'purge' ? 'Purge'
+                    : confirm.action.charAt(0).toUpperCase() + confirm.action.slice(1)
+                  if (settingsBusy) return 'Saving…'
+                  return confirm.settings?.fields?.length ? `Save and ${label.toLowerCase()}` : label
+                })()}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dependency auto-enable dialog */}
+      {depConfirm && (
+        <DependencyConfirmDialog
+          ext={depConfirm.ext}
+          missingDeps={depConfirm.missingDeps}
+          onConfirm={() => handleMutation(depConfirm.ext.id, 'enable', { autoEnableDeps: true })}
+          onCancel={() => setDepConfirm(null)}
+        />
+      )}
+
+      {/* Toast notification */}
+      {toast && (
+        <div className={`fixed bottom-6 right-6 z-50 rounded-xl border p-4 text-[11px] max-w-sm shadow-2xl ${
+          toast.type === 'error' ? 'border-red-500/20 bg-theme-card/95 text-red-300' :
+          toast.type === 'info' ? 'border-theme-accent/20 bg-theme-card/95 text-theme-accent-light' :
+          'border-green-500/20 bg-theme-card/95 text-green-300'
+        }`}>
+          <div className="flex items-center justify-between gap-3">
+            <span className="leading-relaxed">{toast.text}</span>
+            <button onClick={() => setToast(null)} className="text-theme-text-muted/45 hover:text-theme-text-secondary transition-colors">×</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function StatusBadge({ status, statusStyle, ext, gpuBackend, onConsole }) {
+  const runtimeStarting = status === 'installing' && ext.runtime_starting === true
+  let tooltip = runtimeStarting ? 'Service is starting; waiting for its health check' : STATUS_DESCRIPTIONS[status] || ''
+  if (status === 'disabled' && ext.source === 'core' && ext.library_manageable !== true) {
+    tooltip = 'ODS is not currently reporting this service as healthy.'
+  }
+  if (status === 'incompatible') {
+    tooltip += ` \u2014 requires ${ext.gpu_backends?.join(' or ') || 'specific GPU'}, your system: ${gpuBackend || 'unknown'}`
+  }
+
+  const badge = (status === 'installing' || status === 'setting_up') ? (
+    <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 flex items-center gap-1 cursor-help">
+      <Loader2 size={8} className="animate-spin" />
+      {runtimeStarting ? 'starting' : status === 'setting_up' ? 'setting up' : 'installing'}
+    </span>
+  ) : status === 'error' ? (
+    <span
+      className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/20 text-red-300 cursor-pointer"
+      onClick={onConsole}
+    >
+      error
+    </span>
+  ) : (
+    <span className={`text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider cursor-help ${statusStyle}`}>
+      {status.replace(/_/g, ' ')}
+    </span>
+  )
+
+  return (
+    <div className="relative group/status z-[1] hover:z-[60]" data-tooltip>
+      {badge}
+      {tooltip && (
+        <div className="pointer-events-none absolute top-full right-0 z-[60] mt-1.5 w-48 rounded-lg border border-theme-border bg-theme-card/95 px-3 py-2 text-[11px] leading-4 text-theme-text-secondary opacity-0 shadow-2xl transition-all duration-150 translate-y-1 group-hover/status:translate-y-0 group-hover/status:opacity-100">
+          {tooltip}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function LlmSwapBadge({ llm }) {
+  if (!llm?.consumes) return null
+
+  const safe = llm.swap_safe === true
+  const Icon = safe ? Check : X
+  const label = safe ? 'Swap-safe' : 'Not swap-safe'
+  const tone = safe
+    ? 'border-green-500/20 bg-green-500/10 text-green-300'
+    : 'border-red-500/20 bg-red-500/10 text-red-300'
+
+  return (
+    <span
+      data-testid="llm-swap-badge"
+      title={llm.swap_safe_reason || label}
+      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ${tone}`}
+    >
+      <Icon size={10} />
+      {label}
+    </span>
+  )
+}
+
+function ExtensionCard({ ext, hermesProxy, gpuBackend, agentAvailable, onDetails, onConsole, onAction, webuiSelection, mutating, progressData }) {
+  const Icon = extensionIcon(ext)
+  const status = ext.status || 'not_installed'
+  const statusStyle = STATUS_STYLES[status] || STATUS_STYLES.not_installed
+  const isMutating = mutating === ext.id
+  const anyMutating = !!mutating
+  const agentOffline = agentAvailable === false
+  const actionDisabled = anyMutating || agentOffline
+  const disabledTitle = agentOffline ? 'Host agent is offline' : anyMutating ? 'Another operation is in progress' : undefined
+
+  const isCore = ext.source === 'core'
+  const isUserExt = ext.source === 'user'
+  const isManagedBuiltin = isCore && ext.library_manageable === true
+  const isError = status === 'error'
+  const runtimeStarting = status === 'installing' && ext.runtime_starting === true
+  // A saved progress record can describe a terminal failure or completion.
+  // Only active phases should keep the installation spinner on screen.
+  const showProgress = !isError && (runtimeStarting || (progressData?.status
+    ? ['pulling', 'starting', 'setup_hook'].includes(progressData.status)
+    : status === 'installing' || status === 'setting_up'))
+  const isStopped = status === 'stopped'
+  const isUnhealthy = status === 'unhealthy'
+  const isCliInstalled = status === 'cli_installed'
+  const isToggleable = (isUserExt || (isManagedBuiltin && ext.library_selected === true))
+    && (status === 'enabled' || status === 'cli_installed' || status === 'disabled' || status === 'error' || status === 'stopped' || status === 'unhealthy')
+  const showManagedAdd = isManagedBuiltin && ext.library_selected === false && status === 'disabled'
+  const showManagedRetry = isManagedBuiltin && (isError
+    || (ext.library_selected === true && (isStopped || isUnhealthy)))
+  const showRemove = isUserExt && (status === 'disabled' || isError)
+  const showInstall = status === 'not_installed' && ext.installable
+  const showUpdate = isUserExt && ext.installable && (
+    ext.update_available || ext.locally_modified || ['untracked', 'unknown'].includes(ext.update_status)
+  )
+  const showRollback = isUserExt && ext.rollback_available
+  const launchService = ext.id === 'hermes' && hermesProxy?.status === 'enabled' ? hermesProxy : ext
+  const launchUrl = serviceUrl(launchService)
+  const launchPort = launchService.external_port ?? launchService.external_port_default ?? launchService.port
+
+  return (
+    <article className="extension-entry">
+      {/* Card body */}
+      <div className="extension-body">
+        <div className="extension-heading flex items-start justify-between mb-2">
+          <div className="flex items-center gap-2.5">
+            <div className="extension-symbol">
+              <MetalMetricIcon icon={Icon} size={19}/>
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-theme-text leading-tight">{ext.name}</h3>
+              {ext.features?.[0]?.category && (
+                <span className="text-[9px] text-theme-text-secondary/70 uppercase tracking-[0.18em]">{ext.features[0].category}</span>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <LlmSwapBadge llm={ext.llm} />
+            {isCore && (
+              <span
+                className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/15 uppercase tracking-wider cursor-help"
+                title="Bundled with ODS; runtime status is shown separately"
+              >
+                built-in
+              </span>
+            )}
+            <StatusBadge status={status} statusStyle={statusStyle} ext={ext} gpuBackend={gpuBackend} onConsole={onConsole} />
+            {isToggleable && (
+              <button
+                disabled={actionDisabled}
+                aria-label={`${status === 'disabled' ? 'Enable' : 'Disable'} ${ext.name}`}
+                title={disabledTitle}
+                onClick={() => onAction(ext, status === 'disabled' ? 'enable' : 'disable')}
+                className={`relative inline-flex h-[18px] w-[32px] shrink-0 rounded-full transition-colors disabled:opacity-50 ${
+                  status === 'error' ? 'bg-red-500' :
+                  status === 'stopped' ? 'bg-theme-text-secondary' :
+                  status === 'unhealthy' ? 'bg-theme-text-secondary' :
+                  (status === 'enabled' || isCliInstalled) ? 'bg-green-500' : 'bg-theme-border'
+                }`}
+              >
+                {isMutating ? (
+                  <Loader2 size={8} className="animate-spin absolute top-[3px] left-[10px] text-white" />
+                ) : (
+                  <span className={`pointer-events-none inline-block h-[14px] w-[14px] rounded-full bg-white shadow-sm transform transition-transform mt-[2px] ${
+                    status === 'disabled' ? 'translate-x-[2px]' : 'translate-x-[16px]'
+                  }`} />
+                )}
+              </button>
+            )}
+          </div>
+        </div>
+        <p className="text-[11px] text-theme-text-secondary/85 line-clamp-2 leading-relaxed">{ext.description || 'No description available.'}</p>
+      </div>
+
+      {/* Progress indicator — shows during active install/setup, survives page refresh */}
+      {showProgress && (
+        <div className="px-4 py-2 border-t border-theme-border/40 text-[10px] text-blue-400/80 flex items-center gap-2">
+          <Loader2 size={12} className="animate-spin" />
+          <span>{runtimeStarting ? 'Starting service — waiting for health check...' : progressData?.phase_label || (progressData?.status === 'setup_hook' || status === 'setting_up' ? 'Running setup...' : 'Installing...')}</span>
+        </div>
+      )}
+      {/* Error message — expandable when long or multiline so docker-compose
+          stderr isn't cut off mid-actionable-line. */}
+      {ext.status === 'error' && progressData?.error && (() => {
+        const errorText = progressData.error
+        const firstLine = errorText.split('\n')[0]
+        const isMultiline = errorText.length > firstLine.length
+        const isLongLine = firstLine.length > 120
+        const needsExpand = isMultiline || isLongLine
+        if (!needsExpand) {
+          return (
+            <div className="px-4 py-2 border-t border-red-500/15 text-[10px] text-red-300/80 leading-relaxed">
+              {errorText} <HelpLink className="ml-1" />
+            </div>
+          )
+        }
+        const summaryText = isLongLine
+          ? firstLine.slice(0, 120) + '...'
+          : firstLine + (isMultiline ? '...' : '')
+        return (
+          <>
+            <details className="group px-4 py-2 border-t border-red-500/15 text-[10px] text-red-300/80 leading-relaxed">
+              <summary className="cursor-pointer flex items-start gap-1 list-none [&::-webkit-details-marker]:hidden hover:text-red-300">
+                <ChevronDown size={10} className="mt-0.5 shrink-0 transition-transform group-open:rotate-180" />
+                <span className="flex-1 break-words">{summaryText}</span>
+              </summary>
+              <pre className="whitespace-pre-wrap text-[10px] text-red-300/80 mt-2 font-mono break-words">{errorText}</pre>
+            </details>
+            <div className="px-4 pb-2 text-[10px] text-red-300/80">
+              <HelpLink />
+            </div>
+          </>
+        )
+      })()}
+
+      {/* Card footer */}
+      <div className="extension-actions flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap gap-1.5">
+          {(showManagedAdd || showManagedRetry) && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle || 'Existing service data and settings will be reused'}
+              onClick={() => onAction(ext, 'enable')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-theme-accent text-white hover:bg-theme-accent-hover transition-colors disabled:opacity-50 shadow-sm shadow-theme-accent/20"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><Download size={12} /> {showManagedAdd && ext.id === 'hermes' ? 'Add Hermes with web access' : showManagedAdd ? `Add ${ext.name}` : `Retry ${ext.name}`}</>}
+            </button>
+          )}
+          {ext.id === 'open-webui' && webuiSelection?.supported && webuiSelection.enabled === false && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle || 'Existing Open WebUI chats and settings will be reused'}
+              onClick={() => onAction(ext, 'add-webui')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-theme-accent text-white hover:bg-theme-accent-hover transition-colors disabled:opacity-50 shadow-sm shadow-theme-accent/20"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><Download size={12} /> Add Open WebUI</>}
+            </button>
+          )}
+          {showInstall && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle}
+              onClick={() => onAction(ext, 'install')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-theme-accent text-white hover:bg-theme-accent-hover transition-colors disabled:opacity-50 shadow-sm shadow-theme-accent/20"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><Download size={12} /> Install</>}
+            </button>
+          )}
+          {showUpdate && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle || (ext.locally_modified ? 'Local definition changes will be backed up' : 'Update from ODS library')}
+              onClick={() => onAction(ext, 'update')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-cyan-500/15 text-cyan-300 hover:bg-cyan-500/25 transition-colors disabled:opacity-50"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><RefreshCw size={12} /> {ext.update_available ? 'Update' : 'Refresh'}</>}
+            </button>
+          )}
+          {showRollback && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle || 'Restore previous extension definition'}
+              onClick={() => onAction(ext, 'rollback')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-theme-surface-hover/50 text-theme-text-secondary hover:text-theme-text transition-colors disabled:opacity-50"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><RotateCcw size={12} /> Rollback</>}
+            </button>
+          )}
+          {(isUserExt || ext.app_path) && isStopped && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle}
+              onClick={() => onAction(ext, 'enable')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-green-500/15 text-green-400 hover:bg-green-500/25 transition-colors disabled:opacity-50"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : 'Start'}
+            </button>
+          )}
+          {isUserExt && isUnhealthy && (
+            <button
+              onClick={onConsole}
+              disabled={agentOffline}
+              title={agentOffline ? 'Host agent is offline' : 'View container logs'}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-theme-text-secondary/15 text-theme-text-secondary hover:bg-theme-text-secondary/25 transition-colors disabled:opacity-50"
+            >
+              <Terminal size={12} /> Check Logs
+            </button>
+          )}
+          {isError && !showManagedRetry && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle}
+              onClick={() => onAction(ext, ext.id === 'opencode' ? 'install' : 'enable')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 transition-colors disabled:opacity-50"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><RefreshCw size={12} /> Retry</>}
+            </button>
+          )}
+          {showRemove && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle}
+              onClick={() => onAction(ext, 'uninstall')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-transparent text-red-400/80 hover:bg-red-500/15 hover:text-red-300 transition-colors disabled:opacity-50"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><Trash2 size={12} /> Remove</>}
+            </button>
+          )}
+          {showRemove && ext.has_data && (
+            <button
+              disabled={actionDisabled}
+              title={disabledTitle || 'Permanently delete service data'}
+              onClick={() => onAction(ext, 'purge')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] rounded-lg bg-transparent text-theme-text-secondary/80 hover:bg-theme-text-secondary/15 hover:text-theme-text-secondary transition-colors disabled:opacity-50"
+            >
+              {isMutating ? <Loader2 size={12} className="animate-spin" /> : <><Database size={12} /> Purge Data</>}
+            </button>
+          )}
+          {isUserExt && (status === 'enabled' || isCliInstalled) && (
+            <span className="text-[9px] uppercase tracking-[0.14em] text-theme-text-muted/45">Disable to remove</span>
+          )}
+          {!showInstall && !showRemove && !isToggleable && (
+            <div className="flex items-center gap-1" title={status === 'incompatible' && gpuBackend ? `Your system: ${gpuBackend}` : undefined}>
+              {status === 'incompatible' && <span className="text-[9px] uppercase tracking-[0.14em] text-theme-text-muted/45 mr-0.5">Requires:</span>}
+              {ext.gpu_backends?.slice(0, 3).map(gpu => (
+                <span key={gpu} className="text-[9px] px-1.5 py-0.5 rounded-full border border-theme-border/50 bg-theme-surface-hover/30 text-theme-text-muted/65 font-mono uppercase tracking-[0.1em]">{gpu}</span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <DependencyBadges dependsOn={ext.depends_on} dependencyStatus={ext.dependency_status} />
+          {ext.app_path ? (
+            // Host applications (OpenCode) have their own page: open, start,
+            // set up, and how to use it, including from another device.
+            <Link
+              to={ext.app_path}
+              className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-mono text-theme-text-secondary hover:text-theme-text hover:bg-theme-surface-hover/40 rounded-lg transition-colors"
+              title={`${ext.name}: status, how to use it, and troubleshooting`}
+            >
+              <ExternalLink size={11} />
+              {status === 'enabled' ? 'Open' : 'Manage'}
+            </Link>
+          ) : status === 'enabled' && launchUrl ? (
+            HEADLESS_EXTENSIONS.has(ext.id) ? (
+              <span className="px-2 py-1 text-[9px] font-mono uppercase tracking-[0.12em] text-theme-text-muted/45">
+                API service
+              </span>
+            ) : (
+              <a
+                href={launchUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={e => {
+                  e.stopPropagation()
+                  if (opensWithOdsSession(launchService.id)) openWithFreshSession(e)
+                }}
+                className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-mono text-theme-text-secondary hover:text-theme-text hover:bg-theme-surface-hover/40 rounded-lg transition-colors"
+                aria-label={`Open ${ext.name}`}
+                title={launchPort ? `Open ${ext.name} on port ${launchPort}` : `Open ${ext.name}`}
+              >
+                <ExternalLink size={11} />
+                Open
+              </a>
+            )
+          ) : null}
+          {(isUserExt || isCore) && status !== 'not_installed' && (
+            <button
+              onClick={onConsole}
+              disabled={agentOffline}
+              className={`flex items-center gap-1.5 px-2 py-1.5 text-[10px] rounded-lg transition-colors ${
+                agentOffline ? 'text-theme-text-muted/40 cursor-not-allowed' :
+                isError ? 'text-red-400 hover:text-red-300 hover:bg-red-500/10' :
+                (status === 'installing' || isStopped || isUnhealthy) ? 'text-theme-text-secondary/80 hover:text-theme-text-secondary hover:bg-theme-text-secondary/10' :
+                'text-theme-text-secondary hover:text-theme-text hover:bg-theme-surface-hover/40'
+              }`}
+              title={agentOffline ? 'Agent offline' : 'View logs'}
+            >
+              <Terminal size={14} />
+              <span>Logs</span>
+            </button>
+          )}
+          <button
+            onClick={onDetails}
+            aria-label={`Details for ${ext.name}`}
+            className="flex items-center gap-1 px-2 py-1.5 text-[10px] text-theme-text-secondary hover:text-theme-text hover:bg-theme-surface-hover/40 rounded-lg transition-colors"
+          >
+            <MetalMetricIcon icon={Info} size={14} /><span>Details</span>
+          </button>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+function DetailModal({ ext, gpuBackend, onClose }) {
+  useEffect(() => {
+    if (!ext) return
+    const handler = (e) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [ext, onClose])
+
+  if (!ext) return null
+
+  const Icon = extensionIcon(ext)
+  const envVars = ext.env_vars || []
+  const deps = ext.depends_on || []
+  const features = ext.features || []
+  const statusStyle = STATUS_STYLES[ext.status] || STATUS_STYLES.not_installed
+  const isIncompatible = ext.status === 'incompatible'
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="bg-theme-card border border-theme-border rounded-xl w-full max-w-lg max-h-[80vh] overflow-y-auto mx-4"
+        onClick={e => e.stopPropagation()}
+        role="dialog" aria-modal="true" aria-label={ext.name}
+      >
+        {/* Header */}
+        <div className="sticky top-0 bg-theme-card border-b border-theme-border p-4 flex items-center justify-between rounded-t-xl">
+          <div className="flex items-center gap-3">
+            <MetalMetricIcon icon={Icon} size={22}/>
+            <div>
+              <h3 className="text-lg font-semibold text-theme-text">{ext.name}</h3>
+              <span
+                className={`text-xs px-2 py-0.5 rounded-full ${statusStyle}`}
+                title={isIncompatible ? `Requires ${ext.gpu_backends?.join(' or ') || 'specific GPU'} — your system: ${gpuBackend || 'unknown'}` : ext.source === 'core' ? 'Built-in service — managed by ODS' : undefined}
+              >
+                {(ext.status || 'not_installed').replace('_', ' ')}
+              </span>
+              <div className="mt-1">
+                <LlmSwapBadge llm={ext.llm} />
+              </div>
+            </div>
+          </div>
+          <button onClick={onClose} aria-label="Close extension details" autoFocus className="text-theme-text-muted hover:text-theme-text-secondary transition-colors p-1">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4">
+          {/* Description */}
+          <p className="text-sm text-theme-text-muted">{ext.description || 'No description available.'}</p>
+
+          {/* Info grid */}
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <div className="bg-theme-card/50 rounded-lg p-3">
+              <span className="text-theme-text-muted text-xs block mb-1">Port</span>
+              <span className="text-theme-text font-mono">{ext.external_port_default || ext.port || '—'}</span>
+            </div>
+            {ext.source === 'user' && (
+              <div className="bg-theme-card/50 rounded-lg p-3">
+                <span className="text-theme-text-muted text-xs block mb-1">Library</span>
+                <span className="text-theme-text capitalize">{(ext.update_status || 'unavailable').replace('_', ' ')}</span>
+                {ext.locally_modified && (
+                  <span className="text-theme-text-secondary text-[10px] block mt-1">Local definition changed</span>
+                )}
+              </div>
+            )}
+            <div className="bg-theme-card/50 rounded-lg p-3">
+              <span className="text-theme-text-muted text-xs block mb-1">GPU</span>
+              <span className="text-theme-text">{ext.gpu_backends?.join(', ') || 'none'}</span>
+              {isIncompatible && gpuBackend && (
+                <span className="text-theme-text-secondary text-[10px] block mt-1">Your system: {gpuBackend}</span>
+              )}
+            </div>
+            <div className="bg-theme-card/50 rounded-lg p-3">
+              <span className="text-theme-text-muted text-xs block mb-1">Category</span>
+              <span className="text-theme-text">{ext.category || '—'}</span>
+            </div>
+            <div className="bg-theme-card/50 rounded-lg p-3">
+              <span className="text-theme-text-muted text-xs block mb-1">Health</span>
+              <span className="text-theme-text font-mono text-xs">{ext.health_endpoint || '—'}</span>
+            </div>
+          </div>
+
+          {/* Dependencies */}
+          {deps.length > 0 && (
+            <div>
+              <h4 className="text-xs font-medium text-theme-text-muted uppercase tracking-wider mb-2">Dependencies</h4>
+              <div className="flex flex-wrap gap-2">
+                {deps.map(dep => (
+                  <span key={dep} className="bg-theme-card text-theme-text-muted rounded px-2 py-1 text-xs">{dep}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Environment variables */}
+          {envVars.length > 0 && (
+            <div>
+              <h4 className="text-xs font-medium text-theme-text-muted uppercase tracking-wider mb-2">Environment Variables</h4>
+              <div className="bg-theme-card/50 rounded-lg overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-theme-border">
+                      <th className="text-left px-3 py-2 text-theme-text-muted font-medium text-xs">Key</th>
+                      <th className="text-left px-3 py-2 text-theme-text-muted font-medium text-xs">Description</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {envVars.map(v => (
+                      <tr key={v.key || v.name} className="border-b border-theme-border/50 last:border-0">
+                        <td className="px-3 py-2 text-theme-accent-light font-mono text-xs">{v.key || v.name}</td>
+                        <td className="px-3 py-2 text-theme-text-muted text-xs">{v.description || '-'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Features */}
+          {features.length > 0 && (
+            <div>
+              <h4 className="text-xs font-medium text-theme-text-muted uppercase tracking-wider mb-2">Features</h4>
+              <div className="space-y-1">
+                {features.map(feat => (
+                  <div key={feat.name} className="flex items-center gap-2 text-sm">
+                    <span className="w-1.5 h-1.5 rounded-full bg-theme-accent" />
+                    <span className="text-theme-text-secondary">{feat.name}</span>
+                    {feat.category && <span className="text-xs text-theme-text-muted">({feat.category})</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Login / Credentials */}
+          {envVars.some(v => /password|secret|token|key/i.test(v.key || '')) && (
+            <div>
+              <h4 className="text-xs font-medium text-theme-text-muted uppercase tracking-wider mb-2">Configured Credentials</h4>
+              <p className="text-xs text-theme-text-muted mb-2">Run this from your ODS installation directory to view the configured values:</p>
+              <CopyableCommand command={
+                `grep -E '^[[:space:]]*(export[[:space:]]+)?(${envVars.filter(v => /username|password|secret|token|key|user|email/i.test(v.key || '')).map(v => v.key).join('|')})[[:space:]]*=' .env`
+              } />
+              <p className="text-xs text-theme-text-muted mt-1.5">A password changed inside an application may differ from its initial value in .env.</p>
+            </div>
+          )}
+
+          {/* The CLI refuses selection changes for category=core services. */}
+          {ext.category !== 'core' && <div>
+            <h4 className="text-xs font-medium text-theme-text-muted uppercase tracking-wider mb-2">CLI Commands</h4>
+            <div className="space-y-1">
+              <CopyableCommand command={`ods enable ${ext.id}`} />
+              <CopyableCommand command={`ods disable ${ext.id}`} />
+            </div>
+          </div>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ConsoleModal({ ext, onClose }) {
+  const [logs, setLogs] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [fetchingLogs, setFetchingLogs] = useState(false)
+  const logRequestInFlight = useRef(false)
+  const [error, setError] = useState(null)
+  const [disconnected, setDisconnected] = useState(false)
+  const [atBottom, setAtBottom] = useState(true)
+  const [installInfo, setInstallInfo] = useState(null)
+  const logRef = useRef(null)
+  const isNearBottom = useRef(true)
+
+  useEffect(() => {
+    const handler = (e) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  // Fetch install progress info
+  useEffect(() => {
+    let active = true
+    const fetchProgress = async () => {
+      try {
+        const res = await fetchJson(`/api/extensions/${ext.id}/progress`)
+        if (res.ok && active) {
+          const data = await res.json()
+          if (data.status !== 'idle') setInstallInfo(data)
+        }
+      } catch { /* ignore */ }
+    }
+    fetchProgress()
+    const interval = setInterval(fetchProgress, 5000)
+    return () => { active = false; clearInterval(interval) }
+  }, [ext.id])
+
+  useEffect(() => {
+    let active = true
+    // Tracker drives the disconnected banner after 3 consecutive failures.
+    // We also keep the raw failure count locally for the exponential
+    // backoff calculation (trackers don't expose internal state on success).
+    let failCount = 0
+    const tracker = createRecoveryTracker({
+      threshold: 3,
+      onThresholdReached: () => setDisconnected(true),
+      // setDisconnected(false) is already done in the success branch below,
+      // so no onRecovered callback is needed here.
+    })
+
+    const poll = async () => {
+      if (!active) return
+      if (logRequestInFlight.current) {
+        setTimeout(poll, 2000)
+        return
+      }
+      logRequestInFlight.current = true
+      setFetchingLogs(true)
+      try {
+        const res = await fetch(`/api/extensions/${ext.id}/logs`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.detail || 'Failed to fetch logs')
+        }
+        const data = await res.json()
+        setLogs(data.logs || 'No logs available.')
+        setError(null)
+        setDisconnected(false)
+        tracker.recordSuccess()
+        failCount = 0
+      } catch (err) {
+        failCount = tracker.recordFailure()
+        setError(err.message)
+      } finally {
+        setLoading(false)
+        logRequestInFlight.current = false
+        setFetchingLogs(false)
+      }
+      if (active) {
+        const delay = failCount > 0 ? Math.min(2000 * Math.pow(2, failCount - 1), 30000) : 2000
+        setTimeout(poll, delay)
+      }
+    }
+    poll()
+    return () => { active = false }
+  }, [ext.id])
+
+  useEffect(() => {
+    if (logRef.current && isNearBottom.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight
+    }
+  }, [logs])
+
+  const handleScroll = () => {
+    if (logRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = logRef.current
+      const near = scrollHeight - scrollTop - clientHeight < 50
+      isNearBottom.current = near
+      setAtBottom(near)
+    }
+  }
+
+  const scrollToBottom = () => {
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight
+      isNearBottom.current = true
+      setAtBottom(true)
+    }
+  }
+
+  const fetchLogsOnce = async () => {
+    if (logRequestInFlight.current) return
+    logRequestInFlight.current = true
+    setFetchingLogs(true)
+    try {
+      const res = await fetch(`/api/extensions/${ext.id}/logs`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to fetch logs')
+      }
+      const data = await res.json()
+      setLogs(data.logs || 'No logs available.')
+      setError(null)
+      setDisconnected(false)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      logRequestInFlight.current = false
+      setFetchingLogs(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="bg-theme-bg border border-theme-border rounded-xl w-full max-w-3xl h-[70vh] flex flex-col mx-4"
+        onClick={e => e.stopPropagation()}
+        role="dialog" aria-modal="true" aria-label={`${ext.name} logs`}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-theme-border">
+          <div className="flex items-center gap-2">
+            <Terminal size={16} className={disconnected ? 'text-red-400' : 'text-green-400'} />
+            <span className="text-sm font-medium text-theme-text">{ext.name}</span>
+            <span className="text-xs text-theme-text-muted">logs</span>
+            {disconnected ? (
+              <span className="w-1.5 h-1.5 rounded-full bg-red-500" title="Disconnected" />
+            ) : (
+              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" title="Live" />
+            )}
+          </div>
+          <button onClick={onClose} autoFocus className="text-theme-text-muted hover:text-theme-text-secondary transition-colors p-1">
+            <X size={16} />
+          </button>
+        </div>
+        {installInfo && (
+          <div className={`px-4 py-2 border-b text-xs flex items-center gap-2 ${
+            installInfo.status === 'error' ? 'border-red-500/30 bg-red-500/10 text-red-300' :
+            installInfo.status === 'started' ? 'border-green-500/30 bg-green-500/10 text-green-300' :
+            'border-blue-500/30 bg-blue-500/10 text-blue-300'
+          }`}>
+            {installInfo.status !== 'error' && installInfo.status !== 'started' && (
+              <Loader2 size={12} className="animate-spin" />
+            )}
+            <span className="font-medium">{installInfo.phase_label || installInfo.status}</span>
+            {installInfo.error && (
+              <span className="ml-2 text-red-300">— {installInfo.error}</span>
+            )}
+            {installInfo.started_at && (
+              <span className="ml-auto text-theme-text-muted">
+                {new Date(installInfo.started_at).toLocaleTimeString()}
+              </span>
+            )}
+          </div>
+        )}
+        <div className="relative flex-1">
+          <div
+            ref={el => { logRef.current = el }}
+            onScroll={handleScroll}
+            className="absolute inset-0 overflow-y-auto p-4 font-mono text-xs leading-relaxed text-theme-text-secondary whitespace-pre-wrap break-all"
+          >
+            {loading && !logs ? (
+              <div className="flex items-center gap-2 text-theme-text-muted">
+                <Loader2 size={14} className="animate-spin" /> Loading logs...
+              </div>
+            ) : (
+              <>
+                {logs}
+                {error && logs && (
+                  <div className="mt-2 text-red-400 border-t border-red-500/20 pt-2">
+                    {disconnected ? 'Connection lost' : 'Fetch error'}: {error}
+                  </div>
+                )}
+              </>
+            )}
+            {error && !logs && (
+              <div className="text-red-400">{error}</div>
+            )}
+          </div>
+          {!atBottom && (
+            <button
+              onClick={scrollToBottom}
+              className="absolute bottom-2 right-4 bg-theme-card border border-theme-border text-theme-text-muted hover:text-theme-text rounded-full px-3 py-1 text-xs shadow-lg transition-colors"
+            >
+              ↓ Jump to bottom
+            </button>
+          )}
+        </div>
+        <div className="border-t border-theme-border px-4 py-2 flex items-center justify-between">
+          <span className={`text-[10px] ${disconnected ? 'text-red-400' : 'text-theme-text-muted'}`}>
+            {disconnected ? 'Reconnecting...' : 'Auto-refreshing every 2s'}
+          </span>
+          <button onClick={fetchLogsOnce} disabled={fetchingLogs} className="text-xs text-theme-text-muted hover:text-theme-text-secondary transition-colors disabled:opacity-50" title="Refresh now">
+            <RefreshCw size={12} />
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CopyableCommand({ command }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = () => {
+    navigator.clipboard?.writeText(command)
+      .then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000) })
+      .catch(() => {})
+  }
+
+  return (
+    <div className="group flex items-center justify-between bg-theme-card rounded px-3 py-1.5 font-mono text-sm text-theme-text-secondary">
+      <span className="truncate mr-2">{command}</span>
+      <button
+        onClick={handleCopy}
+        className="shrink-0 text-theme-text-muted hover:text-theme-text-secondary transition-colors"
+        title="Copy to clipboard"
+      >
+        {copied ? <Check size={13} className="text-green-400" /> : <Copy size={13} />}
+      </button>
+    </div>
+  )
+}

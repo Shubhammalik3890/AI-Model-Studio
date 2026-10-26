@@ -1,0 +1,3808 @@
+# ============================================================================
+# ODS Windows CLI -- ods.ps1
+# ============================================================================
+# Day-to-day management of a ODS installation on Windows.
+# Mirrors the Linux ods-cli command structure.
+#
+# Usage:
+#   .\ods.ps1 status              # Health checks + GPU status
+#   .\ods.ps1 start [service]     # Start all or one service
+#   .\ods.ps1 stop [service]      # Stop all or one service
+#   .\ods.ps1 restart [service]   # Restart all or one service
+#   .\ods.ps1 logs <service> [N]  # Tail logs (default 100 lines)
+#   .\ods.ps1 config show         # View .env (secrets masked)
+#   .\ods.ps1 config edit         # Open .env in notepad
+#   .\ods.ps1 chat "message"      # Quick chat via API
+#   .\ods.ps1 update              # Pull latest images and restart
+#   .\ods.ps1 doctor              # Diagnose runtime readiness
+#   .\ods.ps1 repair voice        # Repair voice/STT/TTS readiness
+#   .\ods.ps1 enable <service>    # Enable an extension service (+ its dependencies)
+#   .\ods.ps1 disable <service>   # Disable an extension service
+#   .\ods.ps1 disable <svc> -Force # Disable even when other extensions depend on it
+#   .\ods.ps1 uninstall --force    # Remove ODS containers, volumes, and files
+#   .\ods.ps1 report              # Generate Windows diagnostics bundle
+#   .\ods.ps1 version             # Show version
+#   .\ods.ps1 help                # Show help
+#
+# ============================================================================
+
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [string]$Command = "help",
+
+    [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
+)
+
+$ErrorActionPreference = "Stop"
+
+# The native-llm-* entry points run from the ODSNativeLlamaRuntime task and
+# from Git Bash, without the installer's environment, so they name the
+# installation explicitly. Set before constants.ps1 derives its paths.
+if ($Command -in @("native-llm-start", "native-llm-restart") -and @($Arguments).Count -ge 1 -and $Arguments[0]) {
+    $env:ODS_HOME = [System.IO.Path]::GetFullPath([string]$Arguments[0])
+}
+
+# ── Locate libraries ──
+# NOTE: Nested Join-Path required -- PS 5.1 only accepts 2 arguments
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LibDir = Join-Path $ScriptDir "lib"
+. (Join-Path $LibDir "constants.ps1")
+. (Join-Path $LibDir "ui.ps1")
+. (Join-Path $LibDir "compose-diagnostics.ps1")
+. (Join-Path $LibDir "backend-contract.ps1")
+. (Join-Path $LibDir "detection.ps1")
+. (Join-Path $LibDir "llm-endpoint.ps1")
+. (Join-Path $LibDir "native-llama-args.ps1")
+. (Join-Path $LibDir "native-llama-runtime.ps1")
+. (Join-Path $LibDir "native-llama-legacy.ps1")
+. (Join-Path $LibDir "model-activation.ps1")
+. (Join-Path $LibDir "host-agent-process.ps1")
+. (Join-Path $LibDir "opencode-startup.ps1")
+. (Join-Path $LibDir "install-report.ps1")
+. (Join-Path $LibDir "tier-map.ps1")
+
+# Retired by install-windows.ps1 (Round F); uninstall still removes it when
+# its action is one this installation owns.
+$script:LEMONADE_TASK_NAME = "ODSLemonadeRuntime"
+$script:ODS_MODEL_UPGRADE_TASK_NAME = "ODSModelUpgrade"
+# Registered by install-windows.ps1: starts the native llama-server at logon.
+$script:NATIVE_LLAMA_TASK_NAME = $script:ODSNativeLlamaLegacyTaskName
+
+# ── Resolve install directory ──
+$InstallDir = $script:ODS_INSTALL_DIR
+# The installed configuration also supplies the dashboard link and login
+# launcher. Do not let an unrelated shell override select a different port.
+$script:OPENCODE_PORT = Get-WindowsODSEnvPort `
+    -EnvMap (Get-WindowsODSEnvMap -InstallDir $InstallDir) -Name 'OPENCODE_PORT' -DefaultPort 3003
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+function Test-DockerRunning {
+    <#
+    .SYNOPSIS
+        Quick check if Docker daemon is responsive. Shows friendly message if not.
+    #>
+    $null = docker info 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-AIError "Docker Desktop is not running."
+        Write-AI "Start it from the Start Menu, then try again."
+        return $false
+    }
+    return $true
+}
+
+function Test-Install {
+    param([switch]$SkipDockerCheck)
+
+    if (-not (Test-Path -LiteralPath $InstallDir)) {
+        Write-AIError "ODS not found at $InstallDir. Set ODS_HOME or run installer first."
+        exit 1
+    }
+    $baseCompose = Join-Path $InstallDir "docker-compose.base.yml"
+    $monoCompose = Join-Path $InstallDir "docker-compose.yml"
+    if (-not (Test-Path -LiteralPath $baseCompose) -and -not (Test-Path -LiteralPath $monoCompose)) {
+        Write-AIError "docker-compose.base.yml not found in $InstallDir"
+        exit 1
+    }
+    if (-not $SkipDockerCheck -and -not (Test-DockerRunning)) { exit 1 }
+}
+
+function Write-ODSUtf8NoBomFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
+function Resolve-ODSModelStoreComposeFlags {
+    param([string[]]$Flags)
+    $helper = Join-Path $InstallDir 'scripts/model-store-compose-flags.py'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        throw 'Registered model-store Compose resolver is missing; repair the ODS installation'
+    }
+    $python = Resolve-ODSHostAgentPython
+    if (-not $python) { throw 'Python 3 is required for registered model-store Compose mounts' }
+    # Windows PowerShell's pipeline encoding can be ASCII, UTF-16 or UTF-8
+    # with a BOM depending on the host/profile. This is a UTF-8 JSON protocol.
+    $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $arguments = @($python.PrefixArgs) + @('-X', 'utf8', $helper, '--install-dir', $InstallDir, '--json-stdin')
+    $inputJson = ConvertTo-Json -InputObject @($Flags) -Compress
+    $output = $inputJson | & $python.FilePath @arguments 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Registered model-store Compose configuration is unavailable: $(($output | Out-String).Trim())" }
+    try { $resolved = ($output | Out-String) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Registered model-store Compose resolver returned invalid arguments' }
+    return @($resolved)
+}
+
+function Get-ComposeFlags {
+    <#
+    .SYNOPSIS
+        Read saved compose flags from installer, or build default flags.
+    #>
+    Ensure-HermesDashboardSessionToken
+
+    $flagsFile = Join-Path $InstallDir ".compose-flags"
+    if (Test-Path -LiteralPath $flagsFile) {
+        $raw = (Get-Content -LiteralPath $flagsFile -Raw).Trim()
+        if (($raw -match 'user-extensions') -or (Test-Path -LiteralPath (Join-Path $InstallDir 'data/user-extensions')) -or (Test-Path -LiteralPath (Join-Path $InstallDir '.model-stores.compose.json')) -or
+            (Test-Path -LiteralPath (Join-Path $InstallDir 'data/model-stores.json'))) {
+            return (Resolve-ODSModelStoreComposeFlags -Flags ($raw -split "\s+"))
+        }
+        return ($raw -split "\s+")
+    }
+
+    $launchRecord = Join-Path (Join-Path $InstallDir "logs") "compose-launch.txt"
+    if (Test-Path -LiteralPath $launchRecord) {
+        $composeFlagsLine = Get-Content -LiteralPath $launchRecord -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match "^compose_flags=" } |
+            Select-Object -First 1
+        if ($composeFlagsLine) {
+            $raw = ($composeFlagsLine -replace "^compose_flags=", "").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                Write-AIWarn ".compose-flags is missing; using compose flags from logs\compose-launch.txt"
+                if (($raw -match 'user-extensions') -or (Test-Path -LiteralPath (Join-Path $InstallDir 'data/user-extensions')) -or (Test-Path -LiteralPath (Join-Path $InstallDir '.model-stores.compose.json')) -or
+                    (Test-Path -LiteralPath (Join-Path $InstallDir 'data/model-stores.json'))) {
+                    return (Resolve-ODSModelStoreComposeFlags -Flags ($raw -split "\s+"))
+                }
+                return ($raw -split "\s+")
+            }
+        }
+    }
+
+    # Fallback: detect from available files
+    # --env-file explicit: Docker Compose V2 on Windows may not auto-discover
+    # .env from the project directory when multiple -f flags are used.
+    $flags = @("--env-file", ".env")
+    $base = Join-Path $InstallDir "docker-compose.base.yml"
+    $nvidia = Join-Path $InstallDir "docker-compose.nvidia.yml"
+    $mono = Join-Path $InstallDir "docker-compose.yml"
+
+    if (Test-Path -LiteralPath $base) {
+        $flags += @("-f", "docker-compose.base.yml")
+        if (Test-Path -LiteralPath $nvidia) {
+            $flags += @("-f", "docker-compose.nvidia.yml")
+        }
+    } elseif (Test-Path -LiteralPath $mono) {
+        $flags += @("-f", "docker-compose.yml")
+    }
+
+    # Add enabled extension compose files
+    $extDir = Join-Path (Join-Path $InstallDir "extensions") "services"
+    if (Test-Path -LiteralPath $extDir) {
+        Get-ChildItem -LiteralPath $extDir -Directory | ForEach-Object {
+            $composePath = Join-Path $_.FullName "compose.yaml"
+            if (Test-Path -LiteralPath $composePath) {
+                $relPath = $composePath.Substring($InstallDir.Length + 1) -replace "\\", "/"
+                $flags += @("-f", $relPath)
+            }
+        }
+    }
+
+    if ((($flags -join ' ') -match 'user-extensions') -or (Test-Path -LiteralPath (Join-Path $InstallDir 'data/user-extensions')) -or (Test-Path -LiteralPath (Join-Path $InstallDir '.model-stores.compose.json')) -or
+        (Test-Path -LiteralPath (Join-Path $InstallDir 'data/model-stores.json'))) {
+        return (Resolve-ODSModelStoreComposeFlags -Flags $flags)
+    }
+    return $flags
+}
+
+function Test-ODSArgumentPresent {
+    param(
+        [string[]]$Arguments,
+        [string[]]$Names
+    )
+
+    if (-not $Arguments) { return $false }
+    foreach ($arg in $Arguments) {
+        foreach ($name in $Names) {
+            if ($arg -eq $name) { return $true }
+        }
+    }
+    return $false
+}
+
+function Test-ODSDockerRunningQuiet {
+    $previousPreference = $ErrorActionPreference
+    try {
+        # PowerShell 5.1 turns native stderr warnings into terminating errors
+        # under Stop, even when docker info exits successfully.
+        $ErrorActionPreference = 'Continue'
+        $null = & docker info 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Test-ODSLegacyOpenClawContainer {
+    # The legacy OpenClaw extension was removed. Starts never remove orphan
+    # containers, so an upgrade that stopped before its final stack start can
+    # leave the old ods-openclaw container running.
+    $previousPreference = $ErrorActionPreference
+    try {
+        # PowerShell 5.1 turns native stderr into terminating errors under
+        # Stop; a missing container is the normal case here.
+        $ErrorActionPreference = 'Continue'
+        $null = & docker container inspect ods-openclaw 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Get-ODSDockerProjectResourceNames {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("container", "network", "volume")]
+        [string]$Kind
+    )
+
+    $filter = "label=com.docker.compose.project=ods"
+    try {
+        $names = switch ($Kind) {
+            "container" {
+                @(& docker ps -a --filter $filter --format '{{.Names}}' 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+            "network" {
+                @(& docker network ls --filter $filter --format '{{.Name}}' 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+            "volume" {
+                @(& docker volume ls -q --filter $filter 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+        }
+        if ($LASTEXITCODE -ne 0) { throw "Docker could not list $Kind resources." }
+        return @($names)
+    } catch {
+        throw "Docker ownership query failed; runtime files were preserved: $_"
+    }
+}
+
+function Test-ODSComposeFlagsFilesAvailable {
+    param([string[]]$ComposeFlags)
+
+    if (-not $ComposeFlags -or $ComposeFlags.Count -eq 0) { return $false }
+
+    $hasComposeFile = $false
+    for ($i = 0; $i -lt $ComposeFlags.Count; $i++) {
+        $token = [string]$ComposeFlags[$i]
+        $path = $null
+        $isComposeFile = $false
+
+        if (($token -eq "-f" -or $token -eq "--file" -or $token -eq "--env-file") -and ($i + 1) -lt $ComposeFlags.Count) {
+            $path = [string]$ComposeFlags[$i + 1]
+            $isComposeFile = ($token -ne "--env-file")
+            $i++
+        } elseif ($token -like "--file=*") {
+            $path = $token.Substring("--file=".Length)
+            $isComposeFile = $true
+        } elseif ($token -like "--env-file=*") {
+            $path = $token.Substring("--env-file=".Length)
+        }
+
+        if ($path) {
+            if ([System.IO.Path]::IsPathRooted($path)) {
+                $fullPath = $path
+            } else {
+                $fullPath = Join-Path $InstallDir $path
+            }
+            if (-not (Test-Path -LiteralPath $fullPath)) {
+                Write-AIWarn "Compose receipt references missing file: $path"
+                return $false
+            }
+            if ($isComposeFile) {
+                $hasComposeFile = $true
+            }
+        }
+    }
+
+    return $hasComposeFile
+}
+
+function Assert-ODSDockerProjectOwnership {
+    param([switch]$RemoveVolumes)
+    $containers = @(Get-ODSDockerProjectResourceNames -Kind 'container')
+    if (-not $containers.Count) {
+        $orphans = @(Get-ODSDockerProjectResourceNames -Kind 'network') + @(Get-ODSDockerProjectResourceNames -Kind 'volume')
+        if ($orphans.Count) {
+            throw 'ODS_UNINSTALL_OWNERSHIP_UNKNOWN: only orphaned Docker resources remain. Their project label cannot identify the original Windows or WSL installation; nothing was removed.'
+        }
+        return [pscustomobject]@{ Containers = @(); Networks = @(); Volumes = @() }
+    }
+    $expected = [IO.Path]::GetFullPath($InstallDir).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $ownedVolumes = @{}
+    $verifiedContainerIds = @{}
+    $verifiedNetworkIds = @{}
+    foreach ($name in $containers) {
+        $json = & docker container inspect $name 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "Cannot verify Docker container $name; uninstall stopped before any changes." }
+        $items = @($json | ConvertFrom-Json -ErrorAction Stop)
+        if ($items.Count -ne 1) { throw "Ambiguous Docker ownership for $name; nothing was removed." }
+        $c = $items[0]
+        $labels = $c.Config.Labels
+        $workingDir = [string]$labels.'com.docker.compose.project.working_dir'
+        if ($labels.'com.docker.compose.project' -ne 'ods' -or [string]::IsNullOrWhiteSpace($workingDir) -or
+            -not [IO.Path]::IsPathRooted($workingDir)) {
+            throw "ODS_UNINSTALL_OWNERSHIP_UNKNOWN: $name has no verifiable Compose installation directory; nothing was removed."
+        }
+        $actual = [IO.Path]::GetFullPath($workingDir).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "ODS_UNINSTALL_OTHER_INSTALLATION: $name belongs to '$workingDir', not '$InstallDir'. Use that installation's uninstaller; nothing was removed."
+        }
+        if (-not $c.Id) { throw "ODS_UNINSTALL_OWNERSHIP_UNKNOWN: container '$name' has no identity; nothing was removed." }
+        $verifiedContainerIds[[string]$c.Id] = $true
+        foreach ($mount in @($c.Mounts)) {
+            if ($mount.Type -eq 'volume' -and $mount.Name) { $ownedVolumes[[string]$mount.Name] = $true }
+        }
+        $nets = $c.NetworkSettings.Networks
+        if ($nets) {
+            foreach ($prop in $nets.PSObject.Properties) {
+                $netVal = $prop.Value
+                if ($netVal -and $netVal.NetworkID) { $verifiedNetworkIds[[string]$netVal.NetworkID] = $true }
+            }
+        }
+    }
+    $projectNetworks = @(Get-ODSDockerProjectResourceNames -Kind 'network')
+    $projectNetworkIds = @()
+    foreach ($netName in $projectNetworks) {
+        $netJson = & docker network inspect $netName 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "ODS_UNINSTALL_OWNERSHIP_UNKNOWN: cannot inspect network '$netName'; nothing was removed."
+        }
+        $netItems = @($netJson | ConvertFrom-Json -ErrorAction Stop)
+        if ($netItems.Count -ne 1) {
+            throw "ODS_UNINSTALL_OWNERSHIP_UNKNOWN: ambiguous network ownership for '$netName'; nothing was removed."
+        }
+        $netId = [string]$netItems[0].Id
+        if ([string]::IsNullOrWhiteSpace($netId) -or -not $verifiedNetworkIds.ContainsKey($netId)) {
+            throw "ODS_UNINSTALL_OWNERSHIP_UNKNOWN: network '$netName' ($netId) is not attached to any verified container of this installation. Its project label alone cannot authorize removal; nothing was removed."
+        }
+        foreach ($attachment in @($netItems[0].Containers.PSObject.Properties)) {
+            if (-not $verifiedContainerIds.ContainsKey([string]$attachment.Name)) {
+                throw "ODS_UNINSTALL_OTHER_INSTALLATION: network '$netName' is also used by an unverified container; nothing was removed."
+            }
+        }
+        $projectNetworkIds += $netId
+    }
+    $projectVolumes = @()
+    if ($RemoveVolumes) {
+        $projectVolumes = @(Get-ODSDockerProjectResourceNames -Kind 'volume')
+        foreach ($volume in $projectVolumes) {
+            if (-not $ownedVolumes.ContainsKey($volume)) {
+                throw "ODS_UNINSTALL_OWNERSHIP_UNKNOWN: volume '$volume' is not attached to a verified container of this installation. Its project label alone cannot authorize deleting its data; nothing was removed."
+            }
+        }
+    }
+    return [pscustomobject]@{ Containers = @($verifiedContainerIds.Keys); Networks = $projectNetworkIds; Volumes = $projectVolumes }
+}
+
+function Remove-ODSDockerProjectByLabel {
+    param([switch]$RemoveVolumes, [Parameter(Mandatory=$true)]$Ownership)
+
+    # @() keeps a single name an array; splatting a bare string would pass
+    # each character to docker as a separate argument.
+    $containers = @($Ownership.Containers)
+    if ($containers.Count -gt 0) {
+        Write-AI "Removing ODS containers by Docker label..."
+        & docker rm -f @containers | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-AIWarn "Some ODS containers could not be removed."
+        }
+    }
+
+    $networks = @($Ownership.Networks)
+    if ($networks.Count -gt 0) {
+        Write-AI "Removing ODS Docker networks by label..."
+        & docker network rm @networks | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-AIWarn "Some ODS networks could not be removed."
+        }
+    }
+
+    if ($RemoveVolumes) {
+        $volumes = @($Ownership.Volumes)
+        if ($volumes.Count -gt 0) {
+            Write-AI "Removing ODS Docker volumes by label..."
+            & docker volume rm @volumes | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                Write-AIWarn "Some ODS volumes could not be removed."
+            }
+        }
+    }
+}
+
+function Assert-ODSInstallDirSafeForRemoval {
+    if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+        throw "Install directory is empty; refusing to remove files."
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($InstallDir)
+    $rootPath = [System.IO.Path]::GetPathRoot($fullPath)
+    $userProfile = [System.IO.Path]::GetFullPath($env:USERPROFILE)
+
+    if ($fullPath.TrimEnd("\") -eq $rootPath.TrimEnd("\")) {
+        throw "Install directory resolves to a drive root ($fullPath); refusing to remove files."
+    }
+    if ($fullPath.TrimEnd("\") -eq $userProfile.TrimEnd("\")) {
+        throw "Install directory resolves to the user profile ($fullPath); refusing to remove files."
+    }
+
+    $primaryMarkers = @(
+        "manifest.json",
+        "ods.ps1",
+        "docker-compose.base.yml",
+        "docker-compose.yml"
+    )
+    $primaryMarkerCount = @($primaryMarkers | Where-Object {
+        Test-Path -LiteralPath (Join-Path $fullPath $_) -PathType Leaf
+    }).Count
+
+    $supportingMarkerCount = 0
+    if (Test-Path -LiteralPath (Join-Path $fullPath ".compose-flags") -PathType Leaf) {
+        $supportingMarkerCount++
+    }
+    $envPath = Join-Path $fullPath ".env"
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $envText = Get-Content -LiteralPath $envPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if (
+            $envText -match '(?m)^WEBUI_SECRET=' -and
+            $envText -match '(?m)^DASHBOARD_API_KEY='
+        ) {
+            $supportingMarkerCount++
+        }
+    }
+
+    if (
+        $primaryMarkerCount -lt 2 -and
+        -not ($primaryMarkerCount -ge 1 -and $supportingMarkerCount -ge 1)
+    ) {
+        throw "Install directory does not contain enough ODS runtime markers ($fullPath); refusing to remove files."
+    }
+}
+
+function Remove-ODSInstallDirectory {
+    param(
+        [switch]$KeepData,
+        [switch]$KeepModels
+    )
+
+    if (-not (Test-Path -LiteralPath $InstallDir)) { return }
+
+    Assert-ODSInstallDirSafeForRemoval
+
+    try {
+        $currentLocation = (Get-Location).ProviderPath
+        if ($currentLocation -and $currentLocation.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $parent = Split-Path -Parent $InstallDir
+            if (-not $parent) { $parent = $env:USERPROFILE }
+            Set-Location $parent
+        }
+    } catch { }
+
+    if ($KeepData) {
+        Write-AI "Preserving data under $InstallDir\data"
+        Get-ChildItem -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "data" } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($KeepModels) {
+        Write-AI "Preserving downloaded models under $InstallDir\data\models"
+        $dataDir = Join-Path $InstallDir "data"
+        if (Test-Path -LiteralPath $dataDir) {
+            Get-ChildItem -LiteralPath $dataDir -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne "models" } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Get-ChildItem -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "data" } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    Remove-Item -LiteralPath $InstallDir -Recurse -Force
+}
+
+function Test-ODSUninstallPathOwned {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try {
+        if (-not [IO.Path]::IsPathRooted($Path)) { return $false }
+        $root = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\', '/')
+        $actual = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+        return $actual.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+            $actual.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Resolve-ODSUninstallLiteral {
+    param($Node, $Assignments, [int]$Before, [int]$Depth=0)
+    if ($Depth -gt 12) { throw 'Unknown launcher expression' }
+    $next=$Depth+1
+    if ($Node -is [Management.Automation.Language.StringConstantExpressionAst]) { return [string]$Node.Value }
+    if ($Node -is [Management.Automation.Language.VariableExpressionAst]) {
+        $name=$Node.VariablePath.UserPath
+        if (-not $Assignments.ContainsKey($name)) { throw 'Unknown launcher variable' }
+        $assignment=$Assignments[$name]
+        if ($assignment.Right.Extent.EndOffset -ge $Before) { throw 'Ambiguous launcher assignment' }
+        return Resolve-ODSUninstallLiteral $assignment.Right $Assignments $assignment.Extent.StartOffset $next
+    }
+    if ($Node -is [Management.Automation.Language.CommandExpressionAst]) { return Resolve-ODSUninstallLiteral $Node.Expression $Assignments $Before $next }
+    if ($Node -is [Management.Automation.Language.ParenExpressionAst]) { return Resolve-ODSUninstallLiteral $Node.Pipeline $Assignments $Before $next }
+    if ($Node -is [Management.Automation.Language.ArrayExpressionAst]) { return Resolve-ODSUninstallLiteral $Node.SubExpression $Assignments $Before $next }
+    if ($Node -is [Management.Automation.Language.PipelineAst] -and $Node.PipelineElements.Count -eq 1) { return Resolve-ODSUninstallLiteral $Node.PipelineElements[0] $Assignments $Before $next }
+    if ($Node -is [Management.Automation.Language.StatementBlockAst]) {
+        foreach ($statement in $Node.Statements) { Resolve-ODSUninstallLiteral $statement $Assignments $Before $next }
+        return
+    }
+    if ($Node -is [Management.Automation.Language.ArrayLiteralAst]) {
+        foreach ($element in $Node.Elements) { Resolve-ODSUninstallLiteral $element $Assignments $Before $next }
+        return
+    }
+    if ($Node -is [Management.Automation.Language.BinaryExpressionAst] -and $Node.Operator -eq 'Plus' -and
+        $Node.Left -is [Management.Automation.Language.ArrayExpressionAst] -and
+        $Node.Right -is [Management.Automation.Language.ArrayExpressionAst]) {
+        Resolve-ODSUninstallLiteral $Node.Left $Assignments $Before $next
+        Resolve-ODSUninstallLiteral $Node.Right $Assignments $Before $next
+        return
+    }
+    throw 'Unknown launcher expression'
+}
+
+function Test-ODSUninstallCommandOwned {
+    param([string]$CommandLine, [string]$Executable='', [switch]$ArgumentsOnly, [int]$Depth=0)
+    if (-not $CommandLine -or $Depth -gt 2) { return $false }
+    $argv=@([regex]::Matches($CommandLine, '"([^"\r\n]*)"|[^\s"]+') | ForEach-Object { $_.Value.Trim('"') })
+    if (-not $ArgumentsOnly) {
+        if (-not $argv.Count) { return $false }
+        if (-not $Executable) { $Executable=$argv[0] }
+        $argv=@($argv | Select-Object -Skip 1)
+    }
+    $program=($Executable -split '[\\/]')[-1]
+    if ($program -match '^(powershell|pwsh)(\.exe)?$') {
+        for ($index=0; $index -lt $argv.Count; $index++) {
+            $arg=$argv[$index]
+            if ($arg -in @('-File','-f')) {
+                return ($index+1 -lt $argv.Count -and (Test-ODSUninstallPathOwned $argv[$index+1]))
+            }
+            if ($arg -in @('-EncodedCommand','-enc','-e')) {
+                if ($index+1 -ge $argv.Count) { return $false }
+                try {
+                    $text=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($argv[$index+1]))
+                    $errors=$null; $tokens=$null
+                    $ast=[Management.Automation.Language.Parser]::ParseInput($text,[ref]$tokens,[ref]$errors)
+                    if ($errors.Count) { return $false }
+                    if ($ast.ParamBlock -or $ast.BeginBlock -or $ast.ProcessBlock -or $ast.EndBlock.Traps.Count) { return $false }
+                    # Recognize the generated launcher without evaluating it.
+                    # Nested/deferred commands, aliases and mixed launchers do
+                    # not establish ownership of the scheduled task.
+                    $assignments=@{}; $launchers=@()
+                    foreach ($statement in $ast.EndBlock.Statements) {
+                        if ($statement -is [Management.Automation.Language.AssignmentStatementAst]) {
+                            if ($statement.Operator -ne 'Equals' -or $statement.Left -isnot [Management.Automation.Language.VariableExpressionAst]) { return $false }
+                            if (@($statement.Right.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst]},$true)).Count) { return $false }
+                            $name=$statement.Left.VariablePath.UserPath
+                            if ($assignments.ContainsKey($name)) { return $false }
+                            $assignments[$name]=$statement
+                            continue
+                        }
+                        if ($statement -isnot [Management.Automation.Language.PipelineAst] -or $statement.PipelineElements.Count -ne 1 -or
+                            $statement.PipelineElements[0] -isnot [Management.Automation.Language.CommandAst]) { return $false }
+                        $command=$statement.PipelineElements[0]
+                        if ($command.GetCommandName() -eq 'Set-Location') { continue }
+                        if ($command.GetCommandName() -ne 'Start-Process') { return $false }
+                        $launchers+=,$command
+                    }
+                    if ($launchers.Count -ne 1) { return $false }
+                    foreach ($command in $launchers) {
+                        $file=$null; $arguments=$null
+                        $elements=$command.CommandElements
+                        for ($i=1; $i -lt $elements.Count; $i++) {
+                            $element=$elements[$i]
+                            if ($element -is [Management.Automation.Language.CommandParameterAst]) {
+                                $value=$element.Argument
+                                if (-not $value -and $i+1 -lt $elements.Count -and $elements[$i+1] -isnot [Management.Automation.Language.CommandParameterAst]) { $value=$elements[$i+1] }
+                                if ($element.ParameterName -eq 'FilePath') { $file=$value }
+                                if ($element.ParameterName -eq 'ArgumentList') { $arguments=$value }
+                            } elseif ($i -eq 1) { $file=$element }
+                        }
+                        if (-not $file -or -not $arguments) { continue }
+                        $exe=@(Resolve-ODSUninstallLiteral $file $assignments $command.Extent.StartOffset)
+                        $values=@(Resolve-ODSUninstallLiteral $arguments $assignments $command.Extent.StartOffset)
+                        if ($exe.Count -ne 1) { continue }
+                        # Start-Process joins ArgumentList verbatim. Adding
+                        # quotes here would invent execution proof for paths
+                        # that the real launcher splits at spaces.
+                        $serialized=$values -join ' '
+                        if (Test-ODSUninstallCommandOwned $serialized $exe[0] -ArgumentsOnly -Depth ($Depth+1)) { return $true }
+                    }
+                } catch { return $false }
+                return $false
+            }
+            if ($arg -in @('-NoProfile','-NoLogo','-NonInteractive','-Sta','-Mta')) { continue }
+            if ($arg -in @('-ExecutionPolicy','-WindowStyle')) { $index++; continue }
+            # Inline commands and unknown switches cannot establish script execution.
+            return $false
+        }
+    } elseif ($program -match '^bash(\.exe)?$') {
+        # Native model upgrades use Git Bash with exactly one generated ODS
+        # wrapper. Do not infer ownership from -c, another script, or a shared
+        # bash.exe location.
+        if ($argv.Count -ne 1 -or -not (Test-ODSUninstallPathOwned $argv[0])) { return $false }
+        try {
+            $expected=[IO.Path]::GetFullPath((Join-Path $InstallDir 'logs\bootstrap-run.sh'))
+            $actual=[IO.Path]::GetFullPath($argv[0])
+            return $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)
+        } catch { return $false }
+    } elseif ($program -match '^(python(?:3(?:\.\d+)?)?|pythonw|py)(\.exe)?$') {
+        foreach ($arg in $argv) {
+            if ($arg -in @('-u','-B','-E','-s','-S') -or $arg -match '^-[23](?:\.\d+)?$') { continue }
+            if ($arg.StartsWith('-')) { return $false }
+            return (Test-ODSUninstallPathOwned $arg)
+        }
+    } elseif ($program -match '^(wscript|cscript)(\.exe)?$') {
+        foreach ($arg in $argv) {
+            if ($arg.StartsWith('//')) { continue }
+            return (Test-ODSUninstallPathOwned $arg)
+        }
+    }
+    return $false
+}
+
+function Test-ODSUninstallTaskOwned {
+    param($Task)
+    if (-not $Task -or -not @($Task.Actions).Count) { return $false }
+    foreach ($action in @($Task.Actions)) {
+        if (-not (Test-ODSUninstallPathOwned ([string]$action.Execute)) -and
+            -not (Test-ODSUninstallCommandOwned ([string]$action.Arguments) ([string]$action.Execute) -ArgumentsOnly)) { return $false }
+    }
+    return $true
+}
+
+function Test-ODSUninstallStartupLauncherOwned {
+    param([string]$Content)
+    if ([string]::IsNullOrWhiteSpace($Content)) { return $false }
+    # Both native installer paths write the exact comment before this VBS
+    # launcher. Older generated files omitted it. Reject any extra commands.
+    $launcher=[regex]::Match($Content.Trim(), '(?i)^(?:'' ODS Host Agent login startup launcher\r?\n)?Set WshShell = CreateObject\("WScript\.Shell"\)\r?\nWshShell\.Run "([^"\r\n]+)", 0, False$')
+    return ($launcher.Success -and (Test-ODSUninstallCommandOwned $launcher.Groups[1].Value))
+}
+
+function Stop-ODSUninstallOwnedHelpers {
+    # Shared executable locations, ports and stale PID files cannot identify
+    # an installation. Only a helper's executable/script path can do that.
+    Remove-ODSOpenCodeStartupFallback -InstallDir $InstallDir
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $byId = @{}; $ancestors = @{}
+    foreach ($process in $processes) { $byId[[int]$process.ProcessId] = $process }
+    $ancestorId = $PID
+    while ($ancestorId -gt 0 -and -not $ancestors.ContainsKey($ancestorId)) {
+        $ancestors[$ancestorId] = $true
+        if (-not $byId.ContainsKey($ancestorId)) { break }
+        $ancestorId = [int]$byId[$ancestorId].ParentProcessId
+    }
+    $owned=@{}
+    foreach ($process in $processes) {
+        if ($ancestors.ContainsKey([int]$process.ProcessId)) { continue }
+        if ([string]$process.Name -notmatch '^(python(?:3(?:\.\d+)?)?|pythonw|py|bash|powershell|pwsh|wscript|cscript|opencode|llama-server|lemonade-server)(\.exe)?$') { continue }
+        if ((Test-ODSUninstallPathOwned ([string]$process.ExecutablePath)) -or
+            (Test-ODSUninstallCommandOwned ([string]$process.CommandLine) ([string]$process.Name))) {
+            $owned[[int]$process.ProcessId]=$true
+        }
+    }
+    # Native runtimes installed outside ODS can be children of an owned
+    # launcher. The captured parent chain, rather than a shared port or PID
+    # file, establishes their association with this installation.
+    $ordered=@($processes | Where-Object { $owned.ContainsKey([int]$_.ProcessId) })
+    do {
+        $added=$false
+        foreach ($process in $processes) {
+            $id=[int]$process.ProcessId
+            if ($owned.ContainsKey($id) -or $ancestors.ContainsKey($id)) { continue }
+            if ($owned.ContainsKey([int]$process.ParentProcessId)) {
+                $owned[$id]=$true; $ordered+=,$process; $added=$true
+            }
+        }
+    } while ($added)
+    [array]::Reverse($ordered)
+    foreach ($process in $ordered) {
+        try { Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop }
+        catch { if (Get-Process -Id ([int]$process.ProcessId) -ErrorAction SilentlyContinue) { throw } }
+    }
+    $startup = [Environment]::GetFolderPath('Startup')
+    if ($startup) {
+        $entry = Join-Path $startup 'ods-host-agent.vbs'
+        if (Test-Path -LiteralPath $entry) {
+            $content=Get-Content -LiteralPath $entry -Raw -ErrorAction Stop
+            if (Test-ODSUninstallStartupLauncherOwned $content) {
+                Remove-Item -LiteralPath $entry -Force -ErrorAction Stop
+            }
+        }
+    }
+}
+
+function Invoke-Uninstall {
+    param([string[]]$UninstallArgs)
+
+    $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+
+    $force = Test-ODSArgumentPresent -Arguments $UninstallArgs -Names @("-Force", "--force")
+    $keepData = Test-ODSArgumentPresent -Arguments $UninstallArgs -Names @("-KeepData", "--keep-data")
+    $keepModels = Test-ODSArgumentPresent -Arguments $UninstallArgs -Names @("-KeepModels", "--keep-models")
+    $removeVolumes = (-not $keepData -and -not $keepModels)
+
+    $dockerAvailable = Test-ODSDockerRunningQuiet
+    $hasInstallDir = Test-Path -LiteralPath $InstallDir
+    $hasProjectContainers = $false
+    if ($dockerAvailable) {
+        $hasProjectContainers = (@(Get-ODSDockerProjectResourceNames -Kind "container").Count -gt 0)
+    }
+
+    if (-not $dockerAvailable) {
+        Write-AIError "Docker Desktop is not running, so ODS containers and volumes cannot be removed safely."
+        Write-AI "Start Docker Desktop and rerun the uninstall command. Runtime files were left unchanged."
+        throw "ODS_UNINSTALL_DOCKER_UNAVAILABLE"
+    }
+
+    if ($hasInstallDir) {
+        Assert-ODSInstallDirSafeForRemoval
+    }
+
+    # Check before stopping helpers or compose down -v, not after data is gone.
+    $ownership = Assert-ODSDockerProjectOwnership -RemoveVolumes:$removeVolumes
+
+    if (-not $hasInstallDir -and -not $hasProjectContainers) {
+        Write-AISuccess "No ODS install found at $InstallDir"
+        return
+    }
+
+    if (-not $force) {
+        Write-AIWarn "This will stop ODS and remove the Windows runtime at $InstallDir."
+        if ($removeVolumes) {
+            Write-AIWarn "Docker volumes for the ods project will also be removed."
+        }
+        $answer = Read-Host "Type uninstall to continue"
+        if ($answer -ne "uninstall") {
+            Write-AI "Uninstall cancelled."
+            return
+        }
+    }
+
+    Write-AI "Stopping ODS host-side helpers..."
+    Stop-ODSUninstallOwnedHelpers
+
+    foreach ($taskName in @($script:ODS_AGENT_TASK_NAME, $script:ODS_MODEL_UPGRADE_TASK_NAME, $script:LEMONADE_TASK_NAME, $script:OPENCODE_TASK_NAME, $script:NATIVE_LLAMA_TASK_NAME)) {
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if (-not $task) { continue }
+        if (-not (Test-ODSUninstallTaskOwned $task)) {
+            Write-AIWarn "Scheduled task $taskName has no verified installation ownership; preserving it."
+            continue
+        }
+        # A task left behind keeps a helper running against a deleted runtime,
+        # so a failed removal is reported with the command to finish it.
+        try {
+            if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop }
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+        } catch [Microsoft.Management.Infrastructure.CimException] {
+            Write-AIWarn "Scheduled task $taskName could not be removed ($($_.Exception.Message)). Remove it with: Unregister-ScheduledTask -TaskName '$taskName' -Confirm:`$false"
+        }
+    }
+
+    # Remove only the resources identified by the ownership preflight. Saved
+    # Compose flags/files can name another project or unrelated volumes, so
+    # they are not deletion authority. IDs also prevent a replacement container
+    # or network with the same name from being swept into this uninstall.
+    Remove-ODSDockerProjectByLabel -RemoveVolumes:$removeVolumes -Ownership $ownership
+    $remainingContainers = @(Get-ODSDockerProjectResourceNames -Kind "container")
+    $remainingNetworks = @(Get-ODSDockerProjectResourceNames -Kind "network")
+    $remainingVolumes = if ($removeVolumes) {
+        @(Get-ODSDockerProjectResourceNames -Kind "volume")
+    } else {
+        @()
+    }
+    if ($remainingContainers.Count -gt 0 -or $remainingNetworks.Count -gt 0 -or $remainingVolumes.Count -gt 0) {
+        Write-AIError "Docker cleanup is incomplete; runtime files were left in place for recovery."
+        Write-AI "Remaining resources: containers=$($remainingContainers.Count) networks=$($remainingNetworks.Count) volumes=$($remainingVolumes.Count)"
+        foreach ($name in @($remainingContainers + $remainingNetworks + $remainingVolumes)) { Write-AI "  still present: $name" }
+        Write-AI "A resource that is still in use by a container outside ODS cannot be removed; stop that container, then rerun uninstall."
+        throw "ODS_UNINSTALL_DOCKER_CLEANUP_INCOMPLETE"
+    }
+
+    Remove-ODSInstallDirectory -KeepData:$keepData -KeepModels:$keepModels
+
+    if ($keepData) {
+        Write-AISuccess "ODS uninstalled; data was preserved at $InstallDir\data"
+    } elseif ($keepModels) {
+        Write-AISuccess "ODS uninstalled; models were preserved at $InstallDir\data\models"
+    } else {
+        Write-AISuccess "ODS uninstalled from $InstallDir"
+    }
+}
+
+function Read-ODSEnv {
+    <#
+    .SYNOPSIS
+        Safely load .env file into a hashtable (no eval, no injection).
+    #>
+    return Get-WindowsODSEnvMap -InstallDir $InstallDir
+}
+
+function Get-ODSEnvValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Default = ""
+    )
+    try {
+        $envMap = Read-ODSEnv
+        if ($envMap.ContainsKey($Name) -and -not [string]::IsNullOrWhiteSpace($envMap[$Name])) {
+            return $envMap[$Name]
+        }
+    } catch { }
+    return $Default
+}
+
+function Sync-ODSNativeInferenceConfig {
+    <#
+    .SYNOPSIS
+        Align native inference runtime constants with the installed .env.
+    #>
+    try {
+        $envMap = Read-ODSEnv
+        $nativePort = $envMap["AMD_INFERENCE_PORT"]
+        if (-not [string]::IsNullOrWhiteSpace($nativePort)) {
+            $parsedPort = 0
+            if ([int]::TryParse($nativePort, [ref]$parsedPort) -and $parsedPort -gt 0 -and $parsedPort -le 65535) {
+                $script:NATIVE_LLM_PORT = $parsedPort
+            }
+        }
+    } catch { }
+}
+
+function Invoke-HermesSoulRefresh {
+    <#
+    .SYNOPSIS
+        Render data/persona/SOUL.md and optionally copy it into ods-hermes.
+    #>
+    param([switch]$SyncContainer)
+
+    $builder = Join-Path (Join-Path $InstallDir "scripts") "build-installation-context.py"
+    $template = Join-Path (Join-Path (Join-Path $InstallDir "extensions") "services\hermes") "SOUL.md.template"
+    $envPath = Join-Path $InstallDir ".env"
+    $output = Join-Path (Join-Path (Join-Path $InstallDir "data") "persona") "SOUL.md"
+    $outputDir = Split-Path -Parent $output
+
+    if (-not (Test-Path $template)) {
+        Write-AIWarn "Hermes SOUL.md template not found; skipping persona refresh."
+        return
+    }
+
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    $rendered = $false
+    $profileArgs = @()
+    try {
+        $envMap = Read-ODSEnv
+        # Windows AMD keeps the compact prompt profile. Its name is the
+        # build-installation-context.py interface, not a runtime choice.
+        if ($envMap["AMD_INFERENCE_RUNTIME_MODE"] -eq "windows-native-llama-server") {
+            $profileArgs = @("--profile", "local-lemonade")
+        }
+    } catch { }
+    if (Test-Path $builder) {
+        $pythonCandidates = @(
+            @{ Command = "python"; Args = @() },
+            @{ Command = "python3"; Args = @() },
+            @{ Command = "py"; Args = @("-3") }
+        )
+
+        foreach ($candidate in $pythonCandidates) {
+            $cmd = Get-Command $candidate.Command -ErrorAction SilentlyContinue
+            if (-not $cmd -or -not $cmd.Source) { continue }
+            try {
+                & $cmd.Source @($candidate.Args) $builder "--template" $template "--env" $envPath "--output" $output @profileArgs *>> $script:ODS_LOG_FILE
+                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $output -PathType Leaf)) {
+                    $rendered = $true
+                    break
+                }
+            } catch {
+                Add-Content -Path $script:ODS_LOG_FILE -Value "Hermes SOUL.md refresh failed with $($candidate.Command): $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if (-not $rendered) {
+        if (Test-Path -LiteralPath $output) {
+            Remove-Item -LiteralPath $output -Recurse -Force
+        }
+        $content = Get-Content -LiteralPath $template -Raw
+        $content = $content -replace "(?m)^\s*<!-- INSTALLATION_CONTEXT -->\s*\r?\n?", ""
+        [System.IO.File]::WriteAllText($output, $content, (New-Object System.Text.UTF8Encoding($false)))
+        Write-AIWarn "Generated fallback Hermes SOUL.md without dynamic installation context"
+    }
+
+    if ($SyncContainer) {
+        $names = & docker ps --format "{{.Names}}" 2>$null
+        if ($names -contains "ods-hermes") {
+            & docker exec ods-hermes cp /opt/hermes/docker/SOUL.md /opt/data/SOUL.md *>> $script:ODS_LOG_FILE
+            if ($LASTEXITCODE -eq 0) {
+                Write-AISuccess "Synced Hermes SOUL.md"
+            } else {
+                Write-AIWarn "Could not sync Hermes SOUL.md into running container"
+            }
+        }
+    }
+}
+
+function Get-ODSVoiceDiagnosis {
+    $whisperPort = Get-ODSEnvValue -Name "WHISPER_PORT" -Default "9000"
+    $whisperUrl = "http://localhost:$whisperPort"
+    $sttModel = Get-ODSEnvValue -Name "AUDIO_STT_MODEL" -Default "Systran/faster-whisper-base"
+    $sttModelEncoded = $sttModel -replace "/", "%2F"
+    $modelUrl = "$whisperUrl/v1/models/$sttModelEncoded"
+    $ttsPort = Get-ODSEnvValue -Name "TTS_PORT" -Default "8880"
+    $ttsUrl = "http://localhost:$ttsPort"
+
+    $result = [ordered]@{
+        WhisperPort      = $whisperPort
+        WhisperUrl       = $whisperUrl
+        WhisperHealthy   = $false
+        ModelsApiReady   = $false
+        SttModel         = $sttModel
+        SttModelCached   = $false
+        SttModelUrl      = $modelUrl
+        RecoveryCommand  = "curl.exe --max-time 30 -X POST '$modelUrl'"
+        TtsPort          = $ttsPort
+        TtsUrl           = $ttsUrl
+        TtsHealthy       = $false
+    }
+
+    try {
+        Invoke-WebRequest -Uri "$whisperUrl/health" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop | Out-Null
+        $result.WhisperHealthy = $true
+    } catch { }
+
+    try {
+        $resp = Invoke-WebRequest -Uri "$whisperUrl/v1/models" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+        if ($resp.StatusCode -eq 200) {
+            $result.ModelsApiReady = $true
+        }
+    } catch { }
+
+    try {
+        $resp = Invoke-WebRequest -Uri $modelUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+        if ($resp.StatusCode -eq 200) {
+            $result.SttModelCached = $true
+        }
+    } catch { }
+
+    try {
+        Invoke-WebRequest -Uri "$ttsUrl/health" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop | Out-Null
+        $result.TtsHealthy = $true
+    } catch { }
+
+    return $result
+}
+
+function Invoke-ODSSttModelDownloadTrigger {
+    param([Parameter(Mandatory=$true)][string]$ModelUrl)
+
+    # Speaches keeps downloading after it accepts the request. Keep the caller
+    # bounded so slow Hugging Face transfers do not wedge ods.ps1 or install.
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            # PS 5.1 turns redirected native stderr into ErrorRecords. Curl's
+            # timeout diagnostic must reach the exit-28 decision below instead
+            # of terminating repair before it can verify the model cache.
+            $ErrorActionPreference = 'Continue'
+            $curlOutput = & $curl.Source --fail --silent --show-error --max-time 30 -X POST $ModelUrl 2>&1
+            $curlExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($curlExit -eq 0 -or $curlExit -eq 28) { return $true }
+        Write-AIWarn "STT model download trigger returned curl exit $curlExit; verifying cache before failing."
+        if ($curlOutput) {
+            Write-Host "  $($curlOutput | Out-String)" -ForegroundColor DarkGray
+        }
+        return $false
+    }
+
+    try {
+        Invoke-WebRequest -Method POST -Uri $ModelUrl -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-AIWarn "STT model download trigger failed; verifying cache before failing."
+        return $false
+    }
+}
+
+function Wait-ODSSttModelCached {
+    param(
+        [Parameter(Mandatory=$true)][string]$ModelUrl,
+        [int]$TimeoutSeconds = 900
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $check = Invoke-WebRequest -Uri $ModelUrl -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+            if ($check.StatusCode -eq 200) { return $true }
+        } catch { }
+        Start-Sleep -Seconds 5
+    }
+
+    try {
+        $check = Invoke-WebRequest -Uri $ModelUrl -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+        return ($check.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+function Test-ODSSttModelCache {
+    try {
+        $flags = Get-ComposeFlags
+        if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "whisper")) {
+            return
+        }
+    } catch { }
+
+    $diag = Get-ODSVoiceDiagnosis
+    if (-not $diag.WhisperHealthy) {
+        Write-AIWarn "Whisper STT: not responding (port $($diag.WhisperPort))"
+        return
+    }
+    if ($diag.SttModelCached) {
+        Write-AISuccess "Whisper STT model: cached ($($diag.SttModel))"
+        return
+    }
+
+    $apiState = if ($diag.ModelsApiReady) { "models API ready" } else { "models API not ready" }
+    Write-AIWarn "Whisper STT model missing ($($diag.SttModel)) -- transcription will 404 ($apiState)"
+    Write-Host "  Run: $($diag.RecoveryCommand)" -ForegroundColor DarkGray
+}
+
+function Wait-ODSHttpOk {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $resp = Invoke-WebRequest -Uri $Url -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) {
+                return $true
+            }
+        } catch { }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+function Test-ODSComposeServiceAvailable {
+    param(
+        [string[]]$ComposeFlags,
+        [Parameter(Mandatory = $true)][string]$Service
+    )
+
+    try {
+        $services = & docker compose @ComposeFlags config --services 2>$null
+        return ($services -contains $Service)
+    } catch {
+        return $false
+    }
+}
+
+function Get-ODSRunningComposeServices {
+    param([string[]]$ComposeFlags)
+
+    try {
+        $services = & docker compose @ComposeFlags ps --services --filter "status=running" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $services) {
+            return @($services |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique)
+        }
+    } catch { }
+
+    try {
+        $services = & docker ps `
+            --filter "label=com.docker.compose.project=ods" `
+            --format "{{.Label ""com.docker.compose.service""}}" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $services) {
+            return @($services |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique)
+        }
+    } catch { }
+
+    return @()
+}
+
+function Test-ODSComposeServicesStarted {
+    param(
+        [string[]]$ComposeFlags,
+        [string[]]$Services
+    )
+
+    if (-not $Services -or $Services.Count -eq 0) {
+        return $false
+    }
+
+    foreach ($service in $Services) {
+        if ([string]::IsNullOrWhiteSpace($service)) {
+            continue
+        }
+
+        $ids = @()
+        try {
+            $ids = @(& docker compose @ComposeFlags ps --all -q $service 2>$null |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            # Partial stdout is not a complete inventory when Docker failed.
+            # Keep the bounded retry path rather than certifying startup from
+            # whichever container IDs happened to arrive before the failure.
+            if ($LASTEXITCODE -ne 0) {
+                return $false
+            }
+        } catch {
+            return $false
+        }
+
+        if (-not $ids -or $ids.Count -eq 0) {
+            return $false
+        }
+
+        foreach ($id in $ids) {
+            $state = ""
+            try {
+                $state = & docker inspect --format "{{.State.Status}} {{.State.ExitCode}}" $id 2>$null
+            } catch {
+                return $false
+            }
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($state)) {
+                return $false
+            }
+
+            $normalized = $state.Trim()
+            if ($normalized -like "running *") {
+                continue
+            }
+            if ($normalized -eq "exited 0") {
+                continue
+            }
+
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Invoke-ODSComposeUpWithStartupRetry {
+    param(
+        [string[]]$ComposeFlags,
+        [string[]]$ComposeArgs,
+        [string[]]$Services,
+        [string]$Description = "docker compose up"
+    )
+
+    $attempts = 20
+    $parsedAttempts = 0
+    if ([int]::TryParse([string]$env:ODS_RESTART_STARTUP_RETRY_ATTEMPTS, [ref]$parsedAttempts) -and $parsedAttempts -gt 0) {
+        $attempts = $parsedAttempts
+    }
+
+    $delaySeconds = 15
+    $parsedDelay = 0
+    if ([int]::TryParse([string]$env:ODS_RESTART_STARTUP_RETRY_DELAY_SECONDS, [ref]$parsedDelay) -and $parsedDelay -gt 0) {
+        $delaySeconds = $parsedDelay
+    }
+
+    $composeExit = 1
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $ComposeFlags `
+            -ComposeArgs $ComposeArgs
+        if ($composeExit -eq 0) {
+            return 0
+        }
+
+        if (Test-ODSComposeServicesStarted -ComposeFlags $ComposeFlags -Services $Services) {
+            Write-AIWarn "$Description returned $composeExit, but targeted services are running or completed cleanly; continuing."
+            return 0
+        }
+
+        if ($attempt -lt $attempts) {
+            Write-AIWarn "$Description returned $composeExit; waiting for dependencies to settle before retrying ($attempt/$($attempts - 1))."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+
+    return $composeExit
+}
+
+function Write-ODSMissingComposeServiceHint {
+    param(
+        [string[]]$ComposeFlags,
+        [Parameter(Mandatory = $true)][string]$Service
+    )
+
+    Write-AIError "Service '$Service' is not in the active ODS compose stack."
+
+    $serviceDir = Join-Path (Join-Path (Join-Path $InstallDir "extensions") "services") $Service
+    $composePath = Join-Path $serviceDir "compose.yaml"
+    $disabledComposePath = Join-Path $serviceDir "compose.yaml.disabled"
+
+    if (Test-Path $disabledComposePath) {
+        Write-AI "The $Service extension appears disabled in this runtime tree."
+    } elseif (Test-Path $composePath) {
+        Write-AI "The $Service extension exists, but the active .compose-flags stack does not include it."
+        Write-AI "This can happen after a reinstall with different feature choices or a stale compose cache."
+    } else {
+        Write-AI "No compose fragment for '$Service' was found under extensions/services."
+    }
+
+    if ($Service -eq "n8n" -or $Service -eq "workflows") {
+        Write-AI "n8n is optional. Install with -Workflows or -All if you want workflow automation."
+    }
+
+    Write-AI "Active compose services:"
+    try {
+        $services = & docker compose @ComposeFlags config --services 2>$null
+        if ($services) {
+            $services | ForEach-Object { Write-AI "  $_" }
+        } else {
+            Write-AI "  (none returned by docker compose config --services)"
+        }
+    } catch {
+        Write-AI "  Could not inspect compose services. Run the diagnostic command below manually."
+    }
+
+    Write-AI "Diagnostic command:"
+    Write-AI "  `$flags = (Get-Content .compose-flags -Raw).Trim() -split '\s+'"
+    Write-AI "  docker compose @flags config --services"
+}
+
+function Set-ODSEnvValue {
+    <#
+    .SYNOPSIS
+        Upsert a KEY=VALUE pair in .env without adding a UTF-8 BOM.
+    #>
+    param(
+        [string]$Key,
+        [string]$Value
+    )
+
+    $envFile = Join-Path $InstallDir ".env"
+    if (-not (Test-Path $envFile)) { return }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $escapedKey = [regex]::Escape($Key)
+    $updated = $false
+    foreach ($line in @(Get-Content -LiteralPath $envFile -Encoding UTF8)) {
+        if ($line -match "^${escapedKey}=") {
+            if (-not $updated) {
+                [void]$lines.Add("${Key}=${Value}")
+                $updated = $true
+            }
+        } else {
+            [void]$lines.Add($line)
+        }
+    }
+
+    if (-not $updated) {
+        [void]$lines.Add("${Key}=${Value}")
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($envFile, $lines.ToArray(), $utf8NoBom)
+}
+
+function Ensure-HermesDashboardSessionToken {
+    $current = Get-ODSEnvValue -Name "HERMES_DASHBOARD_SESSION_TOKEN"
+    if (-not [string]::IsNullOrWhiteSpace($current)) {
+        return
+    }
+
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $bytes = New-Object byte[] 32
+        $rng.GetBytes($bytes)
+        $token = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+    } finally {
+        $rng.Dispose()
+    }
+    Set-ODSEnvValue -Key "HERMES_DASHBOARD_SESSION_TOKEN" -Value $token
+}
+
+function Set-ODSProxyAuthRequired {
+    $envFile = Join-Path $InstallDir ".env"
+    if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+        throw "Cannot enable network access without $envFile."
+    }
+
+    $current = Get-ODSEnvValue -Name "WEBUI_AUTH"
+    if ($current -ne "true") {
+        Set-ODSEnvValue -Key "WEBUI_AUTH" -Value "true"
+        Write-AI "Network access requires sign-in; set WEBUI_AUTH=true."
+    }
+    $env:WEBUI_AUTH = "true"
+}
+
+# A BIND_ADDRESS other than loopback publishes Open WebUI beyond this machine,
+# with or without the ODS proxy, so it needs the same sign-in enforcement.
+# Same rule as _bind_address_is_network in bin/ods-host-agent.py.
+function Test-ODSBindAddressIsNetwork {
+    param([string]$BindAddress)
+
+    $bind = $BindAddress.Trim().Trim([char[]]@('"', "'"))
+    if ($bind -eq "") { $bind = "127.0.0.1" }
+    # -notin ignores case, as the host agent's lower() does.
+    return $bind -notin @("127.0.0.1", "::1", "[::1]", "localhost")
+}
+
+# Mirrors _ods_cli_network_access_enabled in ods-cli.
+function Test-ODSNetworkAccessEnabled {
+    param([string[]]$ComposeFlags)
+
+    if (Test-ODSBindAddressIsNetwork -BindAddress (Get-ODSEnvValue -Name "BIND_ADDRESS")) {
+        return $true
+    }
+    return [bool](Test-ODSComposeServiceAvailable -ComposeFlags $ComposeFlags -Service "ods-proxy")
+}
+
+function Invoke-ODSProxyAuthPreflight {
+    param([Parameter(Mandatory = $true)][string[]]$ComposeFlags)
+
+    Set-ODSProxyAuthRequired
+    Write-AI "Applying authenticated Open WebUI configuration..."
+    $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $ComposeFlags `
+        -ComposeArgs @("up", "-d", "--no-deps", "--force-recreate", "open-webui")
+    if ($composeExit -ne 0) {
+        Write-AIError "Could not recreate Open WebUI with authentication; ods-proxy was not started."
+        Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $ComposeFlags `
+            -Phase "ods.ps1 proxy auth preflight"
+        throw "ODS_PROXY_AUTH_PREFLIGHT_FAILED"
+    }
+}
+
+function Select-AutoCpuValue {
+    <#
+    .SYNOPSIS
+        Keep a manual CPU override only when it is valid and more conservative.
+    #>
+    param(
+        [string]$Existing,
+        [string]$Detected
+    )
+
+    $existingNumber = 0.0
+    $detectedNumber = 0.0
+    $style = [System.Globalization.NumberStyles]::Float
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $existingValid = [double]::TryParse($Existing, $style, $culture, [ref]$existingNumber)
+    $detectedValid = [double]::TryParse($Detected, $style, $culture, [ref]$detectedNumber)
+
+    if ($existingValid -and $detectedValid -and $existingNumber -gt 0 -and $existingNumber -le $detectedNumber) {
+        return $Existing
+    }
+    return $Detected
+}
+
+function Select-CappedCpuValue {
+    param(
+        [string]$Desired,
+        [string]$Ceiling
+    )
+
+    $desiredNumber = 0.0
+    $ceilingNumber = 0.0
+    $style = [System.Globalization.NumberStyles]::Float
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    if (-not [double]::TryParse($Desired, $style, $culture, [ref]$desiredNumber)) {
+        $desiredNumber = 1.0
+    }
+    if (-not [double]::TryParse($Ceiling, $style, $culture, [ref]$ceilingNumber) -or $ceilingNumber -le 0) {
+        $ceilingNumber = 1.0
+    }
+
+    $value = [Math]::Min($desiredNumber, $ceilingNumber)
+    if ($value -lt 0.01) { $value = 0.01 }
+    return $value.ToString("0.0", $culture)
+}
+
+function Ensure-LlamaCpuBudget {
+    <#
+    .SYNOPSIS
+        Backfill/cap llama-server CPU settings for existing installs.
+    #>
+    $envFile = Join-Path $InstallDir ".env"
+    if (-not (Test-Path $envFile)) { return }
+
+    $envVars = Read-ODSEnv
+    $gpuBackend = $envVars["GPU_BACKEND"]
+    if ([string]::IsNullOrWhiteSpace($gpuBackend) -or $gpuBackend -eq "none") {
+        $gpuBackend = "cpu"
+    }
+    $gpuBackend = $gpuBackend.ToLowerInvariant()
+
+    $budget = Get-LlamaCpuBudget -GpuBackend $gpuBackend
+    $llamaCpuLimit = Select-AutoCpuValue -Existing $envVars["LLAMA_CPU_LIMIT"] -Detected $budget.Limit
+    $llamaCpuReservation = Select-AutoCpuValue -Existing $envVars["LLAMA_CPU_RESERVATION"] -Detected $budget.Reservation
+
+    $limitNumber = 0.0
+    $reservationNumber = 0.0
+    $style = [System.Globalization.NumberStyles]::Float
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    if ([double]::TryParse($llamaCpuLimit, $style, $culture, [ref]$limitNumber) -and
+        [double]::TryParse($llamaCpuReservation, $style, $culture, [ref]$reservationNumber) -and
+        $reservationNumber -gt $limitNumber) {
+        $llamaCpuReservation = $llamaCpuLimit
+    }
+
+    $changed = $false
+    if ($envVars["LLAMA_CPU_LIMIT"] -ne $llamaCpuLimit) {
+        Set-ODSEnvValue -Key "LLAMA_CPU_LIMIT" -Value $llamaCpuLimit
+        $changed = $true
+    }
+    if ($envVars["LLAMA_CPU_RESERVATION"] -ne $llamaCpuReservation) {
+        Set-ODSEnvValue -Key "LLAMA_CPU_RESERVATION" -Value $llamaCpuReservation
+        $changed = $true
+    }
+
+    if ($changed) {
+        Write-AI ("Auto-adjusted llama-server CPU budget: limit={0}, reservation={1} (Docker CPUs: {2})" -f `
+            $llamaCpuLimit, $llamaCpuReservation, $budget.Available)
+    }
+
+    $serviceChanged = $false
+    $serviceBudgets = @(
+        @{ Name = "TTS"; DesiredLimit = "8.0"; DesiredReservation = "2.0" },
+        @{ Name = "WHISPER"; DesiredLimit = "4.0"; DesiredReservation = "1.0" },
+        @{ Name = "HERMES"; DesiredLimit = "4.0"; DesiredReservation = "0.5" },
+        @{ Name = "COMFYUI"; DesiredLimit = "16.0"; DesiredReservation = "2.0" }
+    )
+    foreach ($service in $serviceBudgets) {
+        $limitKey = "$($service.Name)_CPU_LIMIT"
+        $reservationKey = "$($service.Name)_CPU_RESERVATION"
+        $detectedLimit = Select-CappedCpuValue -Desired $service.DesiredLimit -Ceiling $budget.Available
+        $finalLimit = Select-AutoCpuValue -Existing $envVars[$limitKey] -Detected $detectedLimit
+        $detectedReservation = Select-CappedCpuValue -Desired $service.DesiredReservation -Ceiling $finalLimit
+        $finalReservation = Select-AutoCpuValue -Existing $envVars[$reservationKey] -Detected $detectedReservation
+
+        $finalLimitNumber = 0.0
+        $finalReservationNumber = 0.0
+        if ([double]::TryParse($finalLimit, $style, $culture, [ref]$finalLimitNumber) -and
+            [double]::TryParse($finalReservation, $style, $culture, [ref]$finalReservationNumber) -and
+            $finalReservationNumber -gt $finalLimitNumber) {
+            $finalReservation = $finalLimit
+        }
+
+        if ($envVars[$limitKey] -ne $finalLimit) {
+            Set-ODSEnvValue -Key $limitKey -Value $finalLimit
+            $serviceChanged = $true
+        }
+        if ($envVars[$reservationKey] -ne $finalReservation) {
+            Set-ODSEnvValue -Key $reservationKey -Value $finalReservation
+            $serviceChanged = $true
+        }
+    }
+
+    if ($serviceChanged) {
+        Write-AI ("Auto-adjusted bundled service CPU budgets (Docker CPUs: {0})" -f $budget.Available)
+    }
+}
+
+# ── AMD native inference server management (llama-server.exe, Vulkan) ──
+
+function Get-ODSNativeModelSelection {
+    param([switch]$VerifyArtifacts, [switch]$AllowMissingModel)
+
+    $envMap = Read-ODSEnv
+    $storeId = [string]$envMap['ODS_ACTIVE_MODEL_STORE']
+    if ([string]::IsNullOrWhiteSpace($storeId)) { $storeId = 'default' }
+    $registry = Join-Path $InstallDir 'data/model-stores.json'
+    if ($storeId -eq 'default' -and -not (Test-Path -LiteralPath $registry)) {
+        $filename = [string]$envMap['GGUF_FILE']
+        if ([string]::IsNullOrWhiteSpace($filename)) { $filename = 'Qwen3.5-9B-Q4_K_M.gguf' }
+        if ($filename -match '[/\\\x00\r\n]' -or $filename -in @('.', '..')) {
+            throw 'Invalid configured model filename'
+        }
+        $directory = Join-Path $InstallDir 'data/models'
+        $modelPath = Join-Path $directory $filename
+        if ($VerifyArtifacts -and (-not (Test-Path -LiteralPath $modelPath -PathType Leaf) -or
+            (Get-Item -LiteralPath $modelPath).Length -le 0)) {
+            throw 'The configured native model is missing or empty; the current runtime was not stopped'
+        }
+        return [pscustomobject]@{ schemaVersion = 1; storeId = 'default'; modelsDirectory = $directory;
+            modelPath = $modelPath; profile = $null }
+    }
+    $resolver = Join-Path $InstallDir 'scripts/resolve-model-store.py'
+    if (-not (Test-Path -LiteralPath $resolver -PathType Leaf)) {
+        throw 'Registered model store resolver is missing; repair the ODS installation before starting inference'
+    }
+    $python = Resolve-ODSHostAgentPython
+    if (-not $python) { throw 'Python 3 is required to resolve the registered model store' }
+    $resolverArgs = @($python.PrefixArgs) + @($resolver, '--install-dir', $InstallDir)
+    if ($VerifyArtifacts) { $resolverArgs += '--verify-artifacts' }
+    if ($AllowMissingModel) { $resolverArgs += '--allow-missing-model' }
+    $output = & $python.FilePath @resolverArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Configured model store is unavailable: $(($output | Out-String).Trim())"
+    }
+    try { $selection = ($output | Out-String) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Registered model store resolver returned an invalid response' }
+    if ($selection.schemaVersion -ne 1 -or $selection.storeId -ne $storeId -or
+        -not [IO.Path]::IsPathRooted([string]$selection.modelsDirectory) -or
+        -not [IO.Path]::IsPathRooted([string]$selection.modelPath)) {
+        throw 'Registered model store resolver returned an invalid selection'
+    }
+    return $selection
+}
+
+function Get-ODSConfiguredNativeExecutable {
+    $selection = Get-ODSNativeModelSelection -AllowMissingModel
+    if ($selection.profile) { return [string]$selection.profile.executable }
+    return $script:LLAMA_SERVER_EXE
+}
+
+function ConvertTo-ODSNativeArgumentString {
+    param([string[]]$Values)
+    # Start-Process joins ArgumentList without quoting. Preserve SSD paths with
+    # spaces, Unicode, quotes or trailing backslashes using Windows CRT rules.
+    return (@($Values | ForEach-Object {
+        '"' + [regex]::Replace([regex]::Replace([string]$_, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+    }) -join ' ')
+}
+
+function Get-NativeInferenceBackend {
+    <#
+    .SYNOPSIS
+        Determine which native inference backend is configured (from .env LLM_BACKEND).
+    #>
+    Sync-ODSNativeInferenceConfig
+    $configuredExecutable = Get-ODSConfiguredNativeExecutable
+    # A removed external disk must not erase the identity needed to stop an
+    # already-running process. Start verifies the file separately.
+    if ($configuredExecutable -ne $script:LLAMA_SERVER_EXE -or
+        (Test-Path -LiteralPath $configuredExecutable)) { return "llama-server" }
+    return "none"
+}
+
+function Get-NativeInferenceStatus {
+    <#
+    .SYNOPSIS
+        Check if the native llama-server is running (AMD path).
+    .OUTPUTS
+        @{ Running; Pid; Healthy; Backend }
+    #>
+    Sync-ODSNativeInferenceConfig
+    $backend = Get-NativeInferenceBackend
+    $result = @{ Running = $false; Pid = 0; Healthy = $false; Backend = $backend; Recovered = $false }
+    if ($backend -eq "none") { return $result }
+
+    $expectedExecutable = Get-ODSConfiguredNativeExecutable
+    $healthUrl = "http://127.0.0.1:$($script:NATIVE_LLM_PORT)/health"
+
+    $savedPid = 0
+    $pidFileValid = $false
+    if (Test-Path -LiteralPath $script:INFERENCE_PID_FILE -PathType Leaf) {
+        $rawPid = Get-Content -LiteralPath $script:INFERENCE_PID_FILE -Raw -ErrorAction SilentlyContinue
+        if ($rawPid -and $rawPid.Trim() -match '^\d+$') {
+            $savedPid = [int]$rawPid.Trim()
+            $pidFileValid = Test-ODSNativeProcessExecutable `
+                -ProcessId $savedPid -ExpectedExecutable $expectedExecutable
+        }
+        if (-not $pidFileValid) {
+            Remove-Item -LiteralPath $script:INFERENCE_PID_FILE -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($pidFileValid) {
+        $result.Running = $true
+        $result.Pid = $savedPid
+        $result.Healthy = Test-ODSNativeInferenceHealth -HealthUrl $healthUrl
+        return $result
+    }
+
+    # A scheduled task can be restarted outside ods.ps1, leaving a stale PID.
+    # Recover only from a healthy listener owned by the configured executable.
+    if (Test-ODSNativeInferenceHealth -HealthUrl $healthUrl) {
+        $listenerOwnerPid = Get-ODSNativeInferencePortOwnerProcessId `
+            -Port $script:NATIVE_LLM_PORT
+        $listenerPid = if (Test-ODSNativeProcessExecutable `
+            -ProcessId $listenerOwnerPid -ExpectedExecutable $expectedExecutable) {
+            $listenerOwnerPid
+        } else {
+            0
+        }
+        if ($listenerPid -gt 0) {
+            $pidDir = Split-Path -Parent $script:INFERENCE_PID_FILE
+            New-Item -ItemType Directory -Path $pidDir -Force | Out-Null
+            Set-Content -LiteralPath $script:INFERENCE_PID_FILE -Value $listenerPid
+            $result.Running = $true
+            $result.Pid = $listenerPid
+            $result.Healthy = $true
+            $result.Recovered = $true
+        }
+    }
+
+    return $result
+}
+
+function Test-ODSNativeProcessExecutable {
+    param(
+        [int]$ProcessId,
+        [string]$ExpectedExecutable
+    )
+
+    if ($ProcessId -le 0 -or [string]::IsNullOrWhiteSpace($ExpectedExecutable)) { return $false }
+    try {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if (-not $process -or [string]::IsNullOrWhiteSpace([string]$process.ExecutablePath)) { return $false }
+        $actualPath = [System.IO.Path]::GetFullPath([string]$process.ExecutablePath)
+        $expectedPath = [System.IO.Path]::GetFullPath($ExpectedExecutable)
+        return $actualPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function Get-ODSNativeInferencePortOwnerProcessId {
+    param([int]$Port)
+
+    if ($Port -lt 1 -or $Port -gt 65535) { return 0 }
+    $owners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        ForEach-Object { [int]$_.OwningProcess } |
+        Where-Object { $_ -gt 0 } |
+        Select-Object -Unique)
+    if ($owners.Count -eq 1) { return $owners[0] }
+    return 0
+}
+
+function Test-ODSNativeInferenceHealth {
+    param([string]$HealthUrl)
+
+    if ([string]::IsNullOrWhiteSpace($HealthUrl)) { return $false }
+    try {
+        $response = Invoke-WebRequest -Uri $HealthUrl `
+            -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+        return ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300)
+    } catch {
+        return $false
+    }
+}
+
+function Stop-ODSNativeProcessId {
+    param([int]$ProcessId)
+
+    function Wait-ODSNativeProcessExit {
+        param([int]$TargetPid)
+        for ($i = 0; $i -lt 30; $i++) {
+            $proc = Get-Process -Id $TargetPid -ErrorAction SilentlyContinue
+            if (-not $proc) { return $true }
+            Start-Sleep -Milliseconds 500
+        }
+        return $false
+    }
+
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    if (Wait-ODSNativeProcessExit -TargetPid $ProcessId) { return }
+    try {
+        $null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
+            -Arguments @{ CommandLine = ("cmd.exe /c taskkill.exe /PID {0} /T /F" -f $ProcessId) } `
+            -ErrorAction Stop
+    } catch { }
+    [void](Wait-ODSNativeProcessExit -TargetPid $ProcessId)
+}
+
+function Stop-ODSOpenCodeRuntime {
+    try { Stop-ScheduledTask -TaskName $script:OPENCODE_TASK_NAME -ErrorAction SilentlyContinue } catch { }
+
+    $opencodeExe = $script:OPENCODE_EXE
+    $opencodePort = [string]$script:OPENCODE_PORT
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $byPid = @{}
+    foreach ($proc in $processes) {
+        if ($null -ne $proc.ProcessId) {
+            $byPid[[int]$proc.ProcessId] = $proc
+        }
+    }
+
+    $pidsToStop = @{}
+    foreach ($proc in $processes) {
+        $exe = [string]$proc.ExecutablePath
+        $cmd = [string]$proc.CommandLine
+        $isODSOpenCode = $false
+
+        if ($exe -and $opencodeExe -and $exe.Equals($opencodeExe, [StringComparison]::OrdinalIgnoreCase)) {
+            $isODSOpenCode = (
+                $cmd -match '(?i)\bweb\b' -and
+                # Match the entire port argument, never another server's 30030
+                # when this installation is configured for 3003.
+                $cmd -match ('(?i)--port\s+' + [regex]::Escape($opencodePort) + '(?=\s|$)')
+            )
+        }
+
+        if (-not $isODSOpenCode) { continue }
+
+        $pidsToStop[[int]$proc.ProcessId] = $true
+
+        $parentId = [int]$proc.ParentProcessId
+        if ($parentId -gt 0 -and $byPid.ContainsKey($parentId)) {
+            $parent = $byPid[$parentId]
+            $parentName = [string]$parent.Name
+            $parentCmd = [string]$parent.CommandLine
+            $isHiddenLauncher = (
+                $parentName -match '^(powershell|pwsh|wscript|cscript)(\.exe)?$' -and
+                (
+                    $parentName -match '^(wscript|cscript)(\.exe)?$' -or
+                    $parentCmd -match '(?i)-EncodedCommand' -or
+                    $parentCmd -match '(?i)-WindowStyle\s+Hidden'
+                )
+            )
+            if ($isHiddenLauncher) {
+                $pidsToStop[$parentId] = $true
+            }
+        }
+    }
+
+    foreach ($listener in @(Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT -State Listen -ErrorAction SilentlyContinue)) {
+        $ownerId = [int]$listener.OwningProcess
+        if ($ownerId -le 0 -or -not $byPid.ContainsKey($ownerId)) { continue }
+        $owner = $byPid[$ownerId]
+        $exe = [string]$owner.ExecutablePath
+        if ($exe -and $opencodeExe -and $exe.Equals($opencodeExe, [StringComparison]::OrdinalIgnoreCase)) {
+            $pidsToStop[$ownerId] = $true
+        }
+    }
+
+    if ($pidsToStop.Count -eq 0) { return }
+
+    foreach ($pidValue in @($pidsToStop.Keys)) {
+        Stop-ODSNativeProcessId -ProcessId ([int]$pidValue)
+    }
+    Write-AISuccess "OpenCode stopped ($($pidsToStop.Count) process(es))"
+}
+
+function Get-ODSOpenCodePortState {
+    $listeners = @(
+        Get-NetTCPConnection -LocalPort $script:OPENCODE_PORT `
+            -State Listen -ErrorAction SilentlyContinue
+    )
+    if ($listeners.Count -eq 0) {
+        return [pscustomobject]@{ InUse = $false; OwnedByODS = $false; ProcessIds = @() }
+    }
+
+    $listenerPids = @(
+        $listeners |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            Where-Object { [int]$_ -gt 0 }
+    )
+    $expectedExe = [System.IO.Path]::GetFullPath($script:OPENCODE_EXE)
+    $ownedPids = @()
+    foreach ($processId in $listenerPids) {
+        $process = Get-CimInstance Win32_Process `
+            -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
+        if (-not $process -or [string]::IsNullOrWhiteSpace($process.ExecutablePath)) {
+            continue
+        }
+        try {
+            $actualExe = [System.IO.Path]::GetFullPath([string]$process.ExecutablePath)
+        } catch {
+            continue
+        }
+        if ($actualExe.Equals($expectedExe, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $ownedPids += [int]$processId
+        }
+    }
+
+    return [pscustomobject]@{
+        InUse = $true
+        OwnedByODS = ($ownedPids.Count -gt 0)
+        ProcessIds = $listenerPids
+    }
+}
+
+function Start-ODSOpenCodeRuntime {
+    if (-not (Test-Path -LiteralPath $script:OPENCODE_EXE)) {
+        Write-AIWarn "OpenCode is not installed. Re-run the ODS installer to restore it."
+        return $false
+    }
+
+    $portState = Get-ODSOpenCodePortState
+    if ($portState.InUse) {
+        if ($portState.OwnedByODS) {
+            Write-AISuccess "OpenCode already running (http://localhost:$($script:OPENCODE_PORT))"
+            return $true
+        }
+        Write-AIError "Port $($script:OPENCODE_PORT) is used by another process (PID: $($portState.ProcessIds -join ', '))."
+        Write-AI "Stop that process or move it to another port, then start OpenCode again."
+        return $false
+    }
+
+    $started = $false
+    try {
+        $task = Get-ScheduledTask -TaskName $script:OPENCODE_TASK_NAME -ErrorAction Stop
+        Start-ScheduledTask -TaskName $task.TaskName -ErrorAction Stop
+        $started = $true
+    } catch {
+        $launcher = Join-Path $script:OPENCODE_DIR "start-opencode.ps1"
+        if (Test-Path -LiteralPath $launcher) {
+            $argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
+            try {
+                Start-Process -FilePath "powershell.exe" -ArgumentList $argument `
+                    -WorkingDirectory $script:OPENCODE_DIR -WindowStyle Hidden -ErrorAction Stop | Out-Null
+                $started = $true
+            } catch {
+                Write-AIWarn "Could not start OpenCode: $_"
+            }
+        } else {
+            Write-AIWarn "OpenCode launcher is missing. Re-run the ODS installer to repair it."
+        }
+    }
+
+    if (-not $started) { return $false }
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        Start-Sleep -Seconds 1
+        $portState = Get-ODSOpenCodePortState
+        if ($portState.OwnedByODS) {
+            Write-AISuccess "OpenCode started (http://localhost:$($script:OPENCODE_PORT))"
+            return $true
+        }
+        if ($portState.InUse) {
+            Write-AIError "OpenCode could not start because another process took port $($script:OPENCODE_PORT)."
+            return $false
+        }
+    }
+    Write-AIWarn "OpenCode did not become reachable on port $($script:OPENCODE_PORT)."
+    return $false
+}
+
+# Backward-compat alias
+function Get-NativeLlamaStatus { return Get-NativeInferenceStatus }
+
+function Get-ODSNativeLlamaStartPlan {
+    <#
+    .SYNOPSIS
+        Everything a native llama-server launch can fail on, checked before
+        any process is touched: the .env selection and its GGUF, the launch
+        options, pin.json, the API key and the launch arguments.
+    #>
+    Sync-ODSNativeInferenceConfig
+    if ((Get-NativeInferenceBackend) -eq "none") {
+        throw "No native llama-server is installed. Re-run the ODS installer."
+    }
+    $envVars = Read-ODSEnv
+    $selection = Get-ODSNativeModelSelection -VerifyArtifacts
+    $options = Read-ODSNativeLlamaLegacyOptions
+    if (-not $selection.profile) {
+        # Antivirus quarantine or a partial copy must stop here, not mid-load.
+        $null = Test-ODSNativeLlamaInstall -Directory $script:LLAMA_SERVER_DIR `
+            -ExpectedZipSha256 ([string]$options.ZipSha256) -ExpectedReleaseTag ([string]$options.ReleaseTag)
+    }
+    # Brings the key file in line with .env only; a running server keeps the
+    # key it loaded at startup.
+    $apiKey = Sync-ODSNativeLlamaLegacyApiKey -EnvMap $envVars -Path ([string]$options.ApiKeyPath)
+    $launch = New-ODSNativeLlamaLegacyLaunch -EnvMap $envVars -Selection $selection `
+        -Port $script:NATIVE_LLM_PORT -Options $options -PinnedExecutable $script:LLAMA_SERVER_EXE
+    return [pscustomobject]@{ Launch = $launch; ApiKey = $apiKey }
+}
+
+function Start-ODSNativeLlamaFromPlan {
+    # Launch a prepared plan and prove its model and context.
+    param([Parameter(Mandatory = $true)]$Plan)
+    foreach ($warning in @($Plan.Launch.Warnings)) { Write-AIWarn $warning }
+    Write-AI "Starting native llama-server with $($Plan.Launch.GgufFile) (large models can take a few minutes)..."
+    $started = Start-ODSNativeLlamaLegacyProcess -Launch $Plan.Launch -Port $script:NATIVE_LLM_PORT `
+        -ApiKey $Plan.ApiKey -PidFile $script:INFERENCE_PID_FILE
+    Write-AISuccess "Native llama-server ready (PID $($started.ProcessId)): $($started.Proof.ModelId), $($started.Proof.ContextLength) tokens of context"
+}
+
+function Start-NativeInferenceServer {
+    <#
+    .SYNOPSIS
+        Start the native llama-server (AMD path) from the current .env and
+        prove it serves the configured model and context. Throws on failure.
+    .DESCRIPTION
+        pin.json is verified before the pinned runtime starts; the API key
+        file follows LLAMA_SERVER_API_KEY; the launch follows the Round F
+        contract (native-llama-legacy.ps1).
+    #>
+    Sync-ODSNativeInferenceConfig
+    $status = Get-NativeInferenceStatus
+    if ($status.Running) {
+        Write-AISuccess "Native llama-server already running (PID $($status.Pid))"
+        return
+    }
+    Start-ODSNativeLlamaFromPlan -Plan (Get-ODSNativeLlamaStartPlan)
+}
+
+function Restart-ODSNativeLlamaServer {
+    <#
+    .SYNOPSIS
+        Replace the running native llama-server with the .env selection (model
+        switches, the host agent's rollback, the full-model upgrade).
+    .DESCRIPTION
+        The new launch is prepared and validated first, so a bad key, launch
+        option, pin.json or missing GGUF leaves the running server untouched.
+        Only then is the proven old process stopped; a stop that fails leaves
+        it running, keeps its PID record and changes nothing else.
+    #>
+    $plan = Get-ODSNativeLlamaStartPlan
+    # The server being replaced may run the pinned runtime or any registered
+    # model-store runtime of this installation.
+    $known = @($script:LLAMA_SERVER_EXE) + @(Get-ODSNativeLlamaLegacyRegisteredExecutables -InstallDir $InstallDir)
+    try {
+        $null = Stop-ODSNativeLlamaLegacyProcess -PidFile $script:INFERENCE_PID_FILE -Port $script:NATIVE_LLM_PORT -ExecutablePaths $known
+    } catch {
+        throw "Could not stop the running llama-server ($($_.Exception.Message)), so the new model was not started; nothing else was changed."
+    }
+    Start-ODSNativeLlamaFromPlan -Plan $plan
+}
+
+# Backward-compat alias
+function Start-NativeLlamaServer { Start-NativeInferenceServer }
+
+function Stop-NativeInferenceServer {
+    $status = Get-NativeInferenceStatus
+    if (-not $status.Running) {
+        Write-AI "Native llama-server not running"
+        return
+    }
+
+    # The PID is proven by its executable (Get-NativeInferenceStatus); wait
+    # for it to exit so a restart finds its port free.
+    Stop-ODSNativeProcessId -ProcessId ([int]$status.Pid)
+    if (Get-Process -Id ([int]$status.Pid) -ErrorAction SilentlyContinue) {
+        Write-AIWarn "Could not stop native llama-server (PID $($status.Pid))"
+    } else {
+        Write-AISuccess "Native llama-server stopped (PID $($status.Pid))"
+    }
+
+    if (Test-Path $script:INFERENCE_PID_FILE) {
+        Remove-Item $script:INFERENCE_PID_FILE -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Backward-compat alias
+function Stop-NativeLlamaServer { Stop-NativeInferenceServer }
+
+function Invoke-NativeLlmCommand {
+    <#
+    .SYNOPSIS
+        Internal entry points without Docker: "native-llm-start" (the
+        ODSNativeLlamaRuntime at-logon task) and "native-llm-restart" (the
+        host agent's model switches and rollbacks, and
+        scripts/bootstrap-upgrade.sh after promoting the full model).
+    .OUTPUTS
+        The process exit code: 0 only after the model and context were
+        proven, 1 otherwise.
+    #>
+    param([switch]$Restart)
+    $action = $(if ($Restart) { "restart" } else { "start" })
+    try {
+        if ($Restart) {
+            Restart-ODSNativeLlamaServer
+        } else {
+            Start-NativeInferenceServer
+        }
+        Write-ODSNativeLlamaLegacyLog "ready: $(Get-ODSEnvValue -Name 'GGUF_FILE') on port $($script:NATIVE_LLM_PORT)"
+        return 0
+    } catch {
+        $message = $_.Exception.Message
+        Write-AIError "Native llama-server did not ${action}: $message"
+        Write-ODSNativeLlamaLegacyLog "$action failed: $message"
+        return 1
+    }
+}
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+function Invoke-Status {
+    Test-Install
+    Push-Location $InstallDir
+    try {
+        $flags = Get-ComposeFlags
+        Write-Host ""
+        Write-Host "  ODS Status" -ForegroundColor Cyan
+        Write-Host ("  " + ("-" * 40)) -ForegroundColor DarkGray
+
+        # Native inference server status (AMD: llama-server.exe)
+        $nativeStatus = Get-NativeInferenceStatus
+        if ($nativeStatus.Backend -ne "none") {
+            if ($nativeStatus.Running) {
+                $healthStr = $(if ($nativeStatus.Healthy) { "healthy" } else { "loading" })
+                $recoveredStr = $(if ($nativeStatus.Recovered) { ", state reconciled" } else { "" })
+                Write-AISuccess "$($nativeStatus.Backend) (native): running PID $($nativeStatus.Pid) ($healthStr$recoveredStr)"
+            } else {
+                Write-AIWarn "$($nativeStatus.Backend) (native): not running"
+            }
+        }
+
+        # Host agent status
+        try {
+            $resp = Invoke-WebRequest -Uri $script:ODS_AGENT_HEALTH_URL `
+                -TimeoutSec 3 -UseBasicParsing -ErrorAction SilentlyContinue
+            if ($resp.StatusCode -eq 200) {
+                Write-AISuccess "Host Agent: running (port $($script:ODS_AGENT_PORT))"
+            } else {
+                Write-AIWarn "Host Agent: responded with $($resp.StatusCode)"
+            }
+        } catch {
+            Write-AIWarn "Host Agent: not responding (port $($script:ODS_AGENT_PORT))"
+        }
+
+        # Docker services
+        Write-Host ""
+        & docker compose @flags ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>$null
+
+        # Health checks
+        Write-Host ""
+        Write-Host "  Health Checks" -ForegroundColor Cyan
+        Write-Host ("  " + ("-" * 40)) -ForegroundColor DarkGray
+
+        $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $InstallDir -NativeBackend (Get-NativeInferenceBackend)
+        $runtimeEnv = Read-ODSEnv
+        $webuiPort = Get-WindowsODSEnvPort -EnvMap $runtimeEnv -Name "WEBUI_PORT" -DefaultPort 3000
+        $dashboardPort = Get-WindowsODSEnvPort -EnvMap $runtimeEnv -Name "DASHBOARD_PORT" -DefaultPort 3001
+        $endpoints = @(
+            @{ Name = "LLM API";    Url = $llmEndpoint.HealthUrl }
+            @{ Name = "Chat UI";    Url = "http://localhost:$webuiPort" }
+            @{ Name = "Dashboard";  Url = "http://localhost:$dashboardPort" }
+        )
+
+        foreach ($ep in $endpoints) {
+            try {
+                $resp = Invoke-WebRequest -Uri $ep.Url -TimeoutSec 3 `
+                    -UseBasicParsing -ErrorAction SilentlyContinue
+                if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) {
+                    Write-AISuccess "$($ep.Name): healthy"
+                } else {
+                    Write-AIWarn "$($ep.Name): $($resp.StatusCode)"
+                }
+            } catch {
+                Write-AIWarn "$($ep.Name): not responding"
+            }
+        }
+        Test-ODSSttModelCache
+
+        # GPU status
+        Write-Host ""
+        $gpuInfo = Get-GpuInfo
+        if ($gpuInfo.Backend -eq "nvidia") {
+            Write-Host "  GPU Status" -ForegroundColor Cyan
+            try {
+                $gpuStats = & nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>$null
+                if ($gpuStats) {
+                    $gpuStats -split "`n" | ForEach-Object {
+                        $parts = $_ -split ","
+                        if ($parts.Count -ge 5) {
+                            Write-Host "  $($parts[0].Trim()): $($parts[1].Trim())% GPU | $($parts[2].Trim())MB/$($parts[3].Trim())MB VRAM | $($parts[4].Trim())C" -ForegroundColor White
+                        }
+                    }
+                }
+            } catch { }
+        } elseif ($gpuInfo.Backend -eq "amd") {
+            Write-Host "  GPU: $($gpuInfo.Name) ($($gpuInfo.MemoryType) memory)" -ForegroundColor White
+        }
+
+        Write-Host ""
+    } finally {
+        Pop-Location
+    }
+}
+
+function Get-ODSBootstrapStatusData {
+    $statusPath = Join-Path $InstallDir "data\bootstrap-status.json"
+    if (-not (Test-Path -LiteralPath $statusPath)) { return $null }
+    try {
+        return Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function Test-ODSBootstrapUpgradeStaleActive {
+    param([object]$StatusData)
+
+    if ($null -eq $StatusData) { return $false }
+    $state = ([string]$StatusData.status).ToLowerInvariant()
+    if (@("starting", "downloading", "verifying", "swapping") -notcontains $state) {
+        return $false
+    }
+
+    $updatedRaw = [string]$StatusData.updatedAt
+    if ([string]::IsNullOrWhiteSpace($updatedRaw)) { return $false }
+
+    try {
+        $updatedAt = [DateTimeOffset]::Parse($updatedRaw).ToUniversalTime()
+    } catch {
+        return $false
+    }
+
+    $staleSeconds = 120
+    if ($env:ODS_BOOTSTRAP_UPGRADE_STALE_SECONDS -match '^[0-9]+$') {
+        $staleSeconds = [int]$env:ODS_BOOTSTRAP_UPGRADE_STALE_SECONDS
+    }
+
+    return (([DateTimeOffset]::UtcNow - $updatedAt).TotalSeconds -gt $staleSeconds)
+}
+
+function Invoke-BootstrapUpgradeResume {
+    $statusData = Get-ODSBootstrapStatusData
+    if ($null -eq $statusData) { return }
+
+    $state = ([string]$statusData.status).ToLowerInvariant()
+    $reason = $null
+    if ($state -eq "failed" -or $state -eq "error") {
+        $reason = "previous download failed"
+    } elseif (Test-ODSBootstrapUpgradeStaleActive -StatusData $statusData) {
+        $reason = "stale download appears stopped"
+    } else {
+        return
+    }
+
+    $modelName = [string]$statusData.model
+    if ([string]::IsNullOrWhiteSpace($modelName)) {
+        $modelName = "full model"
+    }
+
+    try {
+        $task = Get-ScheduledTask -TaskName $script:ODS_MODEL_UPGRADE_TASK_NAME -ErrorAction Stop
+        if ($task.State -eq "Running") {
+            Write-AI "  Model Upgrade: retry already running"
+            return
+        }
+        Start-ScheduledTask -TaskName $script:ODS_MODEL_UPGRADE_TASK_NAME -ErrorAction Stop
+        Write-AI "  Model Upgrade: $reason; retrying in background ($modelName)"
+    } catch {
+        Write-AIWarn "Model Upgrade: $reason, but the ODSModelUpgrade scheduled task is unavailable."
+        Write-AI "  Re-run the installer or run scripts\bootstrap-upgrade.sh manually."
+    }
+}
+
+function Invoke-Start {
+    param([string]$Service)
+    Test-Install
+    if ($Service -in @("opencode", "opencode-web")) {
+        if (-not (Start-ODSOpenCodeRuntime)) { exit 1 }
+        return
+    }
+    Push-Location $InstallDir
+    try {
+        Ensure-LlamaCpuBudget
+
+        # Start the native llama-server first (AMD path). A model that fails
+        # its proof is reported; the rest of the stack still starts.
+        if (-not $Service -and ((Get-NativeInferenceBackend) -ne "none")) {
+            try {
+                Start-NativeInferenceServer
+            } catch {
+                Write-AIError "Native llama-server did not start: $($_.Exception.Message)"
+            }
+        }
+
+        # Start host agent (if not already running)
+        if (-not $Service) {
+            Invoke-Agent -Action "start"
+            $null = Start-ODSOpenCodeRuntime
+        }
+
+        $flags = Get-ComposeFlags
+        $hermesInStack = Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "hermes"
+        if ($Service -eq "ods-proxy") {
+            Invoke-ODSProxyAuthPreflight -ComposeFlags $flags
+        } elseif ((-not $Service -or $Service -eq "open-webui") -and
+            (Test-ODSNetworkAccessEnabled -ComposeFlags $flags)) {
+            Set-ODSProxyAuthRequired
+        }
+        if ($Service) {
+            if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service $Service)) {
+                Write-ODSMissingComposeServiceHint -ComposeFlags $flags -Service $Service
+                exit 1
+            }
+            Write-AI "Starting $Service..."
+            if ($Service -eq "hermes" -and $hermesInStack) {
+                Invoke-HermesSoulRefresh
+            }
+            $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+                -ComposeArgs @("up", "-d", $Service)
+            if ($composeExit -ne 0) {
+                Write-AIError "docker compose up failed (exit code: $composeExit)"
+                Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags `
+                    -Phase "ods.ps1 start ($Service)"
+                exit 1
+            }
+            Write-AISuccess "$Service started"
+            if ($Service -eq "hermes" -and $hermesInStack) {
+                Invoke-HermesSoulRefresh -SyncContainer
+            }
+        } else {
+            if ($hermesInStack) {
+                Invoke-HermesSoulRefresh
+            }
+            Write-AI "Starting all services..."
+            $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+                -ComposeArgs @("up", "-d")
+            if ($composeExit -ne 0) {
+                Write-AIError "docker compose up failed (exit code: $composeExit)"
+                Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags -Phase "ods.ps1 start (all)"
+                exit 1
+            }
+            Write-AISuccess "All services started"
+            if (Test-ODSLegacyOpenClawContainer) {
+                Write-AIWarn "The removed legacy OpenClaw container ods-openclaw still exists. Remove it with: docker rm -f ods-openclaw (see docs/MIGRATION-OPENCLAW-TO-HERMES.md)"
+            }
+            if ($hermesInStack) {
+                Invoke-HermesSoulRefresh -SyncContainer
+            }
+        }
+        if (-not $Service -or $Service -eq "llama-server") {
+            Invoke-BootstrapUpgradeResume
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Stop-ODSOwnedContainersForRecovery {
+    param([string]$Service)
+    $python = Resolve-ODSHostAgentPython
+    if (-not $python) { throw 'Python 3 is required to verify ODS container ownership before stopping' }
+    $helper = Join-Path $InstallDir 'scripts/stop-owned-containers.py'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) { throw 'ODS container recovery helper is missing' }
+    $arguments = @($python.PrefixArgs) + @('-X', 'utf8', $helper, '--install-dir', $InstallDir)
+    if ($Service) { $arguments += @('--service', $Service) }
+    Write-AIWarn 'Compose validation failed; stopping only existing containers verified as belonging to this installation.'
+    & $python.FilePath @arguments
+    if ($LASTEXITCODE -ne 0) { throw 'Could not stop verified ODS containers' }
+}
+
+function Invoke-Stop {
+    param([string]$Service)
+
+    if ($Service -in @("opencode", "opencode-web")) {
+        Stop-ODSOpenCodeRuntime
+        return
+    }
+
+    if (-not $Service) {
+        if (-not (Test-Path $InstallDir)) {
+            Write-AIError "ODS not found at $InstallDir. Set ODS_HOME or run installer first."
+            exit 1
+        }
+        Push-Location $InstallDir
+        try {
+            # Native helpers do not depend on Docker and may hold install files or ports.
+            if ((Get-NativeInferenceBackend) -ne "none") {
+                Stop-NativeInferenceServer
+            }
+            Invoke-Agent -Action "stop"
+            Stop-ODSOpenCodeRuntime
+        } finally {
+            Pop-Location
+        }
+    }
+
+    Test-Install
+    Push-Location $InstallDir
+    try {
+        try { $flags = Get-ComposeFlags }
+        catch {
+            Stop-ODSOwnedContainersForRecovery -Service $Service
+            return
+        }
+        if ($Service) {
+            if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service $Service)) {
+                Write-ODSMissingComposeServiceHint -ComposeFlags $flags -Service $Service
+                exit 1
+            }
+            Write-AI "Stopping $Service..."
+            $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+                -ComposeArgs @("stop", $Service)
+            if ($composeExit -ne 0) {
+                Write-AIError "docker compose stop failed (exit code: $composeExit)"
+                Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags `
+                    -Phase "ods.ps1 stop ($Service)"
+                exit 1
+            }
+            Write-AISuccess "$Service stopped"
+        } else {
+            Write-AI "Stopping all services..."
+            $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+                -ComposeArgs @("down")
+            if ($composeExit -ne 0) {
+                Write-AIError "docker compose down failed (exit code: $composeExit)"
+                Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags -Phase "ods.ps1 stop (all)"
+                exit 1
+            }
+
+            Write-AISuccess "All services stopped"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-Restart {
+    param([string]$Service)
+    Test-Install
+    if ($Service -in @("opencode", "opencode-web")) {
+        Stop-ODSOpenCodeRuntime
+        if (-not (Start-ODSOpenCodeRuntime)) { exit 1 }
+        return
+    }
+    Push-Location $InstallDir
+    try {
+        Ensure-LlamaCpuBudget
+
+        $flags = Get-ComposeFlags
+        $hermesInStack = Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "hermes"
+        if ($Service -eq "ods-proxy") {
+            Invoke-ODSProxyAuthPreflight -ComposeFlags $flags
+        } elseif ((-not $Service -or $Service -eq "open-webui") -and
+            (Test-ODSNetworkAccessEnabled -ComposeFlags $flags)) {
+            Set-ODSProxyAuthRequired
+        }
+        if ($Service) {
+            if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service $Service)) {
+                Write-ODSMissingComposeServiceHint -ComposeFlags $flags -Service $Service
+                exit 1
+            }
+            Write-AI "Restarting $Service..."
+            if ($Service -eq "hermes" -and $hermesInStack) {
+                Invoke-HermesSoulRefresh
+            }
+            $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+                -ComposeArgs @("up", "-d", "--force-recreate", "--no-build", "--pull", "never", $Service)
+            if ($composeExit -ne 0) {
+                Write-AIWarn "docker compose force-recreate returned $composeExit; retrying start for $Service."
+                $retryArgs = @("up", "-d", "--no-build", "--pull", "never", $Service)
+                $composeExit = Invoke-ODSComposeUpWithStartupRetry -ComposeFlags $flags `
+                    -ComposeArgs $retryArgs `
+                    -Services @($Service) `
+                    -Description "docker compose start for $Service"
+                if ($composeExit -ne 0) {
+                    Write-AIError "docker compose up --force-recreate failed (exit code: $composeExit)"
+                    Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags `
+                        -Phase "ods.ps1 restart ($Service)"
+                    exit 1
+                }
+            }
+            Write-AISuccess "$Service restarted"
+            if ($Service -eq "hermes" -and $hermesInStack) {
+                Invoke-HermesSoulRefresh -SyncContainer
+            }
+        } else {
+            $nativeBackend = Get-NativeInferenceBackend
+            if ($nativeBackend -ne "none") {
+                # An absent SSD or changed qualification must fail before any
+                # working helper or inference process is stopped.
+                $null = Get-ODSNativeModelSelection -VerifyArtifacts
+            }
+            Stop-ODSOpenCodeRuntime
+            # For AMD, also restart the native llama-server: validated first,
+            # so a failure leaves the running model in place.
+            if ($nativeBackend -ne "none") {
+                try {
+                    Restart-ODSNativeLlamaServer
+                } catch {
+                    Write-AIError "Native llama-server did not restart: $($_.Exception.Message)"
+                }
+            }
+            if ($hermesInStack) {
+                Invoke-HermesSoulRefresh
+            }
+            Write-AI "Restarting all services..."
+            $restartTargets = Get-ODSRunningComposeServices -ComposeFlags $flags
+            $composeArgs = @("up", "-d", "--force-recreate", "--no-build", "--pull", "never")
+            if ($restartTargets.Count -gt 0) {
+                $composeArgs += $restartTargets
+            } else {
+                Write-AIWarn "No running compose services found; falling back to full stack restart."
+            }
+            $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+                -ComposeArgs $composeArgs
+            if ($composeExit -ne 0 -and $restartTargets.Count -gt 0) {
+                Write-AIWarn "docker compose force-recreate returned $composeExit; retrying start for recreated running services."
+                $retryArgs = @("up", "-d", "--no-build", "--pull", "never") + $restartTargets
+                $composeExit = Invoke-ODSComposeUpWithStartupRetry -ComposeFlags $flags `
+                    -ComposeArgs $retryArgs `
+                    -Services $restartTargets `
+                    -Description "docker compose start for recreated running services"
+            }
+            if ($composeExit -ne 0) {
+                Write-AIError "docker compose up --force-recreate failed (exit code: $composeExit)"
+                Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags -Phase "ods.ps1 restart (all)"
+                exit 1
+            }
+            # The native host agent reads .env once at process startup. Refresh
+            # it after recreating env-backed containers so dashboard requests do
+            # not use a newer ODS_AGENT_KEY or model state than the agent holds.
+            Invoke-Agent -Action "restart"
+            Write-AISuccess "All services restarted"
+            $null = Start-ODSOpenCodeRuntime
+            if ($hermesInStack) {
+                Invoke-HermesSoulRefresh -SyncContainer
+            }
+        }
+        if (-not $Service -or $Service -eq "llama-server") {
+            Invoke-BootstrapUpgradeResume
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-Logs {
+    param(
+        [string]$Service,
+        [int]$Lines = 100
+    )
+    if (-not $Service) {
+        Write-AI "Usage: .\ods.ps1 logs <service> [lines]"
+        Write-AI "Services: llama-server, open-webui, dashboard-api, n8n, whisper, tts, ..."
+        return
+    }
+    Test-Install
+    Push-Location $InstallDir
+    try {
+        $flags = Get-ComposeFlags
+        if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service $Service)) {
+            Write-ODSMissingComposeServiceHint -ComposeFlags $flags -Service $Service
+            exit 1
+        }
+        & docker compose @flags logs -f --tail $Lines $Service
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-ConfigShow {
+    Test-Install
+    Write-Host ""
+    Write-Host "  Configuration" -ForegroundColor Cyan
+    Write-Host "  Install dir: $InstallDir" -ForegroundColor White
+    Write-Host ""
+
+    $envFile = Join-Path $InstallDir ".env"
+    if (-not (Test-Path $envFile)) {
+        Write-AIWarn ".env not found"
+        return
+    }
+
+    Get-Content -LiteralPath $envFile -Encoding UTF8 | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -match "^#" -or $line -eq "") { return }
+        # Redact any key whose NAME contains a sensitive keyword, mirroring the
+        # Linux CLI's `ods config show` over-mask policy. Anchoring keywords to
+        # the "=" (the old behavior) let *_PASSWORD, *_SALT, and similar values
+        # print in cleartext because the keyword is not the last token before "=".
+        $key = ($line -split '=', 2)[0].Trim()
+        if ($line.Contains('=') -and
+            $key -match '(?i)secret|password|pass|token|key|salt|bearer|user|email') {
+            Write-Host "  $key=***" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  $line" -ForegroundColor White
+        }
+    }
+    Write-Host ""
+}
+
+function Invoke-Chat {
+    param([string]$Message)
+    if (-not $Message) {
+        Write-AI "Usage: .\ods.ps1 chat `"your message`""
+        return
+    }
+
+    $body = @{
+        model    = "default"
+        messages = @(
+            @{ role = "user"; content = $Message }
+        )
+    } | ConvertTo-Json -Depth 3
+    # Windows PowerShell 5.1 encodes a [string] -Body as ISO-8859-1, which
+    # replaces non-Latin text with "?". Send explicit UTF-8 bytes instead.
+    $bodyBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($body)
+
+    $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $InstallDir -NativeBackend (Get-NativeInferenceBackend)
+    $headers = @{}
+    if ($llmEndpoint.ContainsKey("ApiKey") -and -not [string]::IsNullOrWhiteSpace([string]$llmEndpoint.ApiKey)) {
+        $headers.Authorization = "Bearer " + [string]$llmEndpoint.ApiKey
+    }
+    try {
+        $resp = Invoke-RestMethod -Uri $llmEndpoint.ChatCompletionsUrl `
+            -Method POST -Headers $headers -Body $bodyBytes -ContentType "application/json; charset=utf-8" -TimeoutSec 120
+
+        if (-not $resp.choices -or -not $resp.choices[0].message -or
+            $resp.choices[0].message.content -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($resp.choices[0].message.content)) {
+            $detail = 'No assistant text in the response'
+            if ($resp.error -and $resp.error.message) { $detail = [string]$resp.error.message }
+            throw $detail
+        }
+
+        Write-Host ""
+        Write-Host $resp.choices[0].message.content
+        Write-Host ""
+    } catch {
+        Write-AIError "Chat request failed: $_"
+        Write-AI "Is llama-server running? Try: .\ods.ps1 status"
+        exit 1
+    }
+}
+
+function Invoke-Update {
+    Test-Install
+    Push-Location $InstallDir
+    try {
+        Ensure-LlamaCpuBudget
+
+        $flags = Get-ComposeFlags
+        Write-AI "Pulling latest images..."
+        $pullExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags -ComposeArgs @("pull")
+        if ($pullExit -ne 0) {
+            Write-AIError "docker compose pull failed (exit code: $pullExit)"
+            Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags -Phase "ods.ps1 update (pull)"
+            exit 1
+        }
+        # Recreating everything recreates Open WebUI too.
+        if (Test-ODSNetworkAccessEnabled -ComposeFlags $flags) {
+            Set-ODSProxyAuthRequired
+        }
+        Write-AI "Recreating containers..."
+        $upExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+            -ComposeArgs @("up", "-d", "--force-recreate")
+        if ($upExit -ne 0) {
+            Write-AIError "docker compose up failed (exit code: $upExit)"
+            Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags -Phase "ods.ps1 update (up --force-recreate)"
+            exit 1
+        }
+        Write-AISuccess "Update complete"
+
+        Start-Sleep -Seconds 5
+        Invoke-Status
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-Report {
+    # Support diagnostics include failed Docker probes; an unavailable daemon
+    # must not prevent collecting the bundle needed to diagnose it.
+    Test-Install -SkipDockerCheck
+    Push-Location -LiteralPath $InstallDir
+    try {
+        $flags = Get-ComposeFlags
+        Write-ODSInstallReport -InstallDir $InstallDir -ComposeFlags $flags | Out-Null
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-Doctor {
+    Test-Install
+    Push-Location $InstallDir
+    try {
+        $flags = Get-ComposeFlags
+        $voiceInStack = (
+            (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "whisper") -and
+            (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service "tts")
+        )
+
+        Write-Host ""
+        Write-Host "  ODS Doctor" -ForegroundColor Cyan
+        Write-Host ("  " + ("-" * 40)) -ForegroundColor DarkGray
+
+        $hasIssue = $false
+
+        Write-Host ""
+        Write-Host "  Voice Readiness" -ForegroundColor Cyan
+        if (-not $voiceInStack) {
+            Write-AI "Voice services: not enabled in this compose stack"
+            Write-Host ""
+            Write-AISuccess "Doctor found no voice readiness issues."
+            return
+        }
+
+        $voice = Get-ODSVoiceDiagnosis
+        if ($voice.WhisperHealthy) {
+            Write-AISuccess "Whisper STT: healthy ($($voice.WhisperUrl))"
+        } else {
+            Write-AIWarn "Whisper STT: not responding ($($voice.WhisperUrl))"
+            $hasIssue = $true
+        }
+
+        if ($voice.SttModelCached) {
+            Write-AISuccess "Whisper STT model: cached ($($voice.SttModel))"
+        } elseif ($voice.WhisperHealthy) {
+            Write-AIWarn "Whisper STT model: missing ($($voice.SttModel))"
+            Write-Host "  Repair: .\ods.ps1 repair voice" -ForegroundColor DarkGray
+            Write-Host "  Manual: $($voice.RecoveryCommand)" -ForegroundColor DarkGray
+            $hasIssue = $true
+        }
+
+        if ($voice.TtsHealthy) {
+            Write-AISuccess "Kokoro TTS: healthy ($($voice.TtsUrl))"
+        } else {
+            Write-AIWarn "Kokoro TTS: not responding ($($voice.TtsUrl))"
+            Write-Host "  Repair: .\ods.ps1 repair voice" -ForegroundColor DarkGray
+            $hasIssue = $true
+        }
+
+        Write-Host ""
+        if ($hasIssue) {
+            Write-AIWarn "Doctor found repairable voice issues."
+            exit 1
+        }
+        Write-AISuccess "Doctor found no voice readiness issues."
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-RepairVoice {
+    Test-Install
+    Push-Location $InstallDir
+    try {
+        $flags = Get-ComposeFlags
+
+        Write-Host ""
+        Write-Host "  Repair Voice" -ForegroundColor Cyan
+        Write-Host ("  " + ("-" * 40)) -ForegroundColor DarkGray
+
+        $missingServices = @()
+        foreach ($svc in @("whisper", "tts")) {
+            if (-not (Test-ODSComposeServiceAvailable -ComposeFlags $flags -Service $svc)) {
+                $missingServices += $svc
+            }
+        }
+        if ($missingServices.Count -gt 0) {
+            Write-AIError "Voice services are not in this compose stack: $($missingServices -join ', ')"
+            Write-AI "Enable voice in the installer or add the whisper/tts extension compose files, then retry."
+            exit 1
+        }
+
+        Write-AI "Starting Whisper and Kokoro TTS..."
+        $composeExit = Invoke-ODSDockerCompose -InstallDir $InstallDir -ComposeFlags $flags `
+            -ComposeArgs @("up", "-d", "whisper", "tts")
+        if ($composeExit -ne 0) {
+            Write-AIError "docker compose up failed (exit code: $composeExit)"
+            Write-ODSComposeDiagnostics -InstallDir $InstallDir -ComposeFlags $flags -Phase "ods.ps1 repair voice"
+            exit 1
+        }
+
+        $voice = Get-ODSVoiceDiagnosis
+        if (-not $voice.WhisperHealthy) {
+            Write-AI "Waiting for Whisper STT..."
+            Wait-ODSHttpOk -Url "$($voice.WhisperUrl)/health" -TimeoutSeconds 90 | Out-Null
+        }
+        if (-not $voice.TtsHealthy) {
+            Write-AI "Waiting for Kokoro TTS..."
+            Wait-ODSHttpOk -Url "$($voice.TtsUrl)/health" -TimeoutSeconds 90 | Out-Null
+        }
+
+        $voice = Get-ODSVoiceDiagnosis
+        if (-not $voice.WhisperHealthy) {
+            Write-AIError "Whisper STT is still not responding. Check: .\ods.ps1 logs whisper 100"
+            exit 1
+        }
+        if (-not $voice.SttModelCached) {
+            Write-AI "Downloading STT model ($($voice.SttModel))..."
+            Invoke-ODSSttModelDownloadTrigger -ModelUrl $voice.SttModelUrl | Out-Null
+            Wait-ODSSttModelCached -ModelUrl $voice.SttModelUrl -TimeoutSeconds 900 | Out-Null
+        }
+
+        $voice = Get-ODSVoiceDiagnosis
+        if ($voice.SttModelCached) {
+            Write-AISuccess "Whisper STT model cached ($($voice.SttModel))"
+        } else {
+            Write-AIError "STT model is still missing. Run manually: $($voice.RecoveryCommand)"
+            exit 1
+        }
+
+        if ($voice.TtsHealthy) {
+            Write-AISuccess "Kokoro TTS healthy"
+        } else {
+            Write-AIError "Kokoro TTS is still not responding. Check: .\ods.ps1 logs tts 100"
+            exit 1
+        }
+
+        Write-AISuccess "Voice repair complete."
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-Repair {
+    param([string]$Target)
+
+    if ([string]::IsNullOrWhiteSpace($Target)) {
+        $Target = "voice"
+    }
+
+    switch ($Target.ToLower()) {
+        "voice" { Invoke-RepairVoice }
+        "stt"   { Invoke-RepairVoice }
+        "tts"   { Invoke-RepairVoice }
+        default {
+            Write-AI "Usage: .\ods.ps1 repair voice"
+            Write-AIWarn "Unknown repair target: $Target"
+            exit 1
+        }
+    }
+}
+
+function Test-ODSHostAgentPythonCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$PrefixArgs = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($FilePath) -or -not (Test-Path $FilePath)) {
+        return $false
+    }
+    if ($FilePath -match '\\WindowsApps\\python3?\.exe$') {
+        return $false
+    }
+
+    try {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "SilentlyContinue"
+        $version = & $FilePath @PrefixArgs --version 2>&1
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevEAP
+        return ($exitCode -eq 0 -and (($version | Out-String) -match 'Python 3\.'))
+    } catch {
+        $ErrorActionPreference = $prevEAP
+        return $false
+    }
+}
+
+function New-ODSHostAgentPythonCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$PrefixArgs = @()
+    )
+
+    [pscustomobject]@{
+        FilePath   = $FilePath
+        PrefixArgs = @($PrefixArgs)
+    }
+}
+
+function Resolve-ODSHostAgentPython {
+    $seen = @{}
+    $candidateFiles = New-Object System.Collections.Generic.List[string]
+
+    foreach ($root in @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Python"),
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)}
+    )) {
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path $root)) { continue }
+        Get-ChildItem -Path $root -Directory -Filter "Python*" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $exe = Join-Path $_.FullName "python.exe"
+                if (Test-Path $exe) { $candidateFiles.Add($exe) }
+            }
+    }
+
+    foreach ($name in @("python3", "python")) {
+        # Get-Command returns an array when multiple executables share a name
+        # across PATH entries; iterate so .Source is always a single string.
+        foreach ($cmd in @(Get-Command $name -CommandType Application -All -ErrorAction SilentlyContinue)) {
+            if ($cmd.Source) {
+                $candidateFiles.Add($cmd.Source)
+            }
+        }
+    }
+
+    foreach ($file in $candidateFiles) {
+        $key = $file.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        if (Test-ODSHostAgentPythonCandidate -FilePath $file) {
+            return (New-ODSHostAgentPythonCandidate -FilePath $file)
+        }
+    }
+
+    foreach ($pyLauncher in @(Get-Command py -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        if ($pyLauncher.Source -and
+            (Test-ODSHostAgentPythonCandidate -FilePath $pyLauncher.Source -PrefixArgs @("-3"))) {
+            return (New-ODSHostAgentPythonCandidate -FilePath $pyLauncher.Source -PrefixArgs @("-3"))
+        }
+    }
+
+    return $null
+}
+
+function Invoke-Agent {
+    param([string]$Action = "status")
+
+    $agentScript = Join-Path (Join-Path $InstallDir "bin") "ods-host-agent.py"
+    $pidFile     = $script:ODS_AGENT_PID_FILE
+    $logFile     = $script:ODS_AGENT_LOG_FILE
+    $port        = $script:ODS_AGENT_PORT
+    $healthUrl   = $script:ODS_AGENT_HEALTH_URL
+
+    switch ($Action.ToLower()) {
+        "status" {
+            try {
+                $resp = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 3 `
+                    -UseBasicParsing -ErrorAction SilentlyContinue
+                if ($resp.StatusCode -eq 200) {
+                    Write-AISuccess "Host agent: running (port $port)"
+                } else {
+                    Write-AIWarn "Host agent: responded with status $($resp.StatusCode)"
+                }
+            } catch {
+                Write-AIWarn "Host agent: not responding (port $port)"
+            }
+        }
+        "start" {
+            # Check if already running
+            try {
+                $resp = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 2 `
+                    -UseBasicParsing -ErrorAction SilentlyContinue
+                if ($resp.StatusCode -eq 200) {
+                    Write-AISuccess "Host agent already running (port $port)"
+                    return
+                }
+            } catch { }
+
+            # Find Python
+            $_python3 = Resolve-ODSHostAgentPython
+            if (-not $_python3) {
+                Write-AIError "Python 3 not found (ignoring Microsoft Store aliases) -- install Python 3.12 and try again"
+                return
+            }
+            if (-not (Test-Path $agentScript)) {
+                Write-AIError "Agent script not found: $agentScript"
+                return
+            }
+
+            # Clean stale PID
+            if (Test-Path $pidFile) {
+                try {
+                    $_oldPid = [int](Get-Content $pidFile -Raw).Trim()
+                    Stop-ODSHostAgentProcess -ProcessId $_oldPid -AgentScript $agentScript
+                } catch { }
+                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            }
+
+            $pidDir = Split-Path $pidFile
+            New-Item -ItemType Directory -Path $pidDir -Force -ErrorAction SilentlyContinue | Out-Null
+
+            # Start the agent through Task Scheduler so SSH-launched restarts
+            # survive the non-interactive PowerShell session ending.
+            $_dockerBin = "C:\Program Files\Docker\Docker\resources\bin"
+            $_psQuote = {
+                param([string]$Value)
+                "'" + ($Value -replace "'", "''") + "'"
+            }
+            $_dockerPathLiteral = & $_psQuote "$_dockerBin;"
+            $_pythonLiteral = & $_psQuote $_python3.FilePath
+            $_pythonPrefixArgsLiteral = "@(" + (($_python3.PrefixArgs | ForEach-Object { & $_psQuote $_ }) -join ", ") + ")"
+            $_agentScriptLiteral = & $_psQuote $agentScript
+            $_pidFileLiteral = & $_psQuote $pidFile
+            $_installDirLiteral = & $_psQuote $InstallDir
+            $_logFileLiteral = & $_psQuote $logFile
+            $_agentCommand = @"
+`$env:PATH = $_dockerPathLiteral + `$env:PATH
+`$agentArgs = $_pythonPrefixArgsLiteral + @($_agentScriptLiteral, '--port', '$port', '--pid-file', $_pidFileLiteral, '--install-dir', $_installDirLiteral)
+Set-Location $_installDirLiteral
+Start-Process -FilePath $_pythonLiteral -ArgumentList `$agentArgs -WorkingDirectory $_installDirLiteral -WindowStyle Hidden -RedirectStandardError $_logFileLiteral
+"@
+            $_encodedAgentCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($_agentCommand))
+            try { Stop-ScheduledTask -TaskName $script:ODS_AGENT_TASK_NAME -ErrorAction SilentlyContinue } catch { }
+            $taskAction = New-ScheduledTaskAction -Execute "powershell.exe" `
+                -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $_encodedAgentCommand" `
+                -WorkingDirectory $InstallDir
+            $taskTrigger = New-ScheduledTaskTrigger -AtLogOn
+            $taskSettings = New-ScheduledTaskSettingsSet `
+                -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+            $taskPrincipal = New-ODSInteractiveScheduledTaskPrincipal -RunLevel Limited
+
+            $taskError = $null
+            try {
+                Register-ScheduledTask -TaskName $script:ODS_AGENT_TASK_NAME `
+                    -Action $taskAction -Trigger $taskTrigger -Settings $taskSettings -Principal $taskPrincipal `
+                    -Description "ODS Host Agent -- manages extensions and bridges dashboard to host" `
+                    -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskName $script:ODS_AGENT_TASK_NAME
+                # Cleanup any startup VBScript if scheduled task succeeded
+                $startupFolder = [Environment]::GetFolderPath("Startup")
+                $vbsFile = Join-Path $startupFolder "ods-host-agent.vbs"
+                if (Test-Path $vbsFile) {
+                    Remove-Item $vbsFile -Force -ErrorAction SilentlyContinue
+                }
+            } catch {
+                $taskError = $_
+                Write-AIWarn "Could not start host agent through Task Scheduler: $($taskError.Exception.Message)"
+                Write-AI "Setting up alternative startup persistence for standard user..."
+
+                $startupFolder = [Environment]::GetFolderPath("Startup")
+                $vbsFile = Join-Path $startupFolder "ods-host-agent.vbs"
+                $vbsContent = @"
+' ODS Host Agent login startup launcher
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $_encodedAgentCommand", 0, False
+"@
+                try {
+                    Write-ODSUtf8NoBomFile -Path $vbsFile -Content $vbsContent
+                    Write-AISuccess "Startup persistence configured via Start Menu Startup folder: $vbsFile"
+                    # Start the agent now using the startup script
+                    Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbsFile) -NoNewWindow
+                } catch {
+                    Write-AIError "Failed to set up alternative startup persistence: $_"
+                    Write-AIWarn "Starting host agent directly for this session..."
+                    Start-Process -FilePath $_python3.FilePath -ArgumentList @($agentScript, '--port', $port, '--pid-file', $pidFile, '--install-dir', $InstallDir) -WorkingDirectory $InstallDir -WindowStyle Hidden -RedirectStandardError $logFile
+                }
+            }
+
+            Start-Sleep -Seconds 3
+            try {
+                $resp = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 3 `
+                    -UseBasicParsing -ErrorAction SilentlyContinue
+                if ($resp.StatusCode -eq 200) {
+                    Write-AISuccess "Host agent started (port $port)"
+                } else {
+                    Write-AIWarn "Host agent started but health check returned $($resp.StatusCode)"
+                }
+            } catch {
+                Write-AIWarn "Host agent started but not yet responding -- check: .\ods.ps1 agent status"
+            }
+        }
+        "stop" {
+            try { Stop-ScheduledTask -TaskName $script:ODS_AGENT_TASK_NAME -ErrorAction SilentlyContinue } catch { }
+            # Cleanup Startup VBScript
+            $startupFolder = [Environment]::GetFolderPath("Startup")
+            $vbsFile = Join-Path $startupFolder "ods-host-agent.vbs"
+            if (Test-Path $vbsFile) {
+                Remove-Item $vbsFile -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path $pidFile) {
+                try {
+                    $_pid = [int](Get-Content $pidFile -Raw).Trim()
+                    Stop-ODSHostAgentProcess -ProcessId $_pid -AgentScript $agentScript
+                } catch {
+                    Write-AIWarn "Could not stop agent PID: $_"
+                }
+                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-AI "Host agent not running (no PID file)"
+            }
+            foreach ($_listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+                if ($_listener.OwningProcess -gt 0) {
+                    Stop-ODSHostAgentProcess -ProcessId ([int]$_listener.OwningProcess) -AgentScript $agentScript
+                }
+            }
+        }
+        "restart" {
+            Invoke-Agent -Action "stop"
+            Start-Sleep -Seconds 1
+            Invoke-Agent -Action "start"
+        }
+        "logs" {
+            if (Test-Path $logFile) {
+                Get-Content $logFile -Tail 100 -Wait
+            } else {
+                Write-AIWarn "No log file at $logFile"
+            }
+        }
+        default {
+            Write-Host ""
+            Write-Host "  Usage: .\ods.ps1 agent [status|start|stop|restart|logs]" -ForegroundColor DarkGray
+            Write-Host ""
+        }
+    }
+}
+
+function Update-ComposeFlags {
+    <#
+    .SYNOPSIS
+        Update .compose-flags in place after an enable/disable operation.
+
+        Only the toggled service's -f entries are rewritten. Every other token
+        is preserved verbatim and in order: --env-file, docker-compose.base.yml,
+        the backend overlay, installers/windows/docker-compose.windows-amd.yml,
+        docker-compose.tier0.yml, docker-compose.override.yml, and the compose
+        fragments of every other extension.
+
+        Editing rather than regenerating is deliberate. The Windows installer
+        records a per-extension GPU overlay (compose.nvidia.yaml /
+        compose.amd.yaml) next to each compose.yaml, and gates some of them on
+        the detected driver -- Whisper's CUDA overlay is skipped below driver
+        575. Rebuilding the extension entries by re-scanning the filesystem
+        cannot see those decisions and would silently drop or resurrect them.
+
+        scripts/resolve-compose-stack.sh is intentionally not consulted here.
+        Its output is not a superset of the Windows stack: it emits neither
+        docker-compose.tier0.yml nor the Windows AMD overlay, and it selects
+        compose.local.yaml overlays from its own --ods-mode default.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$ServiceId,
+        [Parameter(Mandatory=$true)][ValidateSet("enable", "disable")][string]$Action
+    )
+
+    $flagsFile = Join-Path $InstallDir ".compose-flags"
+    $flagsExisted = Test-Path -LiteralPath $flagsFile
+    $originalContent = if ($flagsExisted) {
+        Get-Content -LiteralPath $flagsFile -Raw
+    } else {
+        $null
+    }
+    $existing = @()
+    if ($flagsExisted) {
+        $raw = $originalContent
+        if (-not [string]::IsNullOrWhiteSpace($raw)) {
+            $existing = @($raw.Trim() -split "\s+" | Where-Object { $_ })
+        } else {
+            Write-AIWarn ".compose-flags is empty -- recovering the active stack before $Action."
+        }
+    }
+
+    if ($existing.Count -eq 0) {
+        # The filesystem fallback in Get-ComposeFlags cannot reconstruct the
+        # complete Windows stack. It does not know which AMD/tier overlays or
+        # per-service GPU fragments the installer selected. Only the launch
+        # receipt is a lossless recovery source.
+        $launchRecord = Join-Path (Join-Path $InstallDir "logs") "compose-launch.txt"
+        if (Test-Path -LiteralPath $launchRecord) {
+            $composeFlagsLine = Get-Content -LiteralPath $launchRecord -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match "^compose_flags=" } |
+                Select-Object -First 1
+            if ($composeFlagsLine) {
+                $receiptFlags = ($composeFlagsLine -replace "^compose_flags=", "").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($receiptFlags)) {
+                    $existing = @($receiptFlags -split "\s+" | Where-Object { $_ })
+                    Write-AIWarn "Recovered the active stack from logs\compose-launch.txt."
+                }
+            }
+        }
+        if ($existing.Count -eq 0) {
+            throw "Could not safely recover the complete Windows compose stack before $Action $ServiceId. Run the installer in place to regenerate .compose-flags."
+        }
+    }
+
+    # Every fragment under extensions/services/<ServiceId>/ belongs to the
+    # toggled service: compose.yaml and any per-backend overlay beside it.
+    $ownedByService = "extensions[/\\]services[/\\]$([regex]::Escape($ServiceId))[/\\]"
+
+    $ownedFragments = New-Object System.Collections.Generic.List[string]
+    $ownedInsertAt = $null
+    $tokens = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $existing.Count; $i++) {
+        if ($existing[$i] -eq "-f" -and ($i + 1) -lt $existing.Count) {
+            $path = $existing[$i + 1]
+            $i++
+            if ($path -match $ownedByService) {
+                if ($null -eq $ownedInsertAt) {
+                    $ownedInsertAt = $tokens.Count
+                }
+                if (-not $ownedFragments.Contains($path)) {
+                    [void]$ownedFragments.Add($path)
+                }
+                continue
+            }
+            [void]$tokens.Add("-f")
+            [void]$tokens.Add($path)
+            continue
+        }
+        [void]$tokens.Add($existing[$i])
+    }
+
+    if ($Action -eq "enable") {
+        $svcDir = Join-Path (Join-Path (Join-Path $InstallDir "extensions") "services") $ServiceId
+        if (Test-Path (Join-Path $svcDir "compose.yaml")) {
+            $serviceEntries = New-Object System.Collections.Generic.List[string]
+            [void]$serviceEntries.Add("-f")
+            [void]$serviceEntries.Add("extensions/services/$ServiceId/compose.yaml")
+            foreach ($fragment in $ownedFragments) {
+                if ($fragment -match "compose\.ya?ml$") { continue }
+                $fragmentPath = Join-Path $InstallDir $fragment
+                if (Test-Path -LiteralPath $fragmentPath -PathType Leaf) {
+                    [void]$serviceEntries.Add("-f")
+                    [void]$serviceEntries.Add($fragment)
+                }
+            }
+            # tier0 and override are appended last by the installer so they win
+            # the merge; the new fragment has to land ahead of them.
+            $insertAt = $tokens.Count
+            if ($null -ne $ownedInsertAt) {
+                $insertAt = [int]$ownedInsertAt
+            } else {
+                for ($j = 0; $j -lt $tokens.Count - 1; $j++) {
+                    if ($tokens[$j] -eq "-f" -and $tokens[$j + 1] -match "docker-compose\.(tier0|override)\.yml$") {
+                        $insertAt = $j
+                        break
+                    }
+                }
+            }
+            $tokens.InsertRange($insertAt, [string[]]$serviceEntries.ToArray())
+        }
+    }
+
+    $newContent = $tokens -join " "
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $tempFile = "$flagsFile.$PID.tmp"
+    try {
+        [System.IO.File]::WriteAllText($tempFile, $newContent, $utf8NoBom)
+        Move-Item -LiteralPath $tempFile -Destination $flagsFile -Force
+    } catch {
+        Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+        if ($flagsExisted) {
+            [System.IO.File]::WriteAllText($flagsFile, [string]$originalContent, $utf8NoBom)
+        } else {
+            Remove-Item -LiteralPath $flagsFile -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+    Write-AI "Updated .compose-flags ($Action $ServiceId)"
+}
+
+function Get-ExtensionServiceDir {
+    <#
+    .SYNOPSIS
+        Resolve the extension service directory for a given service ID.
+        Returns $null if not found.
+    #>
+    param([Parameter(Mandatory=$true)][string]$ServiceId)
+
+    $extDir = Join-Path (Join-Path $InstallDir "extensions") "services"
+    if (-not (Test-Path $extDir)) { return $null }
+
+    $svcDir = Join-Path $extDir $ServiceId
+    if (Test-Path $svcDir) { return $svcDir }
+    return $null
+}
+
+function Get-ExtensionCategory {
+    <#
+    .SYNOPSIS
+        Read the category field from manifest.yaml for a service directory.
+        Returns empty string if not found or unreadable.
+    #>
+    param([Parameter(Mandatory=$true)][string]$ServiceDir)
+
+    foreach ($manifestName in @("manifest.yaml", "manifest.yml")) {
+        $manifestPath = Join-Path $ServiceDir $manifestName
+        if (Test-Path $manifestPath) {
+            $line = Get-Content $manifestPath -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match "^\s*category:" } |
+                Select-Object -First 1
+            if ($line) {
+                return (($line -split "category:")[1]).Trim().Trim('"').Trim("'")
+            }
+        }
+    }
+    return ""
+}
+
+function Get-ExtensionDependencies {
+    <#
+    .SYNOPSIS
+        Read the depends_on list from manifest.yaml for a service directory.
+        Returns an empty array when the key is absent, empty, or unreadable.
+    #>
+    param([Parameter(Mandatory=$true)][string]$ServiceDir)
+
+    foreach ($manifestName in @("manifest.yaml", "manifest.yml")) {
+        $manifestPath = Join-Path $ServiceDir $manifestName
+        if (-not (Test-Path $manifestPath)) { continue }
+        # A prose comment that merely mentions depends_on starts with '#', so
+        # anchoring the match to the key skips it.
+        $line = Get-Content $manifestPath -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match "^\s*depends_on:" } |
+            Select-Object -First 1
+        if (-not $line) { return @() }
+        # Manifests declare deps in YAML flow style: depends_on: [a, b]
+        if ($line -notmatch "\[(.*)\]") { return @() }
+        $inner = $Matches[1].Trim()
+        if (-not $inner) { return @() }
+        return @(
+            $inner -split "," |
+                ForEach-Object { $_.Trim().Trim('"').Trim("'") } |
+                Where-Object { $_ }
+        )
+    }
+    return @()
+}
+
+function Get-DisabledDependencies {
+    <#
+    .SYNOPSIS
+        Extension dependencies of $ServiceId that are currently disabled.
+
+        Core services are skipped: their compose lives in docker-compose.base.yml,
+        so they are always in the merged project and never carry a compose.yaml
+        of their own. Ids with no service directory are skipped too -- there is
+        nothing to enable.
+
+        Only a service holding a compose.yaml.disabled counts as disabled. A
+        service with neither fragment (e.g. opencode) cannot be enabled by a
+        rename, and reporting it here would abort the caller's enable.
+    #>
+    param([Parameter(Mandatory=$true)][string]$ServiceId)
+
+    $svcDir = Get-ExtensionServiceDir -ServiceId $ServiceId
+    if (-not $svcDir) { return @() }
+
+    $missing = @()
+    foreach ($dep in @(Get-ExtensionDependencies -ServiceDir $svcDir)) {
+        $depDir = Get-ExtensionServiceDir -ServiceId $dep
+        if (-not $depDir) { continue }
+        if ((Get-ExtensionCategory -ServiceDir $depDir) -eq "core") { continue }
+        if (Test-Path (Join-Path $depDir "compose.yaml")) { continue }
+        if (Test-Path (Join-Path $depDir "compose.yaml.disabled")) { $missing += $dep }
+    }
+    return $missing
+}
+
+function Get-EnabledDependents {
+    <#
+    .SYNOPSIS
+        Enabled extensions whose manifest declares $ServiceId in depends_on.
+
+        Compose rejects a project whose depends_on names a service the merged
+        files never define ("depends on undefined service"), so a dependent left
+        enabled after its dependency is disabled breaks every service in the
+        stack, not just itself.
+    #>
+    param([Parameter(Mandatory=$true)][string]$ServiceId)
+
+    $extDir = Join-Path (Join-Path $InstallDir "extensions") "services"
+    if (-not (Test-Path $extDir)) { return @() }
+
+    $dependents = @()
+    foreach ($dir in @(Get-ChildItem -LiteralPath $extDir -Directory -ErrorAction SilentlyContinue)) {
+        if ($dir.Name -eq $ServiceId) { continue }
+        # No compose.yaml means the extension is disabled -- it contributes no
+        # depends_on to the merged project.
+        if (-not (Test-Path (Join-Path $dir.FullName "compose.yaml"))) { continue }
+        if (@(Get-ExtensionDependencies -ServiceDir $dir.FullName) -contains $ServiceId) {
+            $dependents += $dir.Name
+        }
+    }
+    return $dependents
+}
+
+function Test-ODSInstallFiles {
+    <#
+    .SYNOPSIS
+        Validate that the ODS install directory and compose files are present.
+        Does NOT require Docker Desktop to be running -- intentionally lighter
+        than Test-Install so that 'ods enable' works offline.
+    #>
+    if (-not (Test-Path $InstallDir)) {
+        Write-AIError "ODS not found at $InstallDir. Set ODS_HOME or run installer first."
+        exit 1
+    }
+    $baseCompose = Join-Path $InstallDir "docker-compose.base.yml"
+    $monoCompose = Join-Path $InstallDir "docker-compose.yml"
+    if (-not (Test-Path $baseCompose) -and -not (Test-Path $monoCompose)) {
+        Write-AIError "docker-compose.base.yml not found in $InstallDir"
+        exit 1
+    }
+}
+
+# Services already visited by the current 'enable' invocation, so a manifest
+# cycle cannot recurse forever.
+$script:_EnableVisited = @()
+
+function Invoke-Enable {
+    <#
+    .SYNOPSIS
+        Enable an extension service -- mirrors 'ods enable <service>' from the Linux CLI.
+        Renames compose.yaml.disabled back to compose.yaml and regenerates .compose-flags.
+        Disabled extension dependencies are enabled first so the merged compose
+        project never names a service it does not define.
+        Does NOT require Docker Desktop to be running (file-only operation).
+    #>
+    param(
+        [string]$ServiceId,
+        # Set on the recursive dependency calls: the install check and the
+        # visited-set reset already ran for the service the operator named.
+        [switch]$AsDependency
+    )
+
+    if (-not $AsDependency) {
+        # Validate install files only -- Docker is not needed to rename a compose fragment.
+        Test-ODSInstallFiles
+        $script:_EnableVisited = @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ServiceId)) {
+        Write-AIError "Usage: .\ods.ps1 enable <service>"
+        Write-AI "Example: .\ods.ps1 enable comfyui"
+        exit 1
+    }
+
+    if ($script:_EnableVisited -contains $ServiceId) { return }
+    $script:_EnableVisited += $ServiceId
+
+    $svcDir = Get-ExtensionServiceDir -ServiceId $ServiceId
+    if (-not $svcDir) {
+        Write-AIError "Unknown extension service: '$ServiceId'"
+        Write-AI "Check available services under: $(Join-Path (Join-Path $InstallDir 'extensions') 'services')"
+        exit 1
+    }
+
+    $category = Get-ExtensionCategory -ServiceDir $svcDir
+    if ($category -eq "core") {
+        Write-AISuccess "$ServiceId is a core service (always enabled)."
+        return
+    }
+
+    if ($ServiceId -eq "ods-proxy") {
+        Set-ODSProxyAuthRequired
+    }
+
+    # Pull in disabled dependencies before touching this service's fragment.
+    # This runs ahead of the already-enabled check on purpose: an operator whose
+    # stack is already broken (dependent enabled, dependency not) repairs it by
+    # re-running enable on the dependent.
+    $missingDeps = @(Get-DisabledDependencies -ServiceId $ServiceId)
+    if ($missingDeps.Count -gt 0) {
+        Write-AIWarn "$ServiceId depends on disabled services: $($missingDeps -join ', ')"
+        foreach ($dep in $missingDeps) {
+            Write-AI "Enabling dependency: $dep"
+            Invoke-Enable -ServiceId $dep -AsDependency
+        }
+    }
+
+    $composePath  = Join-Path $svcDir "compose.yaml"
+    $disabledPath = Join-Path $svcDir "compose.yaml.disabled"
+
+    if (Test-Path $composePath) {
+        $staleDisabledBackup = $null
+        if (Test-Path $disabledPath) {
+            $staleDisabledBackup = "$disabledPath.$PID.stale"
+            Move-Item -LiteralPath $disabledPath -Destination $staleDisabledBackup -Force
+        }
+        # The compose fragment can be present while a stale .compose-flags file
+        # still omits it (for example after an interrupted in-place update).
+        # Reconcile the active project even when no rename is required.
+        try {
+            Update-ComposeFlags -ServiceId $ServiceId -Action "enable"
+        } catch {
+            if ($staleDisabledBackup -and (Test-Path $staleDisabledBackup)) {
+                Move-Item -LiteralPath $staleDisabledBackup -Destination $disabledPath -Force
+            }
+            throw
+        }
+        if ($staleDisabledBackup) {
+            Remove-Item -LiteralPath $staleDisabledBackup -Force -ErrorAction SilentlyContinue
+            Write-AIWarn "Removed stale disabled marker for $ServiceId."
+        }
+        Write-AISuccess "$ServiceId is already enabled."
+        Write-AI "Run '.\ods.ps1 start $ServiceId' to launch it."
+        return
+    }
+
+    if (Test-Path $disabledPath) {
+        Rename-Item -LiteralPath $disabledPath -NewName "compose.yaml" -Force
+        try {
+            Update-ComposeFlags -ServiceId $ServiceId -Action "enable"
+        } catch {
+            if ((Test-Path $composePath) -and -not (Test-Path $disabledPath)) {
+                Rename-Item -LiteralPath $composePath -NewName "compose.yaml.disabled" -Force
+            }
+            throw
+        }
+        Write-AISuccess "$ServiceId enabled."
+        Write-AI "Run '.\ods.ps1 start $ServiceId' to launch it."
+        return
+    }
+
+    Write-AIError "No compose fragment found for '$ServiceId' (expected compose.yaml or compose.yaml.disabled)."
+    Write-AI "This may be a core service or the extension is not installed."
+    exit 1
+}
+
+function Invoke-Disable {
+    <#
+    .SYNOPSIS
+        Disable an extension service -- mirrors 'ods disable <service>' from the Linux CLI.
+        Stops the running container when Docker is available, then renames
+        compose.yaml to compose.yaml.disabled and regenerates .compose-flags.
+        The file/cache changes always run even when Docker Desktop is offline.
+
+        Refuses when another enabled extension declares this service in its
+        manifest depends_on, unless -Force is passed.
+    #>
+    param(
+        [string]$ServiceId,
+        # Disable anyway, leaving the dependents pointing at a service the
+        # merged compose project no longer defines.
+        [switch]$Force
+    )
+
+    # Validate install files only -- Docker stop is best-effort below.
+    Test-ODSInstallFiles
+
+    if ([string]::IsNullOrWhiteSpace($ServiceId)) {
+        Write-AIError "Usage: .\ods.ps1 disable <service>"
+        Write-AI "Example: .\ods.ps1 disable comfyui"
+        exit 1
+    }
+
+    $svcDir = Get-ExtensionServiceDir -ServiceId $ServiceId
+    if (-not $svcDir) {
+        Write-AIError "Unknown extension service: '$ServiceId'"
+        Write-AI "Check available services under: $(Join-Path (Join-Path $InstallDir 'extensions') 'services')"
+        exit 1
+    }
+
+    $category = Get-ExtensionCategory -ServiceDir $svcDir
+    if ($category -eq "core") {
+        Write-AIError "Cannot disable core service: $ServiceId"
+        exit 1
+    }
+
+    $composePath  = Join-Path $svcDir "compose.yaml"
+    $disabledPath = Join-Path $svcDir "compose.yaml.disabled"
+
+    if ((Test-Path $disabledPath) -and -not (Test-Path $composePath)) {
+        # Disabling is also an idempotent repair: remove a stale service entry
+        # from the persisted project even when the marker already says disabled.
+        Update-ComposeFlags -ServiceId $ServiceId -Action "disable"
+        Write-AISuccess "$ServiceId is already disabled."
+        return
+    }
+
+    if (-not (Test-Path $composePath)) {
+        Write-AIError "No compose fragment found for '$ServiceId'."
+        exit 1
+    }
+
+    # Compose validates depends_on against the merged project, so an enabled
+    # dependent whose dependency just vanished takes down every service, not
+    # just itself. Refuse by default; -Force is the operator's escape hatch.
+    $dependents = @(Get-EnabledDependents -ServiceId $ServiceId)
+    if ($dependents.Count -gt 0) {
+        if (-not $Force) {
+            Write-AIError "These enabled extensions depend on ${ServiceId}: $($dependents -join ', ')"
+            Write-AI "Disabling $ServiceId now would make '.\ods.ps1 start' fail for the whole stack."
+            Write-AI "Disable them first, or re-run with -Force to proceed anyway:"
+            Write-AI "  .\ods.ps1 disable $($dependents[0])"
+            Write-AI "  .\ods.ps1 disable $ServiceId -Force"
+            exit 1
+        }
+        Write-AIWarn "Forcing disable. Still enabled and depending on ${ServiceId}: $($dependents -join ', ')"
+        Write-AIWarn "'.\ods.ps1 start' will fail until those extensions are disabled too."
+    }
+
+    # Best-effort container stop -- skip gracefully when Docker Desktop is
+    # offline so the rename + flags update always succeeds.
+    $dockerRunning = $false
+    try { $null = docker info 2>$null; $dockerRunning = ($LASTEXITCODE -eq 0) } catch { }
+    if ($dockerRunning) {
+        try { $flags = Get-ComposeFlags }
+        catch {
+            Stop-ODSOwnedContainersForRecovery -Service $ServiceId
+            $flags = $null
+        }
+        if ($flags) {
+            Write-AI "Stopping $ServiceId..."
+            $prevEAP = $ErrorActionPreference
+            $ErrorActionPreference = "SilentlyContinue"
+            & docker compose @flags stop $ServiceId 2>$null
+            $ErrorActionPreference = $prevEAP
+        }
+    } else {
+        Write-AIWarn "Docker Desktop is not running -- skipping container stop. $ServiceId will be excluded from the next 'ods start'."
+    }
+
+    # Rename and refresh flags regardless of Docker state.
+    $staleDisabledBackup = $null
+    if (Test-Path $disabledPath) {
+        $staleDisabledBackup = "$disabledPath.$PID.stale"
+        Move-Item -LiteralPath $disabledPath -Destination $staleDisabledBackup -Force
+    }
+    Rename-Item -LiteralPath $composePath -NewName "compose.yaml.disabled" -Force
+    try {
+        Update-ComposeFlags -ServiceId $ServiceId -Action "disable"
+    } catch {
+        if ((Test-Path $disabledPath) -and -not (Test-Path $composePath)) {
+            Rename-Item -LiteralPath $disabledPath -NewName "compose.yaml" -Force
+        }
+        if ($staleDisabledBackup -and (Test-Path $staleDisabledBackup)) {
+            Move-Item -LiteralPath $staleDisabledBackup -Destination $disabledPath -Force
+        }
+        throw
+    }
+    if ($staleDisabledBackup) {
+        Remove-Item -LiteralPath $staleDisabledBackup -Force -ErrorAction SilentlyContinue
+        Write-AIWarn "Removed stale disabled marker before disabling $ServiceId."
+    }
+    Write-AISuccess "$ServiceId disabled."
+    Write-AI "Data preserved. Run '.\ods.ps1 enable $ServiceId' to re-enable."
+}
+
+function Invoke-Model {
+    param(
+        [string]$Action = "current",
+        [string[]]$SubArgs
+    )
+
+    Test-ODSInstallFiles
+    Push-Location $InstallDir
+    try {
+        switch ($Action.ToLower()) {
+            "current" {
+                $envVars = Read-ODSEnv
+                $model = $envVars["LLM_MODEL"]
+                $tier = $envVars["TIER"]
+                if ([string]::IsNullOrWhiteSpace($model)) { $model = "<not set>" }
+                Write-Host "Current model: " -NoNewline
+                Write-Host $model -ForegroundColor Green
+                if (-not [string]::IsNullOrWhiteSpace($tier)) {
+                    Write-Host "Current tier: $tier"
+                }
+            }
+            "list" {
+                Write-Host '=== Available Tiers ===' -ForegroundColor Blue
+                Write-Host '  T0         - qwen3.5-2b (< 8GB RAM, any GPU)'
+                Write-Host '  T1         - qwen3.5-9b (<12GB VRAM)'
+                Write-Host '  T2         - qwen3.5-9b (12-19GB, larger context)'
+                Write-Host '  T3         - qwen3.5-27b (20-39GB)'
+                Write-Host '  T4         - qwen3.6-35b-a3b (40GB+)'
+                Write-Host '  SH         - qwen3.6-35b-a3b (Strix Halo unified)'
+                Write-Host '  SH_LARGE   - qwen3.6-35b-a3b (90GB+ unified)'
+                Write-Host '  NV_ULTRA   - qwen3-coder-next (amd64) / qwen3.6-35b-a3b (arm64 Spark)'
+                Write-Host ''
+                Write-Host 'Usage: .\ods.ps1 model swap <tier>'
+            }
+            "swap" {
+                $tier = ($SubArgs | Select-Object -First 1)
+                if ([string]::IsNullOrWhiteSpace($tier)) {
+                    Write-AIError "Usage: .\ods.ps1 model swap <T0|T1|T2|T3|T4|SH|SH_LARGE|NV_ULTRA>"
+                    return
+                }
+                $tier = $tier.ToUpperInvariant()
+
+                # Use the persisted profile for both selection and activation
+                # validation, even when this shell has no MODEL_PROFILE set.
+                $envVars = Read-ODSEnv
+                $modelProfile = [string]$envVars["MODEL_PROFILE"]
+                $model = ConvertTo-ModelFromTier -Tier $tier -ModelProfile $modelProfile
+                if ([string]::IsNullOrWhiteSpace($model)) {
+                    Write-AIError "Unknown tier: $tier"
+                    return
+                }
+
+                # Normalize aliases for Resolve-TierConfig (T0->0, T1->1, SH->SH_COMPACT)
+                $normTier = $tier
+                if ($normTier -match "^T([0-9]+)$") {
+                    $normTier = $Matches[1]
+                }
+                if ($normTier -eq "SH") {
+                    $normTier = "SH_COMPACT"
+                }
+
+                # Resolve tier config to obtain GGUF details
+                $tierConfig = Resolve-TierConfig -Tier $normTier -ModelProfile $modelProfile
+
+                try {
+                    $modelId = Resolve-WindowsODSModelCatalogId `
+                        -InstallDir $InstallDir -GgufFile $tierConfig.GgufFile
+                    Write-AI "Activating $model across ODS consumers..."
+                    $receipt = Invoke-WindowsODSModelActivationTransaction `
+                        -EnvMap $envVars -ModelId $modelId -Tier $normTier `
+                        -ContextLength ([int]$tierConfig.MaxContext)
+                    Write-AISuccess "Model activated everywhere: $model (tier $($receipt.tier), ctx=$($receipt.context_length))."
+                } catch {
+                    Write-AIError $_.Exception.Message
+                    exit 1
+                }
+            }
+            default {
+                Write-AIError "Usage: .\ods.ps1 model <current|list|swap>"
+            }
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Show-Help {
+    Write-Host ""
+    Write-Host "  ODS CLI (Windows)" -ForegroundColor Green
+    Write-Host "  Version $($script:ODS_VERSION)" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  USAGE" -ForegroundColor White
+    Write-Host "    .\ods.ps1 <command> [options]" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  COMMANDS" -ForegroundColor White
+    Write-Host "    status              " -ForegroundColor Cyan -NoNewline
+    Write-Host "Health checks + GPU status" -ForegroundColor DarkGray
+    Write-Host "    start [service]     " -ForegroundColor Cyan -NoNewline
+    Write-Host "Start all or one service" -ForegroundColor DarkGray
+    Write-Host "    stop [service]      " -ForegroundColor Cyan -NoNewline
+    Write-Host "Stop all or one service" -ForegroundColor DarkGray
+    Write-Host "    restart [service]   " -ForegroundColor Cyan -NoNewline
+    Write-Host "Restart all or one service" -ForegroundColor DarkGray
+    Write-Host "    logs <svc> [lines]  " -ForegroundColor Cyan -NoNewline
+    Write-Host "Tail logs (default 100)" -ForegroundColor DarkGray
+    Write-Host "    config show         " -ForegroundColor Cyan -NoNewline
+    Write-Host "View .env (secrets masked)" -ForegroundColor DarkGray
+    Write-Host "    config edit         " -ForegroundColor Cyan -NoNewline
+    Write-Host "Open .env in notepad" -ForegroundColor DarkGray
+    Write-Host "    model [action]      " -ForegroundColor Cyan -NoNewline
+    Write-Host "Inspect/swap LLM profiles: current|list|swap" -ForegroundColor DarkGray
+    Write-Host "    chat `"message`"      " -ForegroundColor Cyan -NoNewline
+    Write-Host "Quick chat via API" -ForegroundColor DarkGray
+    Write-Host "    update              " -ForegroundColor Cyan -NoNewline
+    Write-Host "Pull latest images and restart" -ForegroundColor DarkGray
+    Write-Host "    doctor              " -ForegroundColor Cyan -NoNewline
+    Write-Host "Diagnose runtime readiness" -ForegroundColor DarkGray
+    Write-Host "    repair voice        " -ForegroundColor Cyan -NoNewline
+    Write-Host "Start voice services and cache STT model" -ForegroundColor DarkGray
+    Write-Host "    enable <service>    " -ForegroundColor Cyan -NoNewline
+    Write-Host "Enable an extension service and its dependencies" -ForegroundColor DarkGray
+    Write-Host "    disable <service>   " -ForegroundColor Cyan -NoNewline
+    Write-Host "Disable an extension service (-Force skips the dependent check)" -ForegroundColor DarkGray
+    Write-Host "    uninstall [options] " -ForegroundColor Cyan -NoNewline
+    Write-Host "Remove ODS containers, volumes, and runtime files" -ForegroundColor DarkGray
+    Write-Host "    agent [action]      " -ForegroundColor Cyan -NoNewline
+    Write-Host "Host agent: status|start|stop|restart|logs" -ForegroundColor DarkGray
+    Write-Host "    report              " -ForegroundColor Cyan -NoNewline
+    Write-Host "Generate Windows diagnostics bundle" -ForegroundColor DarkGray
+    Write-Host "    version             " -ForegroundColor Cyan -NoNewline
+    Write-Host "Show version" -ForegroundColor DarkGray
+    Write-Host "    help                " -ForegroundColor Cyan -NoNewline
+    Write-Host "Show this help" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  EXAMPLES" -ForegroundColor White
+    Write-Host "    .\ods.ps1 status" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 logs llama-server 50" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 restart open-webui" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 repair voice" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 enable comfyui" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 disable langfuse" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 disable hermes -Force" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 uninstall --force" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 uninstall --force --keep-data" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 chat `"What is quantum computing?`"" -ForegroundColor DarkGray
+    Write-Host "    .\ods.ps1 model swap T1" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+# ============================================================================
+# Command Dispatch
+# ============================================================================
+
+function Get-ServiceIdArgument {
+    <#
+    .SYNOPSIS
+        First non-flag token, so 'disable -Force hermes' and 'disable hermes -Force'
+        both resolve the service id.
+    #>
+    param([string[]]$Arguments)
+
+    if (-not $Arguments) { return $null }
+    foreach ($arg in $Arguments) {
+        if ($arg -notmatch '^-') { return $arg }
+    }
+    return $null
+}
+
+function Test-ForceArgument {
+    <#
+    .SYNOPSIS
+        True when the operator passed -Force / --force among the trailing args.
+    #>
+    param([string[]]$Arguments)
+
+    if (-not $Arguments) { return $false }
+    foreach ($arg in $Arguments) {
+        if ($arg -eq "-Force" -or $arg -eq "--force") { return $true }
+    }
+    return $false
+}
+
+switch ($Command.ToLower()) {
+    "status"  { Invoke-Status }
+    "start"   { Invoke-Start -Service ($Arguments | Select-Object -First 1) }
+    "stop"    { Invoke-Stop -Service ($Arguments | Select-Object -First 1) }
+    "restart" { Invoke-Restart -Service ($Arguments | Select-Object -First 1) }
+    "logs"    {
+        $svc = $Arguments | Select-Object -First 1
+        # Validate the optional line count instead of a bare [int] cast, which
+        # throws an unhandled .NET conversion error on non-numeric input
+        # (e.g. `ods logs llama-server 5m`). Mirrors the [int]::TryParse guard
+        # used elsewhere in this script; the Unix CLIs pass the value straight
+        # to `docker compose --tail`, which rejects bad input gracefully too.
+        $n = 100
+        if ($Arguments.Count -ge 2) {
+            $parsedLines = 0
+            if ([int]::TryParse([string]$Arguments[1], [ref]$parsedLines) -and $parsedLines -gt 0) {
+                $n = $parsedLines
+            } else {
+                Write-AIWarn "Invalid line count '$($Arguments[1])'; using $n."
+            }
+        }
+        Invoke-Logs -Service $svc -Lines $n
+    }
+    "config"  {
+        $action = ($Arguments | Select-Object -First 1)
+        if ($action -eq "edit") {
+            Test-Install
+            & notepad (Join-Path $InstallDir ".env")
+        } else {
+            Invoke-ConfigShow
+        }
+    }
+    "model"   {
+        $action = ($Arguments | Select-Object -First 1)
+        if (-not $action) { $action = "current" }
+        Invoke-Model -Action $action -SubArgs ($Arguments | Select-Object -Skip 1)
+    }
+    "chat"    { Invoke-Chat -Message ($Arguments -join " ") }
+    "update"  { Invoke-Update }
+    "doctor"  { Invoke-Doctor }
+    "repair"  { Invoke-Repair -Target ($Arguments | Select-Object -First 1) }
+    "enable"  { Invoke-Enable -ServiceId (Get-ServiceIdArgument -Arguments $Arguments) }
+    "disable" { Invoke-Disable -ServiceId (Get-ServiceIdArgument -Arguments $Arguments) -Force:(Test-ForceArgument -Arguments $Arguments) }
+    "uninstall" { Invoke-Uninstall -UninstallArgs $Arguments }
+    "report"  { Invoke-Report }
+    "agent"   {
+        $action = ($Arguments | Select-Object -First 1)
+        if (-not $action) { $action = "status" }
+        Invoke-Agent -Action $action
+    }
+    "version" { Write-Host "ODS v$($script:ODS_VERSION) (Windows)" -ForegroundColor Green }
+    "help"    { Show-Help }
+    # Internal: the ODSNativeLlamaRuntime task and scripts/bootstrap-upgrade.sh.
+    "native-llm-start"   { exit ([int]@(Invoke-NativeLlmCommand)[-1]) }
+    "native-llm-restart" { exit ([int]@(Invoke-NativeLlmCommand -Restart)[-1]) }
+    default   {
+        Write-AIWarn "Unknown command: $Command"
+        Show-Help
+    }
+}

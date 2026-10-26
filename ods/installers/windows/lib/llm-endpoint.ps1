@@ -1,0 +1,337 @@
+# ============================================================================
+# ODS Windows -- local LLM endpoint helpers
+# ============================================================================
+# Part of: installers/windows/lib/
+# Purpose: Parse .env safely and resolve the active local LLM endpoint across
+#          Docker-backed NVIDIA/CPU installs and native AMD backends.
+# ============================================================================
+
+function Get-WindowsODSEnvMap {
+    <#
+    .SYNOPSIS
+        Parse the generated .env file without executing it.
+    #>
+    param(
+        [string]$InstallDir = $script:ODS_INSTALL_DIR,
+        [string]$Path = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+            return @{}
+        }
+        $Path = Join-Path $InstallDir ".env"
+    }
+
+    $result = @{}
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $result }
+
+    try {
+        # Windows PowerShell 5.1 decodes BOM-less files as ANSI without -Encoding.
+        Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -match "^#" -or $line -eq "") { return }
+            if ($line -match "^([A-Za-z_][A-Za-z0-9_]*)=(.*)$") {
+                $key = $Matches[1]
+                $val = $Matches[2]
+                # Strip exactly one matching pair of surrounding quotes.
+                # Trimming each quote character independently corrupts values
+                # that legitimately start or end with the other quote: a
+                # double-quoted "'literal'" loses its inner single quotes and
+                # KEY="'" collapses to empty. Mismatched quotes are kept
+                # verbatim, matching lib/safe-env.sh on Linux.
+                if ($val.Length -ge 2 -and (
+                        ($val.StartsWith('"') -and $val.EndsWith('"')) -or
+                        ($val.StartsWith("'") -and $val.EndsWith("'")))) {
+                    $val = $val.Substring(1, $val.Length - 2)
+                }
+                $result[$key] = $val
+            }
+        }
+    } catch {
+        return @{}
+    }
+
+    return $result
+}
+
+function Get-WindowsODSEnvValue {
+    <#
+    .SYNOPSIS
+        Read the first populated value from a parsed .env hashtable.
+    #>
+    param(
+        [hashtable]$EnvMap,
+        [string[]]$Keys,
+        [string]$Default = ""
+    )
+
+    foreach ($key in $Keys) {
+        if ($EnvMap.ContainsKey($key)) {
+            $value = [string]$EnvMap[$key]
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value
+            }
+        }
+    }
+
+    return $Default
+}
+
+function Get-WindowsODSEnvPort {
+    <#
+    .SYNOPSIS
+        Read and validate a persisted service port from a parsed ODS .env map.
+    #>
+    param(
+        [hashtable]$EnvMap,
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [int]$DefaultPort
+    )
+
+    $candidate = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @($Name) -Default ""
+    $parsedPort = 0
+    if ([int]::TryParse(([string]$candidate).Trim(), [ref]$parsedPort) -and
+        $parsedPort -ge 1 -and $parsedPort -le 65535) {
+        return $parsedPort
+    }
+
+    return $DefaultPort
+}
+
+function Get-WindowsLocalLlmEndpoint {
+    <#
+    .SYNOPSIS
+        Resolve the active local LLM endpoint for native AMD and Docker installs.
+    .OUTPUTS
+        @{ Name; Backend; Port; ApiBasePath; HealthUrl; BaseUrl; ChatCompletionsUrl }
+    #>
+    param(
+        [string]$InstallDir = $script:ODS_INSTALL_DIR,
+        [hashtable]$EnvMap = $null,
+        [string]$GpuBackend = "",
+        [string]$NativeBackend = "",
+        [switch]$CloudMode
+    )
+
+    if ($null -eq $EnvMap) {
+        $EnvMap = Get-WindowsODSEnvMap -InstallDir $InstallDir
+    }
+
+    $resolvedNativeBackend = $NativeBackend
+    if ([string]::IsNullOrWhiteSpace($resolvedNativeBackend)) {
+        $resolvedNativeBackend = ""
+    } else {
+        $resolvedNativeBackend = $resolvedNativeBackend.ToLowerInvariant()
+    }
+
+    $resolvedGpuBackend = $GpuBackend
+    if ([string]::IsNullOrWhiteSpace($resolvedGpuBackend)) {
+        $resolvedGpuBackend = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("GPU_BACKEND") -Default ""
+    }
+    if (-not [string]::IsNullOrWhiteSpace($resolvedGpuBackend)) {
+        $resolvedGpuBackend = $resolvedGpuBackend.ToLowerInvariant()
+    }
+
+    $llmBackend = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LLM_BACKEND") -Default "llama-server"
+    if (-not [string]::IsNullOrWhiteSpace($llmBackend)) {
+        $llmBackend = $llmBackend.ToLowerInvariant()
+    }
+
+    $amdInferenceRuntime = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("AMD_INFERENCE_RUNTIME") -Default ""
+    if (-not [string]::IsNullOrWhiteSpace($amdInferenceRuntime)) {
+        $amdInferenceRuntime = $amdInferenceRuntime.ToLowerInvariant()
+    }
+
+    $amdInferenceLocation = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("AMD_INFERENCE_LOCATION") -Default ""
+    if (-not [string]::IsNullOrWhiteSpace($amdInferenceLocation)) {
+        $amdInferenceLocation = $amdInferenceLocation.ToLowerInvariant()
+    }
+
+    $amdInferenceRuntimeMode = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("AMD_INFERENCE_RUNTIME_MODE") -Default ""
+    if (-not [string]::IsNullOrWhiteSpace($amdInferenceRuntimeMode)) {
+        $amdInferenceRuntimeMode = $amdInferenceRuntimeMode.ToLowerInvariant()
+    }
+
+    $defaultNativePort = "8080"
+    $configuredConstant = Get-Variable -Name NATIVE_LLM_PORT -Scope Script -ErrorAction SilentlyContinue
+    if ($configuredConstant -and [string]$configuredConstant.Value -match '^\d+$') {
+        $defaultNativePort = [string]$configuredConstant.Value
+    }
+    $nativePort = Get-WindowsODSEnvValue `
+        -EnvMap $EnvMap -Keys @("AMD_INFERENCE_PORT") -Default $defaultNativePort
+    $parsedNativePort = 0
+    if (-not [int]::TryParse($nativePort, [ref]$parsedNativePort) -or
+        $parsedNativePort -lt 1 -or $parsedNativePort -gt 65535) {
+        $nativePort = $defaultNativePort
+    } else {
+        $nativePort = [string]$parsedNativePort
+    }
+
+    $usesNativeHostLlamaServer = (-not $CloudMode -and (
+        $resolvedGpuBackend -eq "amd" -or
+        $amdInferenceRuntimeMode -in @("windows-native-llama-server", "windows-llama-server-fallback") -or
+        ($resolvedNativeBackend -eq "llama-server" -and
+            $amdInferenceRuntime -eq "llama-server" -and
+            $amdInferenceLocation -eq "host")
+    ))
+
+    if ($usesNativeHostLlamaServer) {
+        return @{
+            Name = "LLM (llama-server)"
+            Backend = "native-llama-server"
+            Port = $nativePort
+            ApiBasePath = "/v1"
+            HealthUrl = "http://localhost:${nativePort}/health"
+            BaseUrl = "http://localhost:${nativePort}/v1"
+            ChatCompletionsUrl = "http://localhost:${nativePort}/v1/chat/completions"
+            # Sent as a header only; /health and /v1/models stay public.
+            ApiKey = (Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LLAMA_SERVER_API_KEY") -Default "")
+        }
+    }
+
+    $port = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("OLLAMA_PORT", "LLAMA_SERVER_PORT") -Default "11434"
+    $apiBasePath = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LLM_API_BASE_PATH") -Default "/v1"
+    if ($apiBasePath -notmatch "^/") {
+        $apiBasePath = "/$apiBasePath"
+    }
+
+    return @{
+        Name = "LLM (llama-server)"
+        Backend = "docker-llama-server"
+        Port = $port
+        ApiBasePath = $apiBasePath
+        HealthUrl = "http://localhost:${port}/health"
+        BaseUrl = "http://localhost:${port}${apiBasePath}"
+        ChatCompletionsUrl = "http://localhost:${port}${apiBasePath}/chat/completions"
+    }
+}
+
+function Test-ODSCompletionContent {
+    param([string]$Json)
+    try {
+        $payload = $Json | ConvertFrom-Json -ErrorAction Stop
+        if ($null -ne $payload.error -or @($payload.choices).Count -eq 0) { return $false }
+        $content = $payload.choices[0].message.content
+        return ($content -is [string] -and -not [string]::IsNullOrWhiteSpace($content))
+    } catch { return $false }
+}
+
+function Test-WindowsLlmModelReadiness {
+    <#
+    .SYNOPSIS
+        Prove the local LLM can actually serve, not just that its process is alive.
+    .DESCRIPTION
+        A healthy llama-server process is NOT proof the model works: if the
+        GGUF backing file was never placed on disk, /v1/models still lists the model
+        but every chat/completions returns 500. This gate proves two things before an
+        install may report healthy:
+          1. the GGUF backing file exists at the path the backend loads from, and
+          2. a minimal completion actually succeeds (the real user path).
+        The native Windows llama-server requires the endpoint's API key.
+        Returns a result hashtable; the caller decides fatality.
+    .OUTPUTS
+        @{ Ok; FileExists; ModelFile; ModelId; CompletionOk; Detail }
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [hashtable]$Endpoint,
+        [Parameter(Mandatory = $true)] [string]$InstallDir,
+        [string]$GgufFile = "",
+        [int]$TimeoutSec = 120
+    )
+
+    $result = @{ Ok = $false; FileExists = $false; ModelFile = ""; ModelId = ""; CompletionOk = $false; Detail = "" }
+
+    # 1. The backing GGUF must exist on disk where the backend loads it from.
+    if (-not [string]::IsNullOrWhiteSpace($GgufFile)) {
+        $modelPath = Join-Path (Join-Path (Join-Path $InstallDir "data") "models") $GgufFile
+        $result.ModelFile = $modelPath
+        # Test-Path $modelPath treats brackets as wildcards; evaluate -LiteralPath.
+        $result.FileExists = Test-Path -LiteralPath $modelPath -PathType Leaf
+    } else {
+        # No local GGUF configured (e.g. cloud/managed backend) -> file gate N/A.
+        $result.FileExists = $true
+    }
+
+    # 2. llama-server serves the GGUF file name as the model id (--alias).
+    $modelId = $GgufFile
+    if ([string]::IsNullOrWhiteSpace($modelId)) { $modelId = "default" }
+    $result.ModelId = $modelId
+
+    # 3. A minimal completion must actually succeed -- this is the real user path that
+    #    a "registered but missing file" install silently fails.
+    $body = @{
+        model       = $modelId
+        messages    = @(@{ role = "user"; content = "hi" })
+        max_tokens  = 64
+        temperature = 0
+        stream      = $false
+        chat_template_kwargs = @{ enable_thinking = $false }
+    } | ConvertTo-Json -Compress -Depth 5
+
+    $headers = @{}
+    if ($Endpoint.ContainsKey("ApiKey") -and -not [string]::IsNullOrWhiteSpace([string]$Endpoint.ApiKey)) {
+        $headers.Authorization = "Bearer " + [string]$Endpoint.ApiKey
+    }
+    try {
+        $resp = Invoke-WebRequest -Method POST -Uri $Endpoint.ChatCompletionsUrl `
+            -Headers $headers -ContentType "application/json" -Body $body -TimeoutSec $TimeoutSec `
+            -UseBasicParsing -ErrorAction Stop
+        if ([int]$resp.StatusCode -ge 200 -and [int]$resp.StatusCode -lt 300) {
+            $result.CompletionOk = Test-ODSCompletionContent -Json $resp.Content
+        }
+    } catch {
+        # HTTP exception types differ between Windows PowerShell and PowerShell 7.
+        $code = -1
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+        $result.Detail = "completion request failed (status=$code)"
+    }
+
+    if ($result.FileExists -and $result.CompletionOk) {
+        $result.Ok = $true
+        $result.Detail = "model file present and completion succeeded"
+    } elseif (-not $result.FileExists) {
+        $result.Detail = "model '$modelId' is registered but its backing file is missing: $($result.ModelFile)"
+    } elseif ([string]::IsNullOrWhiteSpace($result.Detail)) {
+        $result.Detail = "completion did not succeed"
+    }
+
+    return $result
+}
+
+function Test-WindowsSwitchboardReadiness {
+    # Only the host agent publishes route proof. Exercise the same public alias
+    # used by consumers, not a backend health endpoint or a fabricated receipt.
+    param([hashtable]$EnvMap, [int]$Attempts = 6, [int]$IntervalSec = 5)
+    if ((Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("ODS_MODEL_SWITCHBOARD")) -ne "enabled") {
+        return @{ Ok = $true; Detail = "switchboard disabled" }
+    }
+    $agentKey = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("ODS_AGENT_KEY", "DASHBOARD_API_KEY")
+    $gatewayKey = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LITELLM_KEY")
+    if (-not $agentKey -or -not $gatewayKey) {
+        return @{ Ok = $false; Detail = "switchboard verification credentials are missing" }
+    }
+    $agentPort = [int](Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("ODS_AGENT_PORT") -Default "7710")
+    $gatewayPort = [int](Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LITELLM_PORT") -Default "4000")
+    $body = @{
+        model = "ods/current"; messages = @(@{ role = "user"; content = "Say OK" })
+        max_tokens = 64; temperature = 0; stream = $false
+        chat_template_kwargs = @{ enable_thinking = $false }
+    } | ConvertTo-Json -Compress -Depth 5
+    for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+        try {
+            $null = Invoke-WebRequest -Uri "http://127.0.0.1:$agentPort/v1/model/status" `
+                -Headers @{ Authorization = "Bearer $agentKey" } -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+            $response = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:$gatewayPort/v1/chat/completions" `
+                -Headers @{ Authorization = "Bearer $gatewayKey" } -ContentType "application/json" `
+                -Body $body -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop
+            if ([int]$response.StatusCode -eq 200 -and (Test-ODSCompletionContent -Json $response.Content)) {
+                return @{ Ok = $true; Detail = "ods/current returned a completion" }
+            }
+        } catch { } # Never reflect authenticated upstream bodies into install logs.
+        if ($attempt + 1 -lt $Attempts) { Start-Sleep -Seconds $IntervalSec }
+    }
+    return @{ Ok = $false; Detail = "ods/current did not return a verified completion; inspect model status and retry" }
+}

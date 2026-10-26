@@ -1,0 +1,66 @@
+# ODS — AMD GPU Overlay (upstream llama.cpp, Vulkan)
+# AMD GPUs run the official ggml-org llama.cpp server image, the same b9014
+# release the NVIDIA and CPU overlays pin. The base service supplies the
+# command (--model, --alias, --ctx-size, --n-gpu-layers, --metrics), the
+# models mount, the loopback port and the /health check; this overlay adds
+# only the image and GPU access.
+#
+# Vulkan (Mesa RADV, bundled in the image) needs /dev/dri and the video and
+# render groups. It covers RDNA cards and APUs, Strix Halo included, without
+# ROCm on the host or an HSA override. AMD_INFERENCE_BACKEND=rocm layers
+# docker-compose.amd-rocm.yml on top for the ROCm image (required for Instinct
+# CDNA parts, which have no Vulkan).
+#
+# ComfyUI GPU config lives in extensions/services/comfyui/compose.amd.yaml.
+# Use with: docker compose -f docker-compose.base.yml -f docker-compose.amd.yml up -d
+
+services:
+  llama-server:
+    # Pinned by tag and digest. LLAMA_SERVER_IMAGE is deliberately not read:
+    # the gemma4 profile and catalog entries can set it to another backend's
+    # image (CUDA), which would run without the GPU here.
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b9014@sha256:15c30b560d61ead1e08bee837503203a776fd968736118e313240c32157fd973
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
+    environment:
+      # One GPU unless the multi-GPU overlay assigns more. Which GPU: llama.cpp's
+      # default device list holds the discrete GPUs and uses integrated ones
+      # only when there is none (src/llama.cpp, b9014), and ggml-vulkan types
+      # an APU's GPU as integrated. So with an iGPU next to a discrete AMD GPU
+      # the model runs on the discrete GPU whatever the Vulkan order (Mesa's
+      # device-select layer lists the boot VGA device first), and the
+      # installer counts only the discrete GPU (amd_inference_card_dirs). An
+      # APU alone (Strix Halo) is the only device. "none" also keeps llama.cpp
+      # on one GPU if the container sees two discrete GPUs.
+      - LLAMA_ARG_SPLIT_MODE=${LLAMA_ARG_SPLIT_MODE:-none}
+    deploy:
+      resources:
+        limits:
+          cpus: '${LLAMA_CPU_LIMIT:-16.0}'
+          memory: ${LLAMA_SERVER_MEMORY_LIMIT:-110G}
+        reservations:
+          cpus: '${LLAMA_CPU_RESERVATION:-4.0}'
+          memory: 8G
+
+  open-webui:
+    environment:
+      ENABLE_IMAGE_GENERATION: "${ENABLE_IMAGE_GENERATION:-true}"
+
+  dashboard-api:
+    environment:
+      - GPU_BACKEND=amd
+      - LLM_BACKEND=llama-server
+      - LLM_API_BASE_PATH=/v1
+      - AMD_INFERENCE_RUNTIME=${AMD_INFERENCE_RUNTIME:-llama-server}
+      - AMD_INFERENCE_BACKEND=${AMD_INFERENCE_BACKEND:-vulkan}
+      - AMD_INFERENCE_LOCATION=${AMD_INFERENCE_LOCATION:-container}
+      - AMD_INFERENCE_PORT=${AMD_INFERENCE_PORT:-8080}
+      - AMD_INFERENCE_SUPPORTED_BACKENDS=${AMD_INFERENCE_SUPPORTED_BACKENDS:-vulkan,rocm}
+      - AMD_INFERENCE_RUNTIME_MODE=${AMD_INFERENCE_RUNTIME_MODE:-linux-container}
+      - AMD_INFERENCE_MANAGED=${AMD_INFERENCE_MANAGED:-true}
+    volumes:
+      - /sys/class/drm:/sys/class/drm:ro
+      - /sys/class/hwmon:/sys/class/hwmon:ro

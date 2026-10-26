@@ -1,0 +1,455 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ExternalLink, GitBranch, RefreshCw, X } from 'lucide-react'
+import { serviceUrl } from '../lib/serviceUrls'
+import { openWithFreshSession, opensWithOdsSession } from '../lib/odsSession'
+import PanelSelect from '../components/PanelSelect'
+import IntegrationSnapshotDownload from '../components/IntegrationSnapshotDownload'
+
+const POLL_INTERVAL = 10000
+const POLL_TIMEOUT = 15000
+const NODE_W = 170
+const NODE_H = 64
+const LABEL_W = 210
+const LAYER_GAP = 190
+const NODE_GAP = 42
+const MIN_W = 1080
+const MIN_H = 720
+
+const LAYERS = ['core', 'middleware', 'user-facing', 'other']
+const LAYER_LABELS = {
+  core: 'CORE',
+  middleware: 'MIDDLEWARE',
+  'user-facing': 'USER FACING',
+  other: 'OTHER',
+}
+
+const CATEGORY_MAP = {
+  'llama-server': 'core',
+  qdrant: 'core',
+  searxng: 'core',
+  embeddings: 'core',
+  whisper: 'core',
+  tts: 'core',
+  litellm: 'middleware',
+  'dashboard-api': 'middleware',
+  'token-spy': 'middleware',
+  'privacy-shield': 'middleware',
+  langfuse: 'middleware',
+  ape: 'middleware',
+  'open-webui': 'user-facing',
+  perplexica: 'user-facing',
+  n8n: 'user-facing',
+  dashboard: 'user-facing',
+  comfyui: 'user-facing',
+  opencode: 'user-facing',
+}
+
+const NAME_TO_ID = {
+  'APE (Agent Policy Engine)': 'ape',
+  'ComfyUI (Image Generation)': 'comfyui',
+  'Dashboard (Control Center)': 'dashboard',
+  'Dashboard API (System Status)': 'dashboard-api',
+  'Kokoro (TTS)': 'tts',
+  'LiteLLM (API Gateway)': 'litellm',
+  'llama-server (LLM Inference)': 'llama-server',
+  'n8n (Workflows)': 'n8n',
+  'Open WebUI (Chat)': 'open-webui',
+  'OpenCode (IDE)': 'opencode',
+  'Perplexica (Deep Research)': 'perplexica',
+  'Privacy Shield (PII Protection)': 'privacy-shield',
+  'Qdrant (Vector DB)': 'qdrant',
+  'SearXNG (Web Search)': 'searxng',
+  'TEI (Embeddings)': 'embeddings',
+  'Token Spy (Usage Monitor)': 'token-spy',
+  'Whisper (STT)': 'whisper',
+}
+
+// source depends on target. Unknown extension dependencies are not guessed.
+const KNOWN_EDGES = [
+  ['open-webui', 'litellm', 'LLM proxy'],
+  ['litellm', 'llama-server', 'inference'],
+  ['perplexica', 'searxng', 'search'],
+  ['perplexica', 'litellm', 'LLM proxy'],
+  ['n8n', 'litellm', 'LLM proxy'],
+  ['n8n', 'qdrant', 'vector store'],
+  ['litellm', 'langfuse', 'observability'],
+  ['qdrant', 'embeddings', 'embeddings'],
+  ['open-webui', 'whisper', 'voice input'],
+  ['open-webui', 'tts', 'voice output'],
+  ['dashboard', 'dashboard-api', 'API'],
+  ['dashboard-api', 'llama-server', 'API'],
+  ['token-spy', 'litellm', 'intercept'],
+  ['privacy-shield', 'litellm', 'privacy'],
+  ['comfyui', 'open-webui', 'API'],
+  ['ape', 'litellm', 'LLM proxy'],
+]
+
+const EDGE_META = {
+  inference: '#a855f7',
+  'LLM proxy': '#3b82f6',
+  search: '#f97316',
+  'vector store': '#06b6d4',
+  embeddings: '#14b8a6',
+  'voice input': '#ec4899',
+  'voice output': '#ec4899',
+  API: '#6366f1',
+  intercept: 'rgb(var(--theme-text-secondary))',
+  observability: '#84cc16',
+  privacy: '#f43f5e',
+}
+
+const STATUS = {
+  healthy: { color: '#22c55e', text: 'text-green-400', dot: 'bg-green-400' },
+  degraded: { color: 'rgb(var(--theme-text-secondary))', text: 'text-theme-text-secondary', dot: 'bg-theme-text-secondary' },
+  unhealthy: { color: '#ef4444', text: 'text-red-400', dot: 'bg-red-400' },
+  down: { color: '#ef4444', text: 'text-red-400', dot: 'bg-red-400' },
+  not_deployed: { color: '#6b7280', text: 'text-zinc-500', dot: 'bg-zinc-500' },
+  unknown: { color: '#6b7280', text: 'text-zinc-500', dot: 'bg-zinc-500' },
+}
+
+function statusMeta(status) {
+  return STATUS[status] || STATUS.unknown
+}
+
+function normalizeStatus(status) {
+  return status || 'unknown'
+}
+
+function slugServiceName(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+function resolveServiceId(service) {
+  const explicitId = service.id || service.service_id || service.key
+  if (explicitId) return explicitId
+  return NAME_TO_ID[service.name] || slugServiceName(service.name)
+}
+
+export function buildTopology(statusData) {
+  const services = Array.isArray(statusData?.services) ? statusData.services : []
+  const nodes = services
+    .map(service => {
+      const id = resolveServiceId(service)
+      if (!id) return null
+      return {
+        id,
+        name: service.name || id,
+        status: normalizeStatus(service.status),
+        port: service.external_port ?? service.port ?? '',
+        public_url: service.public_url || '',
+        ui_path: service.ui_path || '/',
+        category: CATEGORY_MAP[id] || 'other',
+      }
+    })
+    .filter(Boolean)
+  const nodeById = new Map(nodes.map(node => [node.id, node]))
+  const edges = KNOWN_EDGES
+    .filter(([source, target]) => nodeById.has(source) && nodeById.has(target))
+    .map(([source, target, label]) => ({
+      source,
+      target,
+      label,
+      status: nodeById.get(source).status === 'healthy' && nodeById.get(target).status === 'healthy'
+        ? 'healthy'
+        : 'degraded',
+    }))
+  return { nodes, edges }
+}
+
+function computeLayout(nodes) {
+  const rows = Object.fromEntries(LAYERS.map(layer => [layer, []]))
+  for (const node of nodes) rows[node.category || 'other']?.push(node)
+  for (const row of Object.values(rows)) row.sort((a, b) => a.name.localeCompare(b.name))
+
+  const maxCount = Math.max(1, ...Object.values(rows).map(row => row.length))
+  const svgWidth = Math.max(MIN_W, LABEL_W + maxCount * NODE_W + (maxCount - 1) * NODE_GAP + 120)
+  const positions = {}
+  const layerY = {}
+  let y = 80
+
+  for (const layer of LAYERS) {
+    const row = rows[layer]
+    if (row.length === 0) continue
+    const rowWidth = row.length * NODE_W + Math.max(0, row.length - 1) * NODE_GAP
+    const x0 = LABEL_W + Math.max(40, (svgWidth - LABEL_W - rowWidth) / 2)
+    row.forEach((node, index) => {
+      positions[node.id] = { x: x0 + index * (NODE_W + NODE_GAP), y }
+    })
+    layerY[layer] = y
+    y += LAYER_GAP
+  }
+
+  return { positions, layerY, svgWidth, svgHeight: Math.max(MIN_H, y + 40) }
+}
+
+function edgePath(source, target) {
+  const sx = source.x + NODE_W / 2
+  const sy = source.y + (source.y > target.y ? 0 : NODE_H)
+  const tx = target.x + NODE_W / 2
+  const ty = target.y + (source.y > target.y ? NODE_H : 0)
+  const midY = (sy + ty) / 2
+  return `M ${sx} ${sy} L ${sx} ${midY} L ${tx} ${midY} L ${tx} ${ty}`
+}
+
+function ServiceNode({ node, pos, selected, onSelect, compact = false }) {
+  const meta = statusMeta(node.status)
+  const label = compact ? node.name.replace(/\s*\(.*\)$/, '') : node.name
+  return (
+    <g role="button" tabIndex={0} aria-label={`${node.name}: ${node.status}`} onClick={() => onSelect(node)} onKeyDown={event => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(node) }
+    }} className="cursor-pointer">
+      <title>{node.name}: {node.status}</title>
+      {selected && (
+        <rect x={pos.x - 4} y={pos.y - 4} width={NODE_W + 8} height={NODE_H + 8} rx={14} fill="none" stroke={meta.color} strokeWidth="2" />
+      )}
+      <rect x={pos.x} y={pos.y} width={NODE_W} height={NODE_H} rx={12} className="fill-zinc-900 stroke-zinc-700" />
+      <circle cx={pos.x + 15} cy={pos.y + 25} r="4" fill={meta.color} />
+      <text x={pos.x + 27} y={pos.y + 29} className="fill-zinc-100" style={{ fontSize: 12, fontWeight: compact ? 500 : 700 }}>
+        {label.length > 18 ? `${label.slice(0, 17)}…` : label}
+      </text>
+      <text x={pos.x + 15} y={pos.y + 47} className="fill-zinc-400" style={{ fontSize: 11 }}>
+        {node.port ? `:${node.port}` : 'No port'}
+      </text>
+      <text x={pos.x + NODE_W - 10} y={pos.y + 47} textAnchor="end" style={{ fontSize: 9, fill: meta.color }}>
+        {node.status.replaceAll('_', ' ')}
+      </text>
+    </g>
+  )
+}
+
+function DetailPanel({ node, edges, onClose, inline = false }) {
+  if (!node) return null
+  const meta = statusMeta(node.status)
+  const upstream = edges.filter(edge => edge.target === node.id)
+  const downstream = edges.filter(edge => edge.source === node.id)
+  const url = serviceUrl(node)
+
+  return (
+    <div className={inline ? 'integration-detail' : 'absolute top-4 right-4 z-10 w-72 overflow-hidden rounded-xl border border-theme-border bg-theme-card shadow-2xl'}>
+      <div className="flex items-center justify-between border-b border-theme-border px-4 py-3">
+        <div className="flex items-center gap-2">
+          <span className={`h-2.5 w-2.5 rounded-full ${meta.dot}`} />
+          <span className="text-sm font-semibold text-theme-text">{node.name}</span>
+        </div>
+        <button onClick={onClose} aria-label="Close service details" className="text-theme-text-muted hover:text-theme-text"><X size={16} /></button>
+      </div>
+      <div className="space-y-3 px-4 py-3 text-xs">
+        <div className="flex justify-between"><span className="text-theme-text-muted">Status</span><span className={meta.text}>{node.status}</span></div>
+        <div className="flex justify-between"><span className="text-theme-text-muted">Port</span><span className="font-mono text-theme-text">{node.port}</span></div>
+        <div className="flex justify-between"><span className="text-theme-text-muted">Layer</span><span className="text-theme-text">{node.category}</span></div>
+        {upstream.length > 0 && <DependencyList label="Used by" edges={upstream} field="source" />}
+        {downstream.length > 0 && <DependencyList label="Depends on" edges={downstream} field="target" />}
+        {url && <a href={url} target="_blank" rel="noreferrer" onClick={opensWithOdsSession(node.id) ? openWithFreshSession : undefined} className="flex items-center gap-1.5 text-theme-accent hover:underline"><ExternalLink size={12} />Open service</a>}
+      </div>
+    </div>
+  )
+}
+
+function DependencyList({ label, edges, field }) {
+  return (
+    <div>
+      <span className="mb-1 block text-theme-text-muted">{label}:</span>
+      <div className="space-y-1">
+        {edges.map(edge => (
+          <div key={`${edge.source}-${edge.target}`} className="flex items-center gap-1.5 text-theme-text">
+            <span style={{ color: EDGE_META[edge.label] || '#6b7280', fontSize: 10 }}>●</span>
+            {edge[field]}
+            <span className="ml-auto text-theme-text-muted">({edge.label})</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function CompactIntegrations({ nodes, edges, capturedAt, refresh, error }) {
+  const [view, setView] = useState('list')
+  const [search, setSearch] = useState('')
+  const [filter, setFilter] = useState('all')
+  const [selectedId, setSelectedId] = useState(null)
+  const detailRef = useRef(null)
+  useEffect(() => { if (selectedId) detailRef.current?.scrollIntoView?.({ block: 'nearest' }) }, [selectedId])
+  const selected = nodes.find(node => node.id === selectedId)
+  const visible = nodes.filter(node => `${node.name} ${node.id}`.toLowerCase().includes(search.toLowerCase()) && (filter === 'all' || (filter === 'healthy' ? node.status === 'healthy' : node.status !== 'healthy')))
+  const positions = {}
+  const labels = []
+  let height = 35
+  for (const layer of LAYERS) {
+    const members = visible.filter(node => node.category === layer).sort((a, b) => a.name.localeCompare(b.name))
+    if (!members.length) continue
+    labels.push({ layer, y: height })
+    height += 20
+    members.forEach((node, index) => { positions[node.id] = { x: 18 + (index % 2) * 212, y: height + Math.floor(index / 2) * 100 } })
+    height += Math.ceil(members.length / 2) * 100 + 25
+  }
+  return <section className="portal-integrations">
+    <header className="integrations-header"><div><h2>Integrations</h2><p>{nodes.length} services · {nodes.filter(node => node.status === 'healthy').length} healthy</p></div><button type="button" aria-label="Refresh integrations" onClick={refresh}><RefreshCw size={15} /></button></header>
+    <IntegrationSnapshotDownload nodes={nodes} edges={edges} capturedAt={capturedAt} refreshFailed={Boolean(error)} />
+    <nav className="settings-view-tabs" aria-label="Integration views"><button type="button" aria-pressed={view === 'list'} onClick={() => setView('list')}>Service list</button><button type="button" aria-pressed={view === 'map'} onClick={() => setView('map')}>View map</button></nav>
+    {error && <p role="alert" className="text-red-400">Status could not be refreshed. {error}</p>}
+    <div className="integrations-filters"><input type="search" aria-label="Search integrations" placeholder="Search services…" value={search} onChange={event => setSearch(event.target.value)} /><PanelSelect label="Service status" value={filter} onChange={setFilter} options={[{value:'all',label:'All statuses'},{value:'healthy',label:'Healthy'},{value:'attention',label:'Not healthy'}]} /></div>
+    <div ref={detailRef}><DetailPanel inline node={selected} edges={edges} onClose={() => setSelectedId(null)} /></div>
+    {!visible.length ? <p className="integrations-empty">{nodes.length ? 'No matching services.' : 'No services reported.'}</p> : view === 'list' ? <div className="integrations-list">
+      {LAYERS.map(layer => {
+        const members = visible.filter(node => node.category === layer).sort((a, b) => a.name.localeCompare(b.name))
+        return members.length > 0 && <section key={layer}><h3>{LAYER_LABELS[layer].toLowerCase().replace('-', ' ')}</h3>{members.map(node => <button type="button" key={node.id} onClick={() => setSelectedId(node.id)} aria-pressed={selectedId === node.id}><span className="integration-name"><span className={`integration-dot ${statusMeta(node.status).dot}`} /><span>{node.name}</span></span><span className="integration-status">{node.status.replaceAll('_', ' ')}{Boolean(node.port) && <small>:{node.port}</small>}</span></button>)}</section>
+      })}
+    </div> : <div className="integrations-map" role="region" aria-label="Service topology" tabIndex={0}>
+      <p>Known dependencies · select a service to highlight its connections</p>
+      <svg width="100%" viewBox={`0 0 418 ${height}`} style={{ fontFamily: 'inherit' }}>
+        {labels.map(({ layer, y }) => <text key={layer} x="18" y={y} fill="currentColor" opacity=".55" fontSize="10">{LAYER_LABELS[layer]}</text>)}
+        {edges.map((edge, index) => {
+          const source = positions[edge.source], target = positions[edge.target]
+          if (!source || !target) return null
+          const highlighted = selectedId === edge.source || selectedId === edge.target
+          const sx = source.x < 200 ? source.x + NODE_W : source.x
+          const tx = target.x < 200 ? target.x + NODE_W : target.x
+          const gutter = 202 + (index % 5) * 3
+          const path = `M ${sx} ${source.y + NODE_H / 2} H ${gutter} V ${target.y + NODE_H / 2} H ${tx}`
+          return <path key={`${edge.source}-${edge.target}`} d={path} fill="none" stroke="currentColor" strokeWidth={highlighted ? 2 : 1} opacity={highlighted ? .85 : .13} />
+        })}
+        {visible.map(node => <ServiceNode compact key={node.id} node={node} pos={positions[node.id]} selected={selectedId === node.id} onSelect={value => setSelectedId(value.id)} />)}
+      </svg>
+    </div>}
+  </section>
+}
+
+export default function ServiceMap({ compact = false }) {
+  const [topology, setTopology] = useState({ nodes: [], edges: [] })
+  const [selectedNode, setSelectedNode] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [actualSize, setActualSize] = useState(false)
+  const [error, setError] = useState(null)
+  const activeRequest = useRef(null)
+
+  const fetchTopology = useCallback(async () => {
+    if (document.hidden || activeRequest.current) return
+    const controller = new AbortController()
+    activeRequest.current = controller
+    let rejectAbort
+    const aborted = new Promise((_, reject) => {
+      rejectAbort = () => reject(new Error('Service status request timed out'))
+      controller.signal.addEventListener('abort', rejectAbort, {once:true})
+    })
+    const timeout = setTimeout(() => controller.abort(), POLL_TIMEOUT)
+    try {
+      const snapshot = (async () => {
+        const response = await fetch('/api/status', {signal:controller.signal})
+        if (!response.ok) throw new Error('Failed to fetch service status')
+        return response.json()
+      })()
+      const data = await Promise.race([snapshot, aborted])
+      if (activeRequest.current !== controller) return
+      setTopology({ ...buildTopology(data), capturedAt: new Date().toISOString() })
+      setError(null)
+    } catch (err) {
+      if (activeRequest.current === controller) setError(err.message)
+    } finally {
+      clearTimeout(timeout)
+      controller.signal.removeEventListener('abort', rejectAbort)
+      controller.abort()
+      // A disposed effect must not clear its replacement's request guard.
+      if (activeRequest.current === controller) {
+        activeRequest.current = null
+        setLoading(false)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchTopology()
+    const interval = setInterval(fetchTopology, POLL_INTERVAL)
+    const onVisibility = () => { if (!document.hidden) fetchTopology() }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      const pending = activeRequest.current
+      activeRequest.current = null
+      pending?.abort()
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [fetchTopology])
+
+  const { nodes, edges, capturedAt } = topology
+  const { positions, layerY, svgWidth, svgHeight } = useMemo(() => computeLayout(nodes), [nodes])
+  const counts = useMemo(() => ({
+    healthy: nodes.filter(node => node.status === 'healthy').length,
+    degraded: nodes.filter(node => node.status === 'degraded').length,
+    down: nodes.filter(node => node.status === 'down' || node.status === 'unhealthy').length,
+    other: nodes.filter(node => !['healthy', 'degraded', 'down', 'unhealthy'].includes(node.status)).length,
+  }), [nodes])
+  const edgeLabels = [...new Set(edges.map(edge => edge.label))]
+
+  if (loading) {
+    return <p role="status" className="text-sm text-theme-text-muted">Loading integrations…</p>
+  }
+
+  if (error && !nodes.length) {
+    return <div role="alert" className="text-sm text-red-400">Topology data unavailable: {error}<button className="ml-3" onClick={fetchTopology}>Retry</button></div>
+  }
+
+  if (compact) return <CompactIntegrations nodes={nodes} edges={edges} capturedAt={capturedAt} refresh={fetchTopology} error={error} />
+
+  return (
+    <div className="p-8">
+      <div className="mb-6 flex items-start justify-between">
+        <div>
+          {!compact && <h1 className="flex items-center gap-2 text-2xl font-bold text-theme-text"><GitBranch size={22} className="text-theme-accent" />Integrations</h1>}
+          <p className="mt-1 text-sm text-theme-text-muted">
+            {nodes.length} services · <span className="text-green-400">{counts.healthy} healthy</span>
+            {counts.degraded > 0 && <>, <span className="text-theme-text-secondary">{counts.degraded} degraded</span></>}
+            {counts.down > 0 && <>, <span className="text-red-400">{counts.down} down</span></>}
+            {counts.other > 0 && <>, <span className="text-zinc-500">{counts.other} other</span></>}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 rounded-lg border border-theme-border bg-theme-card px-3 py-2 font-mono text-xs text-theme-text-muted"><RefreshCw size={12} className="text-theme-accent" />live · 10s</div>
+      </div>
+
+      <div className="mb-4 flex flex-wrap gap-4 text-xs text-theme-text-muted">
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-green-400" />Healthy</span>
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-theme-text-secondary" />Degraded</span>
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-red-400" />Down</span>
+        <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-zinc-500" />Not deployed</span>
+      </div>
+
+      <div className="relative overflow-hidden rounded-xl border border-theme-border bg-theme-bg">
+        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-theme-border">
+          <span className="text-xs text-theme-text-muted">Service connections</span>
+          <IntegrationSnapshotDownload nodes={nodes} edges={edges} capturedAt={capturedAt} refreshFailed={Boolean(error)} />
+          <button type="button" aria-pressed={actualSize} onClick={() => setActualSize(value => !value)} className="rounded-md px-3 py-1.5 text-xs text-theme-text-secondary hover:bg-theme-card">{actualSize ? 'Fit to panel' : 'Actual size'}</button>
+        </div>
+        <div className="overflow-auto" role="region" aria-label="Service topology" tabIndex={0}>
+        <svg width={actualSize ? svgWidth : '100%'} height={actualSize ? svgHeight : undefined} viewBox={`0 0 ${svgWidth} ${svgHeight}`} className="mx-auto block" style={{ fontFamily: 'inherit', minHeight: actualSize ? undefined : 300 }}>
+          <defs>
+            <filter id="node-shadow" x="-25%" y="-60%" width="150%" height="230%"><feDropShadow dx="0" dy="2" stdDeviation="10" floodColor="#000" floodOpacity="0.7" /></filter>
+            {Object.entries(EDGE_META).map(([label, color]) => <marker key={label} id={`arrow-${label.replaceAll(' ', '-')}`} markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M 0 0 L 7 2.5 L 0 5 Z" fill={color} fillOpacity="0.85" /></marker>)}
+          </defs>
+
+          {LAYERS.map(layer => layerY[layer] == null ? null : <text key={layer} x="32" y={layerY[layer] + NODE_H / 2} className="fill-zinc-600" style={{ fontSize: 10, fontWeight: 700 }}>{LAYER_LABELS[layer]}</text>)}
+
+          {edges.map(edge => {
+            const source = positions[edge.source]
+            const target = positions[edge.target]
+            if (!source || !target) return null
+            const color = EDGE_META[edge.label] || '#6b7280'
+            return <path key={`${edge.source}-${edge.target}`} d={edgePath(source, target)} fill="none" stroke={color} strokeWidth="1.8" strokeOpacity={edge.status === 'healthy' ? 0.72 : 0.32} strokeDasharray={edge.status === 'healthy' ? undefined : '5 4'} markerEnd={`url(#arrow-${edge.label.replaceAll(' ', '-')})`} />
+          })}
+
+          {nodes.map(node => positions[node.id] && <ServiceNode key={node.id} node={node} pos={positions[node.id]} selected={selectedNode?.id === node.id} onSelect={setSelectedNode} />)}
+        </svg>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-theme-border px-4 py-3">
+          <span className="text-xs font-medium text-zinc-600">Connections:</span>
+          {edgeLabels.map(label => <span key={label} className="flex items-center gap-1.5 text-xs text-theme-text-muted"><span className="inline-block h-2 w-2 rounded-full" style={{ background: EDGE_META[label] || '#6b7280' }} />{label}</span>)}
+        </div>
+
+        <DetailPanel node={selectedNode} edges={edges} onClose={() => setSelectedNode(null)} />
+      </div>
+    </div>
+  )
+}
